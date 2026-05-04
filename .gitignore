@@ -216,3 +216,15 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Project outputs (generated artifacts)
+results/
+**/single_bin_results/
+**/combined_500_results/
+**/dae_denoise_results/
+**/plots/
+**/*.pth
+**/*_metrics.json
+**/sgd_animation.gif
+**/sgd_path_simple.gif
+**/sgd_trajectory_3d_rotating.gif
