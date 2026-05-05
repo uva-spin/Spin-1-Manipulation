@@ -339,21 +339,27 @@ def GenerateVectorLineshape(P,x):
         Iplus = r*Lineshape(x,1)
         Iminus = Lineshape(x,-1)
         r = r
-    else:
+    elif P < 0:
         r = 1/r
         Iplus = -Lineshape(x,1)
         Iminus = -r*Lineshape(x,-1)
+    else:
+        Iplus = 0
+        Iminus = 0
 
-    # Iplus = r*Lineshape(x,1)
-    # Iminus = Lineshape(x,-1)
     
     ### Scaling
     pSummed = np.sum(Iplus + Iminus)
-    deltaP = (P/pSummed)*100
-    # deltaP = 1
+    # deltaP = P/pSummed
+    deltaP = 1
     Iplus = Iplus*deltaP
     Iminus = Iminus*deltaP
     signal = Iplus + Iminus
+
+    # mask = np.abs(np.asarray(x)) <= 3.0
+    # signal = np.where(mask, signal, 0.0)
+    # Iplus = np.where(mask, Iplus, 0.0)
+    # Iminus = np.where(mask, Iminus, 0.0)
 
     return signal,Iplus,Iminus
 
