@@ -11,10 +11,10 @@ class AFP:
         self.mu = 1.
 
     def calc_P_R(self, Iplus, Iminus):
-        return Iplus + Iminus
+        return self.calc_Iplus_theta(Iplus, Iminus) + self.calc_Iminus_theta(Iplus, Iminus)
 
     def calc_Q_R(self, Iplus, Iminus):
-        return Iplus - Iminus
+        return self.calc_Iplus_theta(Iplus, Iminus) - self.calc_Iminus_theta(Iplus, Iminus)
 
     def calc_P_theta(self, Iplus, Iminus):
         ### go over each bin and add Iplus(R) + Iminus(-R), opposite bin, to get theta space
@@ -29,6 +29,20 @@ class AFP:
         for i in range(len(Iplus)):
             Q_theta[i] = Iplus[i] - Iminus[len(Iplus) - i - 1] + Iplus[len(Iplus) - i - 1] - Iminus[i]
         return Q_theta
+    
+    def calc_Iplus_theta(self, Iplus, Iminus):
+        ## theta_1 (associated with Iplus) is evaluate at Iplus(R) and Iminus(-R)
+        Iplus_theta = np.zeros(len(Iplus))
+        for i in range(len(Iplus)):
+            Iplus_theta[i]  = Iplus[i] + Iminus[len(Iplus) - i - 1]
+        return Iplus_theta
+    
+    def calc_Iminus_theta(self, Iplus, Iminus):
+        ## theta_1 (associated with Iminus) is evaluate at Iminus(R) and Iplus(-R)
+        Iminus_theta = np.zeros(len(Iminus))
+        for i in range(len(Iminus)):
+            Iminus_theta[i] = Iminus[i] + Iplus[len(Iminus) - i - 1]
+        return Iminus_theta
 
     def calculate_n_plus(self, Iplus, Iminus):
         self.n_plus = np.array( self.mu * ( (1./3.) + (1./2.)*self.calc_P_R(Iplus, Iminus) + (1./6.)*self.calc_Q_R(Iplus, Iminus)))
@@ -51,7 +65,6 @@ class AFP:
         denom = self.n_plus + self.n_minus + self.n_naught
         inv = 1.0 / denom
         self.mu = np.where(p == 0, 0.0, inv)
-        print(f"mu: {self.mu}")
 
     def swap_pops(self, pop1_name, pop1_idx, pop2_name, pop2_idx):
         pop1 = getattr(self, pop1_name)
@@ -77,7 +90,7 @@ class AFP:
             self.swap_pops("n_naught", idx, "n_minus", mirror_idx)
             if idx == bins // 2:
                 ### set all population levels at center index to average of all population levels
-                average_pop = np.mean(self.n_plus[idx] + self.n_minus[idx] + self.n_naught[idx])/3.
+                average_pop = (self.n_plus[idx] + self.n_minus[idx] + self.n_naught[idx])/3.
                 self.n_plus[idx] = average_pop
                 self.n_minus[idx] = average_pop
                 self.n_naught[idx] = average_pop
