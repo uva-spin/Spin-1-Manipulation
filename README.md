@@ -1,32 +1,4 @@
 # Spin-1-Manipulation
 
-Repository for generating spin-1 lineshape data, applying ssRF burn effects, and
-training/evaluating compact ML models on those spectra.
+This repo contains scripts and related files for simulations pertaining to manipulation of Spin-1 solid-state target materials. This repo specifically focuses on semi-saturated radiofrequency (ss-RF) and adiabatic fast-passage (AFP) type manipulations discussed respectively in [Clement's paper](https://www.sciencedirect.com/science/article/pii/S0168900223001675) and in Abragam's _Principles of Nuclear Magnetism_. 
 
-## Project Layout
-
-- `Data_Creation/`: data generation and burn simulation scripts
-  - `lookup_table.py`: builds lookup table used for burn-to-(I+, I-) mapping
-  - `ssRFMapper.py`: applies ssRF burn profile to `Ps`, `Iplus`, `Iminus`
-  - `ssRFData.py`: produces burned training/testing datasets
-- `physics/lineshape/`: physics-oriented reference implementations and experiments
-- `ml/`: model training and inference scripts
-  - `rivanna/`: per-bin SLURM-compatible training scripts
-  - `binning_model.py`: combined bin model training/evaluation flow
-  - `dae.py`: denoising autoencoder pipeline and evaluation plots
-- `analysis/`: one-off analysis and visualization scripts
-- `diagrams/`: supporting visual assets
-
-## Typical Workflow
-
-1. Build lookup data with `Data_Creation/lookup_table.py`.
-2. Generate burned datasets with `Data_Creation/ssRFData.py`.
-3. Train models from `ml/` (single-bin, combined, or DAE).
-4. Use `analysis/` scripts for diagnostics and figures.
-
-## Notes
-
-- Scripts are primarily research/experiment oriented and may emit local result
-  artifacts when run.
-- Keep reusable core logic in mapper/model modules; keep plotting and one-off
-  experiments in `analysis/` or `physics/`.

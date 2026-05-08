@@ -1,29 +1,9 @@
-"""
-Train 500 separate bin models (one per frequency bin) and combine them into
-a single model for inference.
-
-Usage:
-  # Train all 500 bins and save combined model (run from project root):
-  python TensorStudies/binning_model_500_bins_combined.py
-
-  # Or train only a subset for testing:
-  python TensorStudies/binning_model_500_bins_combined.py --max-bins 10
-
-Outputs:
-  - combined_500_bin_model.pth: full model with weights and scaling stats
-  - scaling_stats.npz: standalone scaling values for use with real data
-
-Load and scale real data:
-  import numpy as np
-  data = np.load("combined_500_results/scaling_stats.npz")
-  Ps_mean, Ps_std = data["Ps_mean"], data["Ps_std"]
-  Ps_scaled = (Ps_real - Ps_mean) / (Ps_std + 1e-12)  # shape (batch, 500)
-"""
-
 import argparse
+import math
 import os
 from typing import Dict, List, Optional, Tuple
 
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import torch
@@ -32,15 +12,7 @@ import torch.optim as optim
 import torch.utils.data as data
 
 
-# =============================================================================
-# LinearBinModel - same as binning_model_single_bin_job.py
-# =============================================================================
-
-
 class LinearBinModel(nn.Module):
-    """
-    Linear model with optional hidden layer: 1 input -> 2 outputs (Iplus, Iminus)
-    """
 
     def __init__(self, use_hidden: bool = False, hidden_dim: int = 1):
         super().__init__()
@@ -72,19 +44,7 @@ class LinearBinModel(nn.Module):
         out = self.net(x)
         return out[:, 0], out[:, 1]
 
-
-# =============================================================================
-# Combined500BinModel - wraps 500 LinearBinModels into one inference model
-# =============================================================================
-
-
 class Combined500BinModel(nn.Module):
-    """
-    Wraps 500 LinearBinModels into a single model.
-    Input:  (batch_size, 500) - Ps values per bin
-    Output: (batch_size, 500) Iplus, (batch_size, 500) Iminus
-    """
-
     def __init__(
         self,
         bin_models: List[nn.Module],
@@ -95,7 +55,6 @@ class Combined500BinModel(nn.Module):
         self.bin_models = nn.ModuleList(bin_models)
         self.stats = stats
 
-        # Register stats as buffers for device portability (optional, we use numpy)
         self._Ps_mean = torch.from_numpy(stats["Ps_mean"]).float()
         self._Ps_std = torch.from_numpy(stats["Ps_std"]).float()
         self._Iplus_mean = torch.from_numpy(stats["Iplus_mean"]).float()
@@ -106,10 +65,6 @@ class Combined500BinModel(nn.Module):
     def forward(
         self, x: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        x: (batch_size, 500) - raw Ps values
-        Returns: (iplus, iminus) each (batch_size, 500) in original scale
-        """
         device = x.device
         batch_size = x.shape[0]
 
@@ -137,11 +92,6 @@ class Combined500BinModel(nn.Module):
             )
 
         return pred_iplus, pred_iminus
-
-
-# =============================================================================
-# Training logic for a single bin
-# =============================================================================
 
 
 def train_single_bin(
@@ -284,6 +234,80 @@ def train_single_bin(
     return model, ckpt
 
 
+# =============================================================================
+# Main
+# =============================================================================
+
+
+def augment_training_data_with_gap_fill(
+    Ps_train: np.ndarray,
+    Iplus_train: np.ndarray,
+    Iminus_train: np.ndarray,
+    lookup_path: str,
+    num_bins: int = 500,
+    num_fill_per_bin: int = 5000,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Fill training-data gaps using lookup-table interpolation.
+
+    At center-frequency bins the clean lineshape signal never passes through
+    zero, creating a symmetric gap in Ps around zero.  Burns push Ps into this
+    gap, causing the model to extrapolate.  We fill each bin's gap with
+    uniformly-spaced Ps values whose Iplus/Iminus come from linear
+    interpolation of the sorted lookup table -- exactly the same mapping
+    ``map_signal_fast`` uses at inference time.
+    """
+    lookup = pd.read_pickle(lookup_path)
+    lookup_Ps = np.stack(lookup["Ps"].values)
+    lookup_Ip = np.stack(lookup["Iplus"].values)
+    lookup_Im = np.stack(lookup["Iminus"].values)
+
+    aug_Ps = np.copy(Ps_train)
+    aug_Ip = np.copy(Iplus_train)
+    aug_Im = np.copy(Iminus_train)
+
+    n_orig = Ps_train.shape[0]
+    fill_Ps = np.zeros((num_fill_per_bin, num_bins))
+    fill_Ip = np.zeros((num_fill_per_bin, num_bins))
+    fill_Im = np.zeros((num_fill_per_bin, num_bins))
+
+    bins_filled = 0
+    for b in range(num_bins):
+        ps_sorted_idx = np.argsort(lookup_Ps[:, b])
+        ps_sorted = lookup_Ps[ps_sorted_idx, b]
+        ip_sorted = lookup_Ip[ps_sorted_idx, b]
+        im_sorted = lookup_Im[ps_sorted_idx, b]
+
+        train_ps = np.sort(Ps_train[:, b])
+        gaps = np.diff(train_ps)
+        max_gap_idx = np.argmax(gaps)
+        gap_lo = train_ps[max_gap_idx]
+        gap_hi = train_ps[max_gap_idx + 1]
+        gap_size = gap_hi - gap_lo
+
+        ps_range = train_ps[-1] - train_ps[0]
+        if ps_range == 0 or gap_size < 0.05 * ps_range:
+            fill_Ps[:, b] = np.random.uniform(train_ps[0], train_ps[-1], num_fill_per_bin)
+            fill_Ip[:, b] = np.interp(fill_Ps[:, b], ps_sorted, ip_sorted)
+            fill_Im[:, b] = np.interp(fill_Ps[:, b], ps_sorted, im_sorted)
+            continue
+
+        bins_filled += 1
+        fill_vals = np.linspace(gap_lo, gap_hi, num_fill_per_bin)
+        fill_Ps[:, b] = fill_vals
+        fill_Ip[:, b] = np.interp(fill_vals, ps_sorted, ip_sorted)
+        fill_Im[:, b] = np.interp(fill_vals, ps_sorted, im_sorted)
+
+    aug_Ps = np.concatenate([aug_Ps, fill_Ps], axis=0)
+    aug_Ip = np.concatenate([aug_Ip, fill_Ip], axis=0)
+    aug_Im = np.concatenate([aug_Im, fill_Im], axis=0)
+
+    print(
+        f"Gap-fill augmentation: {bins_filled}/{num_bins} bins had significant gaps. "
+        f"Added {num_fill_per_bin} synthetic samples -> total {aug_Ps.shape[0]}"
+    )
+    return aug_Ps, aug_Ip, aug_Im
+
+
 def parse_args():
     parser = argparse.ArgumentParser(
         description="Train 500 bin models and combine into a single model."
@@ -324,13 +348,6 @@ def parse_args():
     parser.add_argument("--lr-min", type=float, default=1e-6)
     parser.add_argument("--max-grad-norm", type=float, default=1.0)
     parser.add_argument("--hidden-dim", type=int, default=128)
-    parser.add_argument(
-        "--no-hidden",
-        action="store_false",
-        dest="use_hidden",
-        help="Use a purely linear model for each bin",
-    )
-    parser.set_defaults(use_hidden=True)
     return parser.parse_args()
 
 
@@ -405,6 +422,10 @@ def main():
     val_Ps = Ps_test_norm[val_indices]
     val_Iplus = Iplus_test_norm[val_indices]
     val_Iminus = Iminus_test_norm[val_indices]
+
+    test_Ps = Ps_test_norm[test_indices]
+    test_Iplus = Iplus_test_norm[test_indices]
+    test_Iminus = Iminus_test_norm[test_indices]
 
     bin_models = []
     stats = {
@@ -484,8 +505,8 @@ def main():
         "num_bins": num_bins,
         "bin_state_dicts": [m.state_dict() for m in bin_models],
         "stats": stats,
-        "use_hidden": args.use_hidden,
-        "hidden_dim": args.hidden_dim,
+        "use_hidden": getattr(args, "use_hidden", True),
+        "hidden_dim": getattr(args, "hidden_dim", 32),
     }
     torch.save(payload, combined_path)
     print(f"Saved combined model to {combined_path}")

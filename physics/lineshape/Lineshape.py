@@ -350,8 +350,9 @@ def GenerateVectorLineshape(P,x):
     
     ### Scaling
     pSummed = np.sum(Iplus + Iminus)
-    # deltaP = P/pSummed
-    deltaP = 1
+    deltaP = P/pSummed
+    print(f"CC: {deltaP}")
+    # deltaP = 1
     Iplus = Iplus*deltaP
     Iminus = Iminus*deltaP
     signal = Iplus + Iminus
@@ -361,7 +362,7 @@ def GenerateVectorLineshape(P,x):
     # Iplus = np.where(mask, Iplus, 0.0)
     # Iminus = np.where(mask, Iminus, 0.0)
 
-    return signal,Iplus,Iminus
+    return signal,Iplus,Iminus, deltaP
 
 
 def GenerateTensorLineshape(x, P, phi_deg):
