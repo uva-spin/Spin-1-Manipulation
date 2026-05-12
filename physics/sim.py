@@ -1,151 +1,47 @@
+from pathlib import Path
+
 from afp import AFP
 from lineshape.Lineshape import GenerateVectorLineshape
 import numpy as np
 import matplotlib.pyplot as plt
 
-R = np.linspace(-6, 6, 500)
-signal, Iplus, Iminus, CC = GenerateVectorLineshape(0.45, R)
-
-def theta_space(Iplus, Iminus):
-    Iplus_theta = np.zeros(len(Iplus))
-    Iminus_theta = np.zeros(len(Iminus))
-    for i in range(len(Iplus)):
-        Iplus_theta[i] = Iplus[i]
-        Iminus_theta[i] = Iminus[len(Iplus) - i - 1]
-    return Iplus_theta, Iminus_theta
-
-Iplus_theta, Iminus_theta = theta_space(Iplus, Iminus)
-
-
-afp = AFP(0.0, 0.0, 0.0)
-n_plus = afp.calculate_n_plus(Iplus, Iminus)
-n_minus = afp.calculate_n_minus(Iplus, Iminus)
-n_naught = afp.calculate_n_naught(Iplus, Iminus)
-
-# P_theta = afp.calc_P_theta(Iplus, Iminus)
-# Q_theta = afp.calc_Q_theta(Iplus, Iminus)
-
-Iplus_theta = afp.calc_Iplus_theta(Iplus, Iminus)
-Iminus_theta = afp.calc_Iminus_theta(Iplus, Iminus)
-
-plt.figure(figsize=(12,8))
-plt.step(R, Iplus_theta, label='$\\rho_+ - \\rho_0$', color='red')
-plt.step(R, Iminus_theta, label='$\\rho_0 - \\rho_-$', color='blue')
-plt.grid(True)
-plt.xlabel('$\\Theta$', fontsize=18, fontfamily='Times New Roman')
-plt.legend(loc='upper right')
-plt.show()
-
-# plt.figure(figsize=(12,8))
-# plt.step(R, Iplus_theta, label='$\\rho_+ - \\rho_0$', color='red')
-# plt.step(R, Iminus_theta, label='$\\rho_0 - \\rho_-$', color='blue')
-# plt.grid(True)
-# plt.xlim(0,np.pi/2)
-# plt.xlabel('$\\Theta$', fontsize=18, fontfamily='Times New Roman')
-# plt.legend(loc='upper right')
-# plt.show()
-
-afp.norm_mu(Iplus, Iminus)
-n_plus_norm = afp.calculate_n_plus(Iplus, Iminus).copy()
-n_minus_norm = afp.calculate_n_minus(Iplus, Iminus).copy()
-n_naught_norm = afp.calculate_n_naught(Iplus, Iminus).copy()
-
-# plt.figure(figsize=(12,8))
-# plt.step(R, P_theta, label='$P_\\theta$', color='red')
-# plt.step(R, Q_theta, label='$Q_\\theta$', color='blue')
-# plt.grid(True)
-# plt.xlim(-3,3)
-# plt.xlabel('$\\Theta$', fontsize=18, fontfamily='Times New Roman')
-# plt.legend(loc='upper right')
-# plt.show()
-
-
-fig, ax = plt.subplots(3, 1, figsize=(12,8))
-ax[0].step(R, n_plus_norm, label='$n_+$')
-ax[0].step(R, n_minus_norm, label='$n_-$')
-ax[0].step(R, n_naught_norm, label='$n_0$')
-ax[0].grid(True)
-ax[0].set_xlim(-3,3)
-ax[0].legend(loc='upper right')
-ax[1].step(R, signal, label='signal', color='black')
-ax[1].grid(True)
-ax[1].set_xlim(-3,3)
-ax[1].legend(loc='upper right')
-ax[2].step(R,(n_plus_norm - n_minus_norm) / (n_plus_norm + n_minus_norm + n_naught_norm), label='$P$', color='black')
-# ax[2].step(R, ((n_plus_norm + n_minus_norm + n_naught_norm) - 3*n_naught_norm)/(n_plus_norm + n_minus_norm + n_naught_norm), label='$Q$', color='red')
-ax[2].grid(True)
-ax[2].set_xlim(-3,3)
-ax[2].legend(loc='upper right')
-plt.show()
+R = np.linspace(-3, 3, 500)
+signal, Iplus, Iminus = GenerateVectorLineshape(0.45, R)
 
 subset_indices = np.arange(250, 500)
-n_plus_afp, n_minus_afp, n_naught_afp = afp.perform_afp(
-    len(subset_indices), subset_indices=subset_indices
+
+# --- before (unaltered lineshape → populations) ---
+afp_before = AFP.from_intensities(Iplus, Iminus)
+Iplus_b, Iminus_b = afp_before.to_intensities()
+
+# --- half swap: same subset, partial mixing ---
+afp_half = AFP.from_intensities(Iplus, Iminus)
+afp_half.perform_afp(subset_indices=subset_indices, efficiency=1.0)
+Iplus_h, Iminus_h = afp_half.to_intensities()
+n_plus_h = afp_half.n_plus.copy()
+n_naught_h = afp_half.n_naught.copy()
+n_minus_h = afp_half.n_minus.copy()
+
+# --- full AFP on same subset, starting from half-swap populations ---
+afp_full = AFP(n_plus_h.copy(), n_naught_h.copy(), n_minus_h.copy())
+afp_full.perform_afp(subset_indices=np.arange(0, 500), efficiency=1.0)
+Iplus_f, Iminus_f = afp_full.to_intensities()
+
+fig, axes = plt.subplots(3, 1, figsize=(12, 8), sharex=True)
+panels = (
+    ("before AFP", Iplus_b, Iminus_b),
+    ("after half swap (η=0.5)", Iplus_h, Iminus_h),
+    ("after full sweep on same subset (η=1.0)", Iplus_f, Iminus_f),
 )
-
-fig, ax = plt.subplots(2, 1, figsize=(12,8))
-ax[0].step(R, Iplus + Iminus, label='$P$', color='black')
-ax[0].step(R, Iplus - Iminus, label='$Q$', color='blue')
-ax[0].grid(True)
-ax[0].legend(loc='upper right')
-ax[1].step(R,(n_plus_afp - n_minus_afp) / (n_plus_afp + n_minus_afp + n_naught_afp), label='$P$', color='black')
-# ax[1].step(R, ((n_plus_afp + n_minus_afp + n_naught_afp) - 3*n_naught_afp)/(n_plus_afp + n_minus_afp + n_naught_afp), label='$Q$', color='red')
-ax[1].grid(True)
-ax[1].legend(loc='upper right')
+for ax, (title, Ip, Im) in zip(axes, panels):
+    ax.step(R, Ip + Im, label="$I_+ + I_-$", color="black")
+    ax.step(R, Ip, label="$I_+$", color="red")
+    ax.step(R, Im, label="$I_-$", color="blue")
+    ax.set_ylabel("intensity")
+    ax.grid(True)
+    ax.legend(loc="upper right")
+    ax.set_title(title)
+axes[-1].set_xlim(-3, 3)
+axes[-1].set_xlabel("$R$")
+plt.tight_layout()
 plt.show()
-
-fig, ax = plt.subplots(2, 1, figsize=(12,8))
-ax[0].step(R, n_plus, label='$n_+$', color='red')
-ax[0].step(R, n_minus, label='$n_-$', color='blue')
-ax[0].step(R, n_naught, label='$n_0$', color='green')
-ax[0].grid(True)
-ax[0].set_xlim(-3,3)
-ax[0].legend(loc='upper right')
-ax[1].step(R, n_plus_afp, label='$\\Delta n_+$', color='red')
-ax[1].step(R, n_minus_afp, label='$\\Delta n_-$', color='blue')
-ax[1].step(R, n_naught_afp, label='$\\Delta n_0$', color='green')
-ax[1].grid(True)
-ax[1].set_xlim(-3,3)
-ax[1].legend(loc='upper right', fontsize=14)
-plt.show()
-
-
-
-# fig, ax = plt.subplots(3, 1, figsize=(12,8))
-# # ax[0].step(R[subset_indices], signal[subset_indices], label='signal', color='black')
-# ax[0].step(R, n_plus_norm - n_naught_norm, label='$I_+$', color='red')
-# # ax[0].step(R, n_naught_norm - n_minus_norm, label='$I_-$', color='blue')
-# ax[0].grid(True)
-# ax[0].legend(loc='upper right')
-# # ax[1].step(R, (n_plus_afp - n_minus_afp), label='P', color='black')
-# # ax[1].step(R, n_plus_afp + n_minus_afp - 2*n_naught_afp, label=f'$Q$', color='purple')
-# ax[1].grid(True)
-# ax[1].legend(loc='upper right', fontsize=14)
-# ax[2].step(R, n_naught_afp - n_minus_afp, label=f'$I_-$', color='blue')
-# ax[2].grid(True)
-# ax[2].legend(loc='upper right')
-# plt.show()
-
-# fig, ax = plt.subplots(2,1,figsize=(12,8))
-# ax[0].step(R, n_plus_norm - n_naught_norm, label='$I_+$', color='black')
-# ax[0].step(R, n_plus_afp - n_naught_afp, label=f'$\\Delta I_+$', color='red')
-# ax[0].grid(True)
-# ax[0].legend(loc='upper right')
-# ax[1].step(R, n_naught_norm - n_minus_norm, label='$I_-$', color='black')
-# ax[1].step(R, n_naught_afp - n_minus_afp, label=f'$\\Delta I_-$', color='blue')
-# ax[1].grid(True)
-# ax[1].legend(loc='upper right')
-# plt.show()
-
-# fig, ax = plt.subplots(2, 1, figsize=(12,8))
-# ax[0].step(R, n_plus_norm, label='$n_+$', color='red')
-# ax[0].step(R, n_naught_norm, label='$n_0$', color='blue', linestyle='--')
-# ax[0].step(R, n_minus_norm, label='$n_-$', color='green', linestyle='--')
-# ax[0].grid(True)
-# ax[0].legend(loc='upper right')
-# ax[1].step(R, n_plus_afp, label=f'$n_+$', color='red', linestyle='--')
-# ax[1].step(R, n_naught_afp, label=f'$n_0$', color='blue', linestyle='--')
-# ax[1].step(R, n_minus_afp, label=f'$n_-$', color='green', linestyle='--')
-# ax[1].grid(True)
-# ax[1].legend(loc='upper right')
-# plt.show()

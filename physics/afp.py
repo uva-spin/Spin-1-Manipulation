@@ -1,101 +1,222 @@
-
-
 import numpy as np
 import tqdm
 
+
+## ---- Old methods here for reference ----
+# def solve_populations(i_plus_total, i_minus_total, mu):
+
+#     delta_plus = i_plus_total / mu
+#     delta_minus = i_minus_total / mu
+
+#     n_naught = (mu - (delta_plus - delta_minus))/3.0
+#     n_plus = delta_plus + n_naught
+#     n_minus  = -delta_minus + n_naught
+
+#     return n_plus, n_minus, n_naught
+
+
+# def solve_populations_per_theta_bins(i_plus, i_minus):
+
+#     n_bins = len(i_plus)
+
+#     n_plus_bins = np.zeros(n_bins)
+#     n_minus_bins = np.zeros(n_bins)
+#     n_naught_bins = np.zeros(n_bins)
+#     cc_theta_bins = np.zeros(n_bins)
+#     theta_area_bins = np.zeros(n_bins)
+#     mirrored_indices = np.zeros(n_bins, dtype=int)
+
+#     tot_area_R = np.sum(i_plus + i_minus) / 2.0 
+
+
+#     for idx in range(n_bins):
+
+#         mirror_idx = (n_bins - idx - 1)
+#         mirrored_indices[idx] = mirror_idx
+
+#         i_plus_theta = i_plus[idx] + i_minus[mirror_idx]
+#         i_minus_theta = i_minus[idx] + i_plus[mirror_idx]
+
+#         theta_pair_area = (i_plus_theta + i_minus_theta)/2.0
+#         area_fraction = theta_pair_area / tot_area_R
+#         theta_area_bins[idx] = theta_pair_area
+
+#         c_theta = area_fraction
+
+#         cc_theta_bins[idx] = c_theta
+        
+#         n_plus_i, n_minus_i, n_naught_i = solve_populations(
+#             i_plus_total=i_plus_theta,
+#             i_minus_total=i_minus_theta,
+#             mu=c_theta,
+#         )
+
+#         n_plus_bins[idx] = n_plus_i * area_fraction
+#         n_minus_bins[idx] = n_minus_i * area_fraction
+#         n_naught_bins[idx] = n_naught_i * area_fraction
+
+
 class AFP:
-    def __init__(self, n_plus_init, n_minus_init, n_naught_init):
-        self.n_plus = n_plus_init
-        self.n_minus = n_minus_init
-        self.n_naught = n_naught_init
-        self.mu = 1.
+    """
+    Spin-1 AFP workflow: load I+/I- → per-bin populations, optional sweep; use to_intensities() for I±.
+    """
 
-    def calc_P_R(self, Iplus, Iminus):
-        return self.calc_Iplus_theta(Iplus, Iminus) + self.calc_Iminus_theta(Iplus, Iminus)
+    __slots__ = ("n_plus", "n_naught", "n_minus")
 
-    def calc_Q_R(self, Iplus, Iminus):
-        return self.calc_Iplus_theta(Iplus, Iminus) - self.calc_Iminus_theta(Iplus, Iminus)
-
-    def calc_P_theta(self, Iplus, Iminus):
-        ### go over each bin and add Iplus(R) + Iminus(-R), opposite bin, to get theta space
-        P_theta = np.zeros(len(Iplus))
-        for i in range(len(Iplus)):
-            P_theta[i] = Iplus[i] + Iminus[len(Iplus) - i - 1] + Iplus[len(Iplus) - i - 1] + Iminus[i]
-        return P_theta
-
-    def calc_Q_theta(self, Iplus, Iminus):
-        ### go over each bin and add Iplus(R) - Iminus(-R), opposite bin, to get theta space
-        Q_theta = np.zeros(len(Iplus))
-        for i in range(len(Iplus)):
-            Q_theta[i] = Iplus[i] - Iminus[len(Iplus) - i - 1] + Iplus[len(Iplus) - i - 1] - Iminus[i]
-        return Q_theta
-    
-    def calc_Iplus_theta(self, Iplus, Iminus):
-        ## theta_1 (associated with Iplus) is evaluate at Iplus(R) and Iminus(-R)
-        Iplus_theta = np.zeros(len(Iplus))
-        for i in range(len(Iplus)):
-            Iplus_theta[i]  = Iplus[i] + Iminus[len(Iplus) - i - 1]
-        return Iplus_theta
-    
-    def calc_Iminus_theta(self, Iplus, Iminus):
-        ## theta_1 (associated with Iminus) is evaluate at Iminus(R) and Iplus(-R)
-        Iminus_theta = np.zeros(len(Iminus))
-        for i in range(len(Iminus)):
-            Iminus_theta[i] = Iminus[i] + Iplus[len(Iminus) - i - 1]
-        return Iminus_theta
-
-    def calculate_n_plus(self, Iplus, Iminus):
-        self.n_plus = np.array( self.mu * ( (1./3.) + (1./2.)*self.calc_P_R(Iplus, Iminus) + (1./6.)*self.calc_Q_R(Iplus, Iminus)))
-        return self.n_plus
-    
-    def calculate_n_minus(self, Iplus, Iminus):
-        self.n_minus = np.array( self.mu *( (1./3.) - (1./2.)*self.calc_P_R(Iplus, Iminus) + (1./6.)*self.calc_Q_R(Iplus, Iminus)))
-        return self.n_minus
-    
-    def calculate_n_naught(self, Iplus, Iminus):
-        self.n_naught = np.array(( self.mu - self.calc_Q_R(Iplus, Iminus)) / 3.0)
-        return self.n_naught
-
-    def calculate_n_naught_theta(self, Iplus, Iminus):
-        self.n_naught = np.array(( self.mu - self.calc_Q_theta(Iplus, Iminus)) / 3.0)
-        return self.n_naught
-
-    def norm_mu(self, Iplus, Iminus):
-        p = self.calc_P_R(Iplus, Iminus)
-        denom = self.n_plus + self.n_minus + self.n_naught
-        inv = 1.0 / denom
-        self.mu = np.where(p == 0, 0.0, inv)
-
-    def swap_pops(self, pop1_name, pop1_idx, pop2_name, pop2_idx):
-        pop1 = getattr(self, pop1_name)
-        pop2 = getattr(self, pop2_name)
-        pop1[pop1_idx], pop2[pop2_idx] = pop2[pop2_idx], pop1[pop1_idx]
-
-    def perform_afp(self, steps, subset_indices=None):
-        bins = len(self.n_plus)
-        if subset_indices is None:
-            sweep_indices = list(range(steps))
+    def __init__(self, rho_plus=None, rho_zero=None, rho_minus=None):
+        if rho_plus is None:
+            self.n_plus = self.n_naught = self.n_minus = None
         else:
-            sweep_indices = list(subset_indices)[:steps]
+            self.n_plus = np.asarray(rho_plus, dtype=float).copy()
+            self.n_naught = np.asarray(rho_zero, dtype=float).copy()
+            self.n_minus = np.asarray(rho_minus, dtype=float).copy()
 
-        for idx in tqdm.tqdm(sweep_indices, desc="Performing AFP"):
-            mirror_idx = bins - idx - 1
-            print(f"idx: {idx}, mirror_idx: {mirror_idx}")
-            print(f"n_plus: {self.n_plus[idx]}, n_naught: {self.n_naught[idx]}")
-            print(f"n_naught mirror: {self.n_naught[mirror_idx]}, n_minus: {self.n_minus[mirror_idx]}")
-            ### swap m = 1 and m = 0 at selected index
-            self.swap_pops("n_plus", idx, "n_naught", idx)
-            
-            ### and swap m = 0 and m = -1 at mirrored selected index
-            self.swap_pops("n_naught", idx, "n_minus", mirror_idx)
-            if idx == bins // 2:
-                ### set all population levels at center index to average of all population levels
-                average_pop = (self.n_plus[idx] + self.n_minus[idx] + self.n_naught[idx])/3.
-                self.n_plus[idx] = average_pop
-                self.n_minus[idx] = average_pop
-                self.n_naught[idx] = average_pop
+    @staticmethod
+    def intensities_to_populations(Iplus, Iminus):
+        n = len(Iplus)
+        tot_area = np.sum(Iplus + Iminus)
+
+        rho_plus = np.zeros(n)
+        rho_zero = np.zeros(n)
+        rho_minus = np.zeros(n)
+
+        for i in range(n):
+            m = n - 1 - i
+            mu = (Iplus[i] + Iminus[m]) / tot_area
+            rho_zero[i] = mu / 3.0
+            rho_plus[i] = rho_zero[i] + Iplus[i] / tot_area
+            rho_minus[i] = rho_zero[i] - Iminus[m] / tot_area
+
+        total = rho_plus.sum() + rho_zero.sum() + rho_minus.sum()
+        return rho_plus / total, rho_zero / total, rho_minus / total
+
+    @staticmethod
+    def populations_to_intensities(rho_plus, rho_zero, rho_minus):
+        n = len(rho_plus)
+        Iplus = np.zeros(n)
+        Iminus = np.zeros(n)
+
+        for i in range(n):
+            m = n - 1 - i
+            Iplus[i] = rho_plus[i] - rho_zero[i]
+            Iminus[m] = rho_zero[i] - rho_minus[i]
+
+        return Iplus, Iminus
+
+    @staticmethod
+    def _resolve_afp_sweep(n, steps=None, subset_indices=None, bin_range=None):
+        if subset_indices is not None:
+            return list(subset_indices)
+        if bin_range is not None:
+            start, stop = bin_range
+            start = int(start)
+            stop = int(stop)
+            if start < 0 or stop > n or start > stop:
+                raise ValueError(
+                    f"bin_range must satisfy 0 <= start <= stop <= n_bins ({n}); "
+                    f"got ({start}, {stop})."
+                )
+            return list(range(start, stop))
+        return list(range(steps if steps is not None else n))
+
+    @staticmethod
+    def _perform_afp_on_populations(rho_plus, rho_zero, rho_minus, sweep, efficiency=1.0):
+        """AFP sweep on per-bin populations (in place)."""
+        n = len(rho_plus)
+        centre = n // 2
+
+        for i in tqdm.tqdm(sweep, desc="AFP"):
+            m = n - 1 - i
+
+            # if i == centre:
+            #     for idx in ({i, m}):
+            #         avg = (
+            #             rho_plus[idx] + rho_zero[idx] + rho_minus[idx]
+            #         ) / 3.0
+            #         rho_plus[idx] = rho_zero[idx] = rho_minus[idx] = avg
+            #     continue
+
+            rho_plus[i], rho_zero[i] = (
+                efficiency * rho_zero[i] + (1 - efficiency) * rho_plus[i],
+                efficiency * rho_plus[i] + (1 - efficiency) * rho_zero[i],
+            )
+
+            if m == i:
+                continue
+
+            rho_zero[m], rho_minus[m] = (
+                efficiency * rho_minus[m] + (1 - efficiency) * rho_zero[m],
+                efficiency * rho_zero[m] + (1 - efficiency) * rho_minus[m],
+            )
+
+    @classmethod
+    def from_intensities(cls, Iplus, Iminus):
+        """Build state from absorption intensities (copies arrays)."""
+        rp, rz, rm = cls.intensities_to_populations(
+            np.asarray(Iplus, dtype=float), np.asarray(Iminus, dtype=float)
+        )
+        return cls(rp, rz, rm)
+
+    @staticmethod
+    def sweep_from_intensities(
+        Iplus,
+        Iminus,
+        steps=None,
+        subset_indices=None,
+        bin_range=None,
+        efficiency=1.0,
+        return_intensities=False,
+    ):
+        """
+        One-shot: intensities → AFP sweep → per-bin populations ``(n_plus, n_naught, n_minus)``.
+
+        Set ``return_intensities=True`` to get ``(Iplus_new, Iminus_new)`` instead.
+        Prefer ``AFP.from_intensities(...)`` when you need multiple steps on the same state.
+        """
+        runner = AFP.from_intensities(Iplus, Iminus)
+        runner.perform_afp(
+            steps=steps,
+            subset_indices=subset_indices,
+            bin_range=bin_range,
+            efficiency=efficiency,
+        )
+        if return_intensities:
+            return runner.to_intensities()
+        return runner.n_plus, runner.n_naught, runner.n_minus
+
+    def load_intensities(self, Iplus, Iminus):
+        """Replace populations from I+, I-."""
+        rp, rz, rm = self.intensities_to_populations(
+            np.asarray(Iplus, dtype=float), np.asarray(Iminus, dtype=float)
+        )
+        self.n_plus, self.n_naught, self.n_minus = rp, rz, rm
         return self.n_plus, self.n_minus, self.n_naught
 
+    def to_intensities(self):
+        """Current populations → I+, I-."""
+        if self.n_plus is None:
+            raise RuntimeError("No populations loaded; use from_intensities or load_intensities.")
+        return self.populations_to_intensities(self.n_plus, self.n_naught, self.n_minus)
 
+    def perform_afp(
+        self,
+        steps=None,
+        subset_indices=None,
+        bin_range=None,
+        efficiency=1.0,
+    ):
+        """
+        AFP sweep on stored per-bin populations (in place).
 
-    
+        Sweep: subset_indices, or bin_range, or first `steps` bins, or full grid.
+
+        Returns ``(n_plus, n_naught, n_minus)`` (same arrays held on the instance).
+        """
+        if self.n_plus is None:
+            raise RuntimeError("No populations loaded; use from_intensities or load_intensities.")
+        n_bins = len(self.n_plus)
+        sweep = self._resolve_afp_sweep(n_bins, steps, subset_indices, bin_range)
+        self._perform_afp_on_populations(
+            self.n_plus, self.n_naught, self.n_minus, sweep, efficiency
+        )
+        return self.n_plus, self.n_naught, self.n_minus
