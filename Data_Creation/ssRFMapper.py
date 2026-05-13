@@ -1,8 +1,17 @@
+import math
+from importlib import util
+from pathlib import Path
+from typing import Tuple
+
 import numpy as np
 import pandas as pd
-from typing import Tuple
 from scipy.special import wofz
-import math
+
+_afp_path = Path(__file__).resolve().parent.parent / "physics" / "afp.py"
+_afp_spec = util.spec_from_file_location("_spin1_afp", str(_afp_path))
+_afp_mod = util.module_from_spec(_afp_spec)
+_afp_spec.loader.exec_module(_afp_mod)
+AFP = _afp_mod.AFP
 
 class ssRFMapper:
     def __init__(self, f, sigma, gamma, x0, amp):
@@ -207,6 +216,15 @@ class ssRFMapper:
 
 
     def apply_ssRF(self, ps: np.ndarray, iplus: np.ndarray, iminus: np.ndarray, return_burn_info: bool = False, profile_type: str = 'voigt') -> Tuple:
+        """
+        Apply ss-RF burn to ``ps`` and map to ``iplus`` / ``iminus`` (arrays updated in place).
+
+        Returns ``(ps, iplus, iminus, rho_plus, rho_zero, rho_minus)`` where the last three
+        are per-bin spin-1 populations from ``AFP.intensities_to_populations`` (same as
+        ``physics/afp.py``), normalized so the three levels sum to 1 over all bins.
+
+        If ``return_burn_info`` is True, appends a ``burn_info`` dict as the last element.
+        """
 
         initial_ps = ps.copy()
         
@@ -296,7 +314,12 @@ class ssRFMapper:
             
             iplus_change_at_mirror = np.abs(iplus[mirrored_indices] - original_iplus_at_mirror)
             iminus_change_at_mirror = np.abs(iminus[mirrored_indices] - original_iminus_at_mirror)
-        
+
+        rho_plus, rho_zero, rho_minus = AFP.intensities_to_populations(
+            np.asarray(iplus, dtype=float),
+            np.asarray(iminus, dtype=float),
+        )
+
         if return_burn_info:
             burn_info = {
                 'burn_indices': burn_indices,
@@ -304,9 +327,11 @@ class ssRFMapper:
                 'iplus_change_at_burn': actual_iplus_change,
                 'iminus_change_at_burn': actual_iminus_change,
                 'iplus_change_at_mirror': iplus_change_at_mirror,
-                'iminus_change_at_mirror': iminus_change_at_mirror
+                'iminus_change_at_mirror': iminus_change_at_mirror,
+                'rho_plus': rho_plus,
+                'rho_zero': rho_zero,
+                'rho_minus': rho_minus,
             }
-            return ps, iplus, iminus, burn_info
-        
+            return ps, iplus, iminus, rho_plus, rho_zero, rho_minus, burn_info
 
-        return ps, iplus, iminus
+        return ps, iplus, iminus, rho_plus, rho_zero, rho_minus

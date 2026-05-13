@@ -52,7 +52,7 @@ def generate_vector_lineshape(polarization, x):
     iminus = i_minus_sign * lineshape(x, -1)
 
     total = iplus + iminus
-    delta_p = (polarization / np.sum(total)) * 200
+    delta_p = (polarization / np.sum(total))
     iplus *= delta_p
     iminus *= delta_p
 
