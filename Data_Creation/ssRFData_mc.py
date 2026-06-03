@@ -27,6 +27,18 @@ from physics.afp import AFP
 from physics.lineshape.Lineshape import GenerateVectorLineshape
 from ssRFMapper import ssRFMapper
 
+# Bins within this distance of the spectrum center (n_bins // 2) skip AFP.
+AFP_CENTER_EXCLUSION_BINS = 5
+
+
+def _afp_center_forbidden_indices(
+    n_bins: int, margin: int = AFP_CENTER_EXCLUSION_BINS
+) -> frozenset[int]:
+    centre = n_bins // 2
+    lo = max(0, centre - margin)
+    hi = min(n_bins - 1, centre + margin)
+    return frozenset(range(lo, hi + 1))
+
 
 def _random_afp_bin_range(n_bins: int, min_width: int, max_width: int) -> tuple[int, int]:
     min_width = int(np.clip(min_width, 1, n_bins))
@@ -41,10 +53,15 @@ def _apply_afp_sweep(
     Iminus: np.ndarray,
     bin_range: tuple[int, int],
     efficiency: float,
+    center_margin: int = AFP_CENTER_EXCLUSION_BINS,
 ) -> tuple[np.ndarray, np.ndarray]:
     total_area = np.sum(Iplus + Iminus)
     afp = AFP.from_intensities(Iplus, Iminus)
-    afp.perform_afp(bin_range=bin_range, efficiency=efficiency)
+    start, stop = int(bin_range[0]), int(bin_range[1])
+    forbidden = _afp_center_forbidden_indices(len(Iplus), center_margin)
+    subset = [i for i in range(start, stop) if i not in forbidden]
+    if subset:
+        afp.perform_afp(subset_indices=subset, efficiency=efficiency)
     Iplus_afp, Iminus_afp = afp.to_intensities()
 
     Iplus[:] = Iplus_afp * total_area
