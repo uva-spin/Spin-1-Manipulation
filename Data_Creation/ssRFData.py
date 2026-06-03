@@ -154,13 +154,16 @@ f = np.linspace(-3, 3, num_bins)
 sigma = 0.16
 gamma = 0.05
 
-# Polarization range (sample fewer than full lookup table)
-P_min, P_max = -0.7, 0.7
+# # Polarization range (sample fewer than full lookup table)
+P_bounds_upper = (-0.5, -0.2)
+P_bounds_lower = (0.2, 0.5)
 num_polarizations = 10  # Many events for large training set
 P_values = np.concatenate([
-    np.linspace(P_min, -0.1, num_polarizations // 2),
-    np.linspace(0.1, P_max, num_polarizations // 2)
+    np.linspace(P_bounds_lower[0], P_bounds_lower[1], num_polarizations // 2),
+    np.linspace(P_bounds_upper[0], P_bounds_upper[1], num_polarizations // 2)
 ])
+
+# P_values = np.linspace(0.5,0.55, num_polarizations)
 
 # Burn locations: sample x0 from valid ranges (avoid center)
 x0_negative = np.linspace(-1.5, -0.3, 50)
@@ -168,7 +171,7 @@ x0_positive = np.linspace(0.3, 1.5, 50)
 burn_locations = np.concatenate([x0_negative, x0_positive])
 
 # Amp range for training
-amp_min, amp_max = 5e-4, 5e-1
+amp_min, amp_max = 5e-4, 5e-2
 # Chance to inject a second burn after the mandatory first burn
 second_burn_probability = 0.99
 
