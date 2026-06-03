@@ -163,12 +163,55 @@ class ssRFMapper:
         """Clip burn amplitudes so values do not cross zero."""
         clipped = np.zeros_like(burn_values)
         for i, (p_val, burn_val) in enumerate(zip(ps_values, burn_values)):
-            if p_val > 0:
+            if p_val >= 0:
                 clipped[i] = np.maximum(burn_val, -p_val) if burn_val < 0 else burn_val
-            elif p_val < 0:
+            elif p_val <= 0:
                 clipped[i] = np.minimum(burn_val, -p_val) if burn_val > 0 else burn_val
             else:
                 clipped[i] = burn_val
+        return clipped
+
+    @staticmethod
+    def _scale_burn_until_nonzero(ps_values: np.ndarray, burn_values: np.ndarray) -> np.ndarray:
+        """Reduce burn amplitude until no Ps value reaches or crosses zero."""
+        scaled_burn = burn_values.copy()
+        for _ in range(200):
+            ps_after_burn = ps_values + scaled_burn
+            reaches_or_crosses_zero = (
+                ((ps_values > 0) & (ps_after_burn <= 0))
+                | ((ps_values < 0) & (ps_after_burn >= 0))
+            )
+            if not np.any(reaches_or_crosses_zero):
+                break
+            scaled_burn *= 0.9
+        return scaled_burn
+
+    @classmethod
+    def _constrain_burn_no_zero_crossing(
+        cls, ps_values: np.ndarray, burn_values: np.ndarray
+    ) -> np.ndarray:
+        """Scale then clip burn amplitudes so Ps does not cross or hit zero."""
+        scaled = cls._scale_burn_until_nonzero(ps_values, burn_values)
+        clipped = cls._clip_burn_to_preserve_sign(ps_values, scaled)
+        ps_after = ps_values + clipped
+
+        # Keep Ps strictly on its original side of zero (tiny epsilon margin).
+        eps = np.finfo(float).eps
+        pos_mask = ps_values > 0
+        neg_mask = ps_values < 0
+
+        if np.any(pos_mask):
+            too_low = ps_after[pos_mask] <= 0
+            if np.any(too_low):
+                max_negative = np.minimum(clipped[pos_mask][too_low], -(ps_values[pos_mask][too_low] - eps))
+                clipped[pos_mask][too_low] = max_negative
+
+        if np.any(neg_mask):
+            too_high = ps_after[neg_mask] >= 0
+            if np.any(too_high):
+                max_positive = np.maximum(clipped[neg_mask][too_high], -(ps_values[neg_mask][too_high] + eps))
+                clipped[neg_mask][too_high] = max_positive
+
         return clipped
 
     def mirror_burn_over_center(self, burn_effect: np.ndarray, burn_indices: np.ndarray) -> np.ndarray:
@@ -192,8 +235,93 @@ class ssRFMapper:
                 mirrored_burn[mirrored_idx] = burn_effect[i]
                 mirrored_indices.append(mirrored_idx)
         
-        return mirrored_burn/2, np.array(mirrored_indices)
+        return mirrored_burn, np.array(mirrored_indices)
 
+
+    def apply_bin_burn(
+        self,
+        ps: np.ndarray,
+        iplus: np.ndarray,
+        iminus: np.ndarray,
+        bin_idx: int,
+        amp: float,
+        return_burn_info: bool = False,
+    ) -> Tuple:
+        """
+        Apply a single-bin ss-RF burn: decrease Ps amplitude at ``bin_idx`` only
+        (no Voigt/Gaussian profile). Mirrored burn at the symmetric frequency is
+        applied when a matching bin exists.
+        """
+        initial_ps = ps.copy()
+        burn_indices = np.array([int(bin_idx)], dtype=int)
+        burn_val = float(amp)
+        if initial_ps[burn_indices[0]] < 0:
+            burn_val = abs(burn_val)
+        else:
+            burn_val = -abs(burn_val)
+
+        ps_at_burn = ps[burn_indices]
+        clipped_burn_values = self._constrain_burn_no_zero_crossing(
+            ps_at_burn, np.array([burn_val])
+        )
+
+        original_iplus_at_burn = iplus[burn_indices].copy()
+        original_iminus_at_burn = iminus[burn_indices].copy()
+
+        ps[burn_indices] += clipped_burn_values
+        # ps[burn_indices] += np.array([burn_val])
+
+        iplus_burn_effect, iminus_burn_effect = self.map_signal_fast(ps, burn_indices)
+        iplus[burn_indices] = iplus_burn_effect[burn_indices]
+        iminus[burn_indices] = iminus_burn_effect[burn_indices]
+
+        actual_iplus_change = np.abs(iplus[burn_indices] - original_iplus_at_burn)
+        actual_iminus_change = np.abs(iminus[burn_indices] - original_iminus_at_burn)
+
+        mirrored_burn, mirrored_indices = self.mirror_burn_over_center(
+            np.array([burn_val]), burn_indices
+        )
+        
+        mirrored_burn /= 2.0
+
+        iplus_change_at_mirror = None
+        iminus_change_at_mirror = None
+
+        if np.any(mirrored_indices):
+            mirrored_burn[mirrored_indices] *= -1.0
+            # Use clipped mirrored burns when mapping mirrored points.
+            burn_at_mirrored = mirrored_burn[mirrored_indices].copy()
+            ps_at_mirror = ps[mirrored_indices].copy()
+            burn_at_mirrored = self._constrain_burn_no_zero_crossing(
+                ps_at_mirror, burn_at_mirrored
+            )
+
+            original_iplus_at_mirror = iplus[mirrored_indices].copy()
+            original_iminus_at_mirror = iminus[mirrored_indices].copy()
+
+            ps[mirrored_indices] += burn_at_mirrored
+
+            iplus_mirror_effect, iminus_mirror_effect = self.map_signal_fast(ps, mirrored_indices)
+            iplus[mirrored_indices] = iplus_mirror_effect[mirrored_indices]
+            iminus[mirrored_indices] = iminus_mirror_effect[mirrored_indices]
+
+            iplus_change_at_mirror = np.abs(iplus[mirrored_indices] - original_iplus_at_mirror)
+            iminus_change_at_mirror = np.abs(iminus[mirrored_indices] - original_iminus_at_mirror)
+
+        if return_burn_info:
+            burn_info = {
+                "burn_indices": burn_indices,
+                "mirror_indices": mirrored_indices if np.any(mirrored_indices) else None,
+                "clipped_burn_values": clipped_burn_values.copy(),
+                "clipped_mirror_burn_values": burn_at_mirrored.copy() if np.any(mirrored_indices) else None,
+                "iplus_change_at_burn": actual_iplus_change,
+                "iminus_change_at_burn": actual_iminus_change,
+                "iplus_change_at_mirror": iplus_change_at_mirror,
+                "iminus_change_at_mirror": iminus_change_at_mirror,
+            }
+            return ps, iplus, iminus, burn_info
+
+        return ps, iplus, iminus
 
     def apply_ssRF(self, ps: np.ndarray, iplus: np.ndarray, iminus: np.ndarray, return_burn_info: bool = False, profile_type: str = 'voigt') -> Tuple:
 
@@ -222,8 +350,7 @@ class ssRFMapper:
                 # Initial ps is positive, burn should be negative (reduce magnitude)
                 ssRF_burn_values[i] = -np.abs(ssRF_burn_values[i])
         
-        # Clip the burn so ps doesn't cross zero
-        clipped_burn_values = self._clip_burn_to_preserve_sign(ps_at_burn, ssRF_burn_values)
+        clipped_burn_values = self._constrain_burn_no_zero_crossing(ps_at_burn, ssRF_burn_values)
         
         # Store original iplus and iminus values at burn indices before applying the burn
         original_iplus_at_burn = iplus[burn_indices].copy()
@@ -249,8 +376,12 @@ class ssRFMapper:
         
         if np.any(mirrored_indices):
             mirrored_burn[mirrored_indices] *= -1.0
-            
-            burn_at_mirrored = mirrored_burn[mirrored_indices]
+
+            burn_at_mirrored = mirrored_burn[mirrored_indices].copy()
+            ps_at_mirror = ps[mirrored_indices].copy()
+            burn_at_mirrored = self._constrain_burn_no_zero_crossing(
+                ps_at_mirror, burn_at_mirrored
+            )
 
             original_iplus_at_mirror = iplus[mirrored_indices].copy()
             original_iminus_at_mirror = iminus[mirrored_indices].copy()
