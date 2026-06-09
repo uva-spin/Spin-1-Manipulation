@@ -34,8 +34,8 @@ class ssRFMapper:
             iplus_values = np.array(iplus_values_at_freq)
             
             sort_indices = np.argsort(ps_values)
-            sorted_ps = ps_values[sort_indices]
-            sorted_iminus = iminus_values[sort_indices]
+            sorted_ps = ps_values
+            sorted_iminus = iminus_values
             sorted_iplus = iplus_values[sort_indices]
             
             self.signal_to_iplus_lookup[freq_idx] = {
@@ -49,49 +49,33 @@ class ssRFMapper:
                 'row_indices': np.array(row_indices)[sort_indices]
             }
 
-    def map_signal_to_iplus_iminus(self, signal: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-        """
-        Map a signal (Ps values at each frequency) to corresponding IPlus and IMinus values.
-        This is used to get the "true" IPlus and IMinus after shifting the signal.
+    @staticmethod
+    def _map_ps(ps_values: np.ndarray, target_ps: float) -> int:
+        idx = int(np.searchsorted(ps_values, target_ps, side="left"))
+        if idx <= 0:
+            return 0
+        if idx >= len(ps_values):
+            return len(ps_values) - 1
+        if abs(target_ps - ps_values[idx - 1]) <= abs(target_ps - ps_values[idx]):
+            return idx - 1
+        return idx
+
+    def map_signal(self, signal: np.ndarray, indices: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         
-        Args:
-            signal: Array of shape (500,) containing Ps values at each frequency bin
-            
-        Returns:
-            Tuple of (iplus_array, iminus_array), each of shape (500,)
-        """
-        iplus_results, iminus_results = self.map_signal_fast(signal, np.arange(len(signal)))
-        return iplus_results, iminus_results
+        iplus_results = np.empty(len(signal), dtype=float)
+        iminus_results = np.empty(len(signal), dtype=float)
 
-    def map_signal_fast(self, signal: np.ndarray, indices: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-        """
-        Map Ps (signal) to Iplus and Iminus using the lookup table.
-        Uses linear interpolation for smooth, physically consistent mappings.
-        """
-        iplus_results = []
-        iminus_results = []
-
-        for freq_idx, signal_value in enumerate(signal):
+        for freq_idx in indices:
+            signal_value = signal[freq_idx]
             iplus_lookup = self.signal_to_iplus_lookup[freq_idx]
-            iminus_lookup = self.signal_to_iminus_lookup[freq_idx]
 
             ps_values = iplus_lookup['ps_values']
             iplus_values = iplus_lookup['iplus_values']
-            iminus_values = iminus_lookup['iminus_values']
+            iminus_values = self.signal_to_iminus_lookup[freq_idx]['iminus_values']
 
-            # Clamp signal_value to lookup range to avoid extrapolation edge effects
-            signal_clamped = np.clip(signal_value, ps_values[0], ps_values[-1])
-
-            # Linear interpolation: smooth mapping instead of nearest-neighbor
-            # This gives physically consistent Iplus/Iminus for burned Ps values
-            mapped_iplus = np.interp(signal_clamped, ps_values, iplus_values)
-            mapped_iminus = np.interp(signal_clamped, ps_values, iminus_values)
-
-            iplus_results.append(mapped_iplus)
-            iminus_results.append(mapped_iminus)
-
-        iplus_results = np.array(iplus_results)
-        iminus_results = np.array(iminus_results)
+            nearest_idx = self._map_ps(ps_values, signal_value)
+            iplus_results[freq_idx] = iplus_values[nearest_idx]
+            iminus_results[freq_idx] = iminus_values[nearest_idx]
 
         return iplus_results, iminus_results
 
@@ -183,7 +167,7 @@ class ssRFMapper:
             )
             if not np.any(reaches_or_crosses_zero):
                 break
-            scaled_burn *= 0.9
+            scaled_burn *= 0.95
         return scaled_burn
 
     @classmethod
@@ -251,7 +235,12 @@ class ssRFMapper:
         Apply a single-bin ss-RF burn: decrease Ps amplitude at ``bin_idx`` only
         (no Voigt/Gaussian profile). Mirrored burn at the symmetric frequency is
         applied when a matching bin exists.
+
+        Input arrays are copied; callers keep their originals unchanged.
         """
+        ps = ps.copy()
+        iplus = iplus.copy()
+        iminus = iminus.copy()
         initial_ps = ps.copy()
         burn_indices = np.array([int(bin_idx)], dtype=int)
         burn_val = float(amp)
@@ -271,25 +260,77 @@ class ssRFMapper:
         ps[burn_indices] += clipped_burn_values
         # ps[burn_indices] += np.array([burn_val])
 
-        iplus_burn_effect, iminus_burn_effect = self.map_signal_fast(ps, burn_indices)
-        iplus[burn_indices] = iplus_burn_effect[burn_indices]
-        iminus[burn_indices] = iminus_burn_effect[burn_indices]
-
+        iplus_burn_effect, iminus_burn_effect = self.map_signal(ps, burn_indices)
+        # swap_mask = iplus_burn_effect[burn_indices] < iminus_burn_effect[burn_indices]
+        # new_iplus = np.where(
+        #     swap_mask,
+        #     iminus_burn_effect[burn_indices],
+        #     iplus_burn_effect[burn_indices],
+        # )
+        # new_iminus = np.where(
+        #     swap_mask,
+        #     iplus_burn_effect[burn_indices],
+        #     iminus_burn_effect[burn_indices],
+        # )
+        if ps[burn_indices] < 0:
+            swap_mask = abs(iplus_burn_effect[burn_indices]) > abs(iminus_burn_effect[burn_indices])
+            new_iplus = np.where(
+                swap_mask,
+                iminus_burn_effect[burn_indices],
+                iplus_burn_effect[burn_indices],
+            )
+            new_iminus = np.where(
+                swap_mask,
+                iplus_burn_effect[burn_indices],
+                iminus_burn_effect[burn_indices],
+            )
+        else:
+            swap_mask = abs(iplus_burn_effect[burn_indices]) < abs(iminus_burn_effect[burn_indices])
+            new_iplus = np.where(
+                swap_mask,
+                iminus_burn_effect[burn_indices],
+                iplus_burn_effect[burn_indices],
+            )
+            new_iminus = np.where(
+                swap_mask,
+                iplus_burn_effect[burn_indices],
+                iminus_burn_effect[burn_indices],
+            )
+        # Swapped mapping can point iplus upward; mirror about pre-burn iplus to flip direction.
+        if ps[burn_indices] < 0:
+            upward_mask = swap_mask & (abs(new_iminus) < abs(original_iplus_at_burn))
+            new_iminus = np.where(
+                upward_mask,
+                2 * original_iminus_at_burn - new_iminus,
+                new_iminus,
+            )
+            iplus[burn_indices] = new_iplus
+            iminus[burn_indices] = new_iminus
+        else:
+            upward_mask = swap_mask & (abs(new_iplus) < abs(original_iminus_at_burn))
+            new_iplus = np.where(
+                upward_mask,
+                2 * original_iplus_at_burn - new_iplus,
+                new_iplus,
+            )
+            iplus[burn_indices] = new_iplus
+            iminus[burn_indices] = new_iminus
+            
+            
         actual_iplus_change = np.abs(iplus[burn_indices] - original_iplus_at_burn)
         actual_iminus_change = np.abs(iminus[burn_indices] - original_iminus_at_burn)
 
         mirrored_burn, mirrored_indices = self.mirror_burn_over_center(
             np.array([burn_val]), burn_indices
         )
-        
-        mirrored_burn /= 2.0
 
+        mirrored_burn /= 2.0
+        
         iplus_change_at_mirror = None
         iminus_change_at_mirror = None
 
         if np.any(mirrored_indices):
             mirrored_burn[mirrored_indices] *= -1.0
-            # Use clipped mirrored burns when mapping mirrored points.
             burn_at_mirrored = mirrored_burn[mirrored_indices].copy()
             ps_at_mirror = ps[mirrored_indices].copy()
             burn_at_mirrored = self._constrain_burn_no_zero_crossing(
@@ -301,9 +342,11 @@ class ssRFMapper:
 
             ps[mirrored_indices] += burn_at_mirrored
 
-            iplus_mirror_effect, iminus_mirror_effect = self.map_signal_fast(ps, mirrored_indices)
-            iplus[mirrored_indices] = iplus_mirror_effect[mirrored_indices]
-            iminus[mirrored_indices] = iminus_mirror_effect[mirrored_indices]
+            iplus_burn_delta = iplus[burn_indices] - original_iplus_at_burn
+            iminus_burn_delta = iminus[burn_indices] - original_iminus_at_burn
+
+            iminus[mirrored_indices] -= 0.5 * iplus_burn_delta
+            iplus[mirrored_indices] -= 0.5 * iminus_burn_delta
 
             iplus_change_at_mirror = np.abs(iplus[mirrored_indices] - original_iplus_at_mirror)
             iminus_change_at_mirror = np.abs(iminus[mirrored_indices] - original_iminus_at_mirror)
@@ -324,7 +367,14 @@ class ssRFMapper:
         return ps, iplus, iminus
 
     def apply_ssRF(self, ps: np.ndarray, iplus: np.ndarray, iminus: np.ndarray, return_burn_info: bool = False, profile_type: str = 'voigt') -> Tuple:
+        """
+        Apply ss-RF burn to ``ps`` and map to ``iplus`` / ``iminus``.
 
+        Input arrays are copied; callers keep their originals unchanged.
+        """
+        ps = ps.copy()
+        iplus = iplus.copy()
+        iminus = iminus.copy()
         initial_ps = ps.copy()
         
         # Generate discretized Voigt/Gaussian profile across all bins
@@ -359,7 +409,7 @@ class ssRFMapper:
         ps[burn_indices] += clipped_burn_values
 
         ### map ps to iplus and iminus
-        iplus_burn_effect, iminus_burn_effect = self.map_signal_fast(ps, burn_indices)
+        iplus_burn_effect, iminus_burn_effect = self.map_signal(ps, burn_indices)
         
         ### burn to iplus, iminus
         iplus[burn_indices] = iplus_burn_effect[burn_indices]
@@ -373,6 +423,8 @@ class ssRFMapper:
 
         iplus_change_at_mirror = None
         iminus_change_at_mirror = None
+
+        # mirrored_burn /= 2.0
         
         if np.any(mirrored_indices):
             mirrored_burn[mirrored_indices] *= -1.0
@@ -387,10 +439,21 @@ class ssRFMapper:
             original_iminus_at_mirror = iminus[mirrored_indices].copy()
 
             ps[mirrored_indices] += burn_at_mirrored
-            
-            iplus_mirror_effect, iminus_mirror_effect = self.map_signal_fast(ps, mirrored_indices)
-            iplus[mirrored_indices] = iplus_mirror_effect[mirrored_indices]
-            iminus[mirrored_indices] = iminus_mirror_effect[mirrored_indices]
+
+            iplus_burn_delta = iplus_burn_effect[burn_indices] - original_iplus_at_burn
+            iminus_burn_delta = iminus_burn_effect[burn_indices] - original_iminus_at_burn
+
+            mirror_iplus_adjust = np.zeros_like(iplus)
+            mirror_iminus_adjust = np.zeros_like(iminus)
+            for burn_idx, mirror_idx, ip_delta, im_delta in zip(
+                burn_indices, mirrored_indices, iplus_burn_delta, iminus_burn_delta
+            ):
+                mirror_iminus_adjust[mirror_idx] -= 0.5 * ip_delta
+                mirror_iplus_adjust[mirror_idx] -= 0.5 * im_delta
+
+            unique_mirror_indices = np.unique(mirrored_indices)
+            iplus[unique_mirror_indices] += mirror_iplus_adjust[unique_mirror_indices]
+            iminus[unique_mirror_indices] += mirror_iminus_adjust[unique_mirror_indices]
             
             iplus_change_at_mirror = np.abs(iplus[mirrored_indices] - original_iplus_at_mirror)
             iminus_change_at_mirror = np.abs(iminus[mirrored_indices] - original_iminus_at_mirror)
