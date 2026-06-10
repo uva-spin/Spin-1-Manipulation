@@ -98,8 +98,8 @@ class AFP:
 
         for i in range(n):
             m = n - 1 - i
-            Iplus[i] = rho_plus[i] - rho_zero[i]
-            Iminus[m] = rho_zero[i] - rho_minus[i]
+            Iplus[i] = rho_plus[i] - rho_zero[i] 
+            Iminus[m] = rho_zero[i] - rho_minus[i] 
 
         return Iplus, Iminus
 

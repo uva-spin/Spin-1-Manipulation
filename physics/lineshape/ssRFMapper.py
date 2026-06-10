@@ -258,20 +258,9 @@ class ssRFMapper:
         original_iminus_at_burn = iminus[burn_indices].copy()
 
         ps[burn_indices] += clipped_burn_values
-        # ps[burn_indices] += np.array([burn_val])
 
         iplus_burn_effect, iminus_burn_effect = self.map_signal(ps, burn_indices)
-        # swap_mask = iplus_burn_effect[burn_indices] < iminus_burn_effect[burn_indices]
-        # new_iplus = np.where(
-        #     swap_mask,
-        #     iminus_burn_effect[burn_indices],
-        #     iplus_burn_effect[burn_indices],
-        # )
-        # new_iminus = np.where(
-        #     swap_mask,
-        #     iplus_burn_effect[burn_indices],
-        #     iminus_burn_effect[burn_indices],
-        # )
+
         if ps[burn_indices] < 0:
             swap_mask = abs(iplus_burn_effect[burn_indices]) > abs(iminus_burn_effect[burn_indices])
             new_iplus = np.where(
@@ -284,8 +273,8 @@ class ssRFMapper:
                 iplus_burn_effect[burn_indices],
                 iminus_burn_effect[burn_indices],
             )
-        else:
-            swap_mask = abs(iplus_burn_effect[burn_indices]) < abs(iminus_burn_effect[burn_indices])
+        elif ps[burn_indices] > 0:
+            swap_mask = original_iplus_at_burn < original_iminus_at_burn
             new_iplus = np.where(
                 swap_mask,
                 iminus_burn_effect[burn_indices],
@@ -296,7 +285,6 @@ class ssRFMapper:
                 iplus_burn_effect[burn_indices],
                 iminus_burn_effect[burn_indices],
             )
-        # Swapped mapping can point iplus upward; mirror about pre-burn iplus to flip direction.
         if ps[burn_indices] < 0:
             upward_mask = swap_mask & (abs(new_iminus) < abs(original_iplus_at_burn))
             new_iminus = np.where(
@@ -306,10 +294,10 @@ class ssRFMapper:
             )
             iplus[burn_indices] = new_iplus
             iminus[burn_indices] = new_iminus
-        else:
-            upward_mask = swap_mask & (abs(new_iplus) < abs(original_iminus_at_burn))
+        elif ps[burn_indices] > 0:
+            upward_iplus = new_iplus > original_iplus_at_burn
             new_iplus = np.where(
-                upward_mask,
+                upward_iplus,
                 2 * original_iplus_at_burn - new_iplus,
                 new_iplus,
             )

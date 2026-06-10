@@ -331,37 +331,28 @@ def Lineshape(x,eps):
 
 
 
-def GenerateVectorLineshape(P,x):
+def GenerateVectorLineshape(P, x):
+    r = (np.sqrt(abs(4 - 3 * P**2)) + P) / abs(2 - 2 * P)
 
-    r = (np.sqrt(4-3*P**(2))+P)/(2-2*P)
-    
     if P > 0:
-        Iplus = r*Lineshape(x,1)
-        Iminus = Lineshape(x,-1)
-        r = r
-    elif P < 0:
-        r = 1/r
-        Iplus = -Lineshape(x,1)
-        Iminus = -r*Lineshape(x,-1)
+        Iplus = r * Lineshape(x, 1)
+        Iminus = Lineshape(x, -1)
     else:
-        Iplus = 0
-        Iminus = 0
+        r = 1 / r
+        Iplus = -Lineshape(x, 1)
+        Iminus = -r * Lineshape(x, -1)
 
-    
     ### Scaling
     pSummed = np.sum(Iplus + Iminus)
-    deltaP = P/pSummed
-    # deltaP = 1
-    Iplus = Iplus*deltaP
-    Iminus = Iminus*deltaP
+    if pSummed == 0:
+        deltaP = 0.0
+    else:
+        deltaP = P / pSummed
+    Iplus = Iplus * deltaP
+    Iminus = Iminus * deltaP
     signal = Iplus + Iminus
 
-    # mask = np.abs(np.asarray(x)) <= 3.0
-    # signal = np.where(mask, signal, 0.0)
-    # Iplus = np.where(mask, Iplus, 0.0)
-    # Iminus = np.where(mask, Iminus, 0.0)
-
-    return signal,Iplus,Iminus
+    return signal, Iplus, Iminus
 
 
 def GenerateTensorLineshape(x, P, phi_deg):
@@ -451,12 +442,4 @@ def SamplingTensorLineshape(P, x, bound, phi=0):
 
 def Baseline_Polynomial_Curve(w):
     return -1.84153246e-07*w**2 + 8.42855076e-05*w - 1.11342243e-04
-
-if __name__ == "__main__":
-    x_grid = np.linspace(-3, 3, 500)
-    plt.figure(figsize=(10, 5))
-    plt.plot(x_grid, GenerateVectorLineshape(0.025, x_grid)[0])
-    plt.plot(x_grid, GenerateVectorLineshape(0.7, x_grid)[1])
-    plt.savefig("Lineshape.png", dpi=600)
-    plt.close()
 
