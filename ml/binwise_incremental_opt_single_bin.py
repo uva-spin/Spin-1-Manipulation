@@ -43,8 +43,8 @@ class BurnConfig:
     sigma: float = 0.16
     gamma: float = 0.05
     amp_min: float = 0.0
-    amp_max: float = 1.0
-    n_amp_steps: int = 20
+    amp_max: float = 1e-6
+    n_amp_steps: int = 1000
     lookup_path: Path | None = None
 
     def __post_init__(self) -> None:
@@ -125,8 +125,9 @@ def find_best_amp_for_bin(
             ps_try, iplus_try, iminus_try, bin_idx, float(amp)
         )
         q_try_bin = q_at_bin(iplus_try, iminus_try, bin_idx)
+        # print(f"amp: {amp}, q_try_bin: {q_try_bin}, best_q_bin: {best_q_bin}")
         if q_try_bin > best_q_bin:
-            # print(f"New best amp: {amp}, delta_q_bin: {q_try_bin - baseline_q_bin}")
+            print(f"New best amp: {amp}, delta_q_bin: {q_try_bin - baseline_q_bin}")
             best_q_bin = q_try_bin
             best_amp = float(amp)
             best_ps = ps_try
@@ -171,73 +172,53 @@ def optimize_binwise_incremental(
     step = 0
     mappers = build_mappers_for_bins(f, polarization, burn_lookup_df, lookup_burn_freqs)
 
-    for bin_idx in tqdm.tqdm(range(len(f)), desc="Optimizing bins"):
-        q_bin_before = q_at_bin(iplus, iminus, bin_idx)
-        best = find_best_amp_for_bin(
-            ps,
-            iplus,
-            iminus,
-            bin_idx,
-            config.amp_values,
-            mappers[bin_idx],
-        )
+    # target frequency bin
+    f_target = -0.92
+    bin_idx = lookup_burn_bin_idx(f_target, lookup_burn_freqs)
 
-        if best is None:
-            trace.append(
-                {
-                    "step": step,
-                    "bin_idx": bin_idx,
-                    "f": float(f[bin_idx]),
-                    "amp": 0.0,
-                    "reward": 0.0,
-                    "q_bin": q_bin_before,
-                    "q_bin_gain": 0.0,
-                    "q": current_q,
-                    "q_gain": current_q - initial_q,
-                    "iplus_area": current_iplus_area,
-                    "iplus_area_change": current_iplus_area - initial_iplus_area,
-                    "iminus_area": current_iminus_area,
-                    "iminus_area_change": current_iminus_area - initial_iminus_area,
-                    "area": current_area,
-                    "area_gain": current_area - initial_area,
-                    "skipped": True,
-                    "skip_reason": "no_amp_improves_q_at_bin",
-                }
-            )
-            continue
+    q_bin_before = q_at_bin(iplus, iminus, bin_idx)
+    best = find_best_amp_for_bin(
+        ps,
+        iplus,
+        iminus,
+        bin_idx,
+        config.amp_values,
+        mappers[bin_idx],
+    )
 
-        best_amp, best_q_bin, ps, iplus, iminus = best
-        iplus_area_before = current_iplus_area
-        iminus_area_before = current_iminus_area
-        current_q_bin = best_q_bin
-        current_q = q_polarization(iplus, iminus)
-        current_iplus_area = float(np.sum(iplus))
-        current_iminus_area = float(np.sum(iminus))
-        current_area = total_signal_area(iplus, iminus)
-        q_bin_gain = current_q_bin - q_bin_before
-        step += 1
-        trace.append(
-            {
-                "step": step,
-                "bin_idx": bin_idx,
-                "f": float(f[bin_idx]),
-                "amp": best_amp,
-                "reward": q_bin_gain,
-                "q_bin_reward": q_bin_gain,
-                "q_bin": current_q_bin,
-                "q_bin_gain": current_q_bin - q_bin_before,
-                "iplus_reduction": iplus_area_before - current_iplus_area,
-                "iminus_reduction": iminus_area_before - current_iminus_area,
-                "q": current_q,
-                "q_gain": current_q - initial_q,
-                "iplus_area": current_iplus_area,
-                "iplus_area_change": current_iplus_area - initial_iplus_area,
-                "iminus_area": current_iminus_area,
-                "iminus_area_change": current_iminus_area - initial_iminus_area,
-                "area": current_area,
-                "area_gain": current_area - initial_area,
-            }
-        )
+
+    best_amp, best_q_bin, ps, iplus, iminus = best
+    iplus_area_before = current_iplus_area
+    iminus_area_before = current_iminus_area
+    current_q_bin = best_q_bin
+    current_q = q_polarization(iplus, iminus)
+    current_iplus_area = float(np.sum(iplus))
+    current_iminus_area = float(np.sum(iminus))
+    current_area = total_signal_area(iplus, iminus)
+    q_bin_gain = current_q_bin - q_bin_before
+    step += 1
+    trace.append(
+        {
+            "step": step,
+            "bin_idx": bin_idx,
+            "f": float(f[bin_idx]),
+            "amp": best_amp,
+            "reward": q_bin_gain,
+            "q_bin_reward": q_bin_gain,
+            "q_bin": current_q_bin,
+            "q_bin_gain": current_q_bin - q_bin_before,
+            "iplus_reduction": iplus_area_before - current_iplus_area,
+            "iminus_reduction": iminus_area_before - current_iminus_area,
+            "q": current_q,
+            "q_gain": current_q - initial_q,
+            "iplus_area": current_iplus_area,
+            "iplus_area_change": current_iplus_area - initial_iplus_area,
+            "iminus_area": current_iminus_area,
+            "iminus_area_change": current_iminus_area - initial_iminus_area,
+            "area": current_area,
+            "area_gain": current_area - initial_area,
+        }
+    )
 
     return {
         "polarization": polarization,

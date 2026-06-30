@@ -20,10 +20,10 @@ OUTPUT_DIR = REPO_ROOT / "results" / "current" / "sarsa"
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 SEED = 42
-EPISODES = 500
+EPISODES = 5000
 POLARIZATION = 0.45
 MAX_BURNS = 165
-FREE_BIN_SELECTION = True
+FREE_BIN_SELECTION = False
 
 from physics.lineshape.Lineshape import GenerateVectorLineshape
 from physics.lineshape.ssRFMapper import ssRFMapper
@@ -41,11 +41,11 @@ class BurnConfig:
     sigma: float = 0.16 
     gamma: float = 0.05
     amp_min: float = 0.0
-    amp_max: float = 5e-3
-    n_amp_bins: int = 165
+    amp_max: float = 5e-1
+    n_amp_bins: int = 30
     max_burns: int = MAX_BURNS
-    enforce_full_spectrum: bool = True
-    n_q_bins: int = 40
+    enforce_full_spectrum: bool = FREE_BIN_SELECTION
+    n_q_bins: int = MAX_BURNS
     x_values: np.ndarray | None = None
     lookup_path: Path | None = None
 
@@ -90,7 +90,7 @@ class BurnConfig:
     @property
     def n_states(self) -> int:
         return self.n_q_bins * self.max_burns
-
+        # return self.n_q_bins
 
 class TensorBurnEnv:
 
@@ -257,8 +257,8 @@ class SARSAAgent:
         self,
         n_states: int,
         n_actions: int,
-        alpha: float = 0.45,
-        gamma: float = 0.95,
+        alpha: float = 0.1,
+        gamma: float = 0.99,
         epsilon: float = 1.0,
         seed: int | None = 42,
     ):

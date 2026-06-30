@@ -254,55 +254,70 @@ class ssRFMapper:
             ps_at_burn, np.array([burn_val])
         )
 
+        if np.all(clipped_burn_values == 0):
+            if return_burn_info:
+                burn_info = {
+                    "burn_indices": burn_indices,
+                    "mirror_indices": None,
+                    "clipped_burn_values": clipped_burn_values.copy(),
+                    "clipped_mirror_burn_values": None,
+                    "iplus_change_at_burn": np.zeros(len(burn_indices), dtype=float),
+                    "iminus_change_at_burn": np.zeros(len(burn_indices), dtype=float),
+                    "iplus_change_at_mirror": None,
+                    "iminus_change_at_mirror": None,
+                }
+                return ps, iplus, iminus, burn_info
+            return ps, iplus, iminus
+
         original_iplus_at_burn = iplus[burn_indices].copy()
         original_iminus_at_burn = iminus[burn_indices].copy()
 
         ps[burn_indices] += clipped_burn_values
 
         iplus_burn_effect, iminus_burn_effect = self.map_signal(ps, burn_indices)
+        
+        iplus_delta = abs(original_iplus_at_burn - iplus_burn_effect[burn_indices])
+        iminus_delta = abs(original_iminus_at_burn - iminus_burn_effect[burn_indices])
 
         if ps[burn_indices] < 0:
-            swap_mask = abs(iplus_burn_effect[burn_indices]) > abs(iminus_burn_effect[burn_indices])
-            new_iplus = np.where(
-                swap_mask,
-                iminus_burn_effect[burn_indices],
-                iplus_burn_effect[burn_indices],
-            )
-            new_iminus = np.where(
-                swap_mask,
-                iplus_burn_effect[burn_indices],
-                iminus_burn_effect[burn_indices],
-            )
+            if original_iplus_at_burn < original_iminus_at_burn:
+                iplus[burn_indices] += iminus_delta
+                iminus[burn_indices] += iplus_delta
+            else:
+                iplus[burn_indices] = iplus_burn_effect[burn_indices]
+                iminus[burn_indices] = iminus_burn_effect[burn_indices]
         elif ps[burn_indices] > 0:
-            swap_mask = original_iplus_at_burn < original_iminus_at_burn
-            new_iplus = np.where(
-                swap_mask,
-                iminus_burn_effect[burn_indices],
-                iplus_burn_effect[burn_indices],
-            )
-            new_iminus = np.where(
-                swap_mask,
-                iplus_burn_effect[burn_indices],
-                iminus_burn_effect[burn_indices],
-            )
-        if ps[burn_indices] < 0:
-            upward_mask = swap_mask & (abs(new_iminus) < abs(original_iplus_at_burn))
-            new_iminus = np.where(
-                upward_mask,
-                2 * original_iminus_at_burn - new_iminus,
-                new_iminus,
-            )
-            iplus[burn_indices] = new_iplus
-            iminus[burn_indices] = new_iminus
-        elif ps[burn_indices] > 0:
-            upward_iplus = new_iplus > original_iplus_at_burn
-            new_iplus = np.where(
-                upward_iplus,
-                2 * original_iplus_at_burn - new_iplus,
-                new_iplus,
-            )
-            iplus[burn_indices] = new_iplus
-            iminus[burn_indices] = new_iminus
+            if original_iplus_at_burn < original_iminus_at_burn:
+                if  iminus_delta - iplus[burn_indices] > 0:
+                    iplus[burn_indices] -= iminus_delta
+                else:
+                    iplus[burn_indices] += iminus_delta
+                iminus[burn_indices] -= iplus_delta
+            else: 
+                # iplus[burn_indices] = iplus_burn_effect[burn_indices]
+                # iminus[burn_indices] = iminus_burn_effect[burn_indices]
+                iplus[burn_indices] -= iplus_delta
+                iminus[burn_indices] -= iminus_delta
+
+        # if ps[burn_indices] < 0:
+        #     upward_mask = (abs(iminus[burn_indices]) < abs(original_iplus_at_burn))
+        #     new_iminus = np.where(
+        #         upward_mask,
+        #         2 * iplus[burn_indices] - iplus[burn_indices],
+        #         iplus[burn_indices],
+        #     )
+        #     iplus[burn_indices] = iplus_burn_effect[burn_indices]
+        #     iminus[burn_indices] = new_iminus
+        # elif ps[burn_indices] > 0:
+        #     downward_mask = (abs(iplus[burn_indices]) < abs(original_iminus_at_burn))
+        #     # new_iplus = np.where(
+        #     #     downward_mask,
+        #     #     2 * iplus[burn_indices] - iplus[burn_indices],
+        #     #     iplus[burn_indices],
+        #     # )
+        #     iplus[burn_indices] = -iminus_delta
+            # iminus[burn_indices] = new_iminus
+        
             
             
         actual_iplus_change = np.abs(iplus[burn_indices] - original_iplus_at_burn)

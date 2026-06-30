@@ -24,7 +24,7 @@ sys.path.insert(0, str(REPO_ROOT))
 
 from physics.afp import AFP
 from physics.lineshape.Lineshape import GenerateVectorLineshape
-from ssRFMapper import ssRFMapper
+from physics.lineshape.ssRFMapper import ssRFMapper
 
 
 def _random_afp_bin_range(n_bins: int, min_width: int, max_width: int) -> tuple[int, int]:
@@ -155,15 +155,15 @@ sigma = 0.16
 gamma = 0.05
 
 # # Polarization range (sample fewer than full lookup table)
-P_bounds_upper = (-0.5, -0.2)
-P_bounds_lower = (0.2, 0.5)
+# P_bounds_upper = (-0.5, -0.2)
+# P_bounds_lower = (0.2, 0.5)
 num_polarizations = 10  # Many events for large training set
-P_values = np.concatenate([
-    np.linspace(P_bounds_lower[0], P_bounds_lower[1], num_polarizations // 2),
-    np.linspace(P_bounds_upper[0], P_bounds_upper[1], num_polarizations // 2)
-])
+# P_values = np.concatenate([
+#     np.linspace(P_bounds_lower[0], P_bounds_lower[1], num_polarizations // 2),
+#     np.linspace(P_bounds_upper[0], P_bounds_upper[1], num_polarizations // 2)
+# ])
 
-# P_values = np.linspace(0.5,0.55, num_polarizations)
+P_values = np.linspace(0.45,0.45, num_polarizations)
 
 # Burn locations: sample x0 from valid ranges (avoid center)
 x0_negative = np.linspace(-1.5, -0.3, 50)
@@ -173,10 +173,10 @@ burn_locations = np.concatenate([x0_negative, x0_positive])
 # Amp range for training
 amp_min, amp_max = 5e-4, 5e-2
 # Chance to inject a second burn after the mandatory first burn
-second_burn_probability = 0.99
+second_burn_probability = 0.0
 
 # AFP sweep injection over a randomized contiguous bin interval.
-afp_sweep_probability = 1.0
+afp_sweep_probability = 0.0
 afp_min_sweep_bins = 8
 afp_max_sweep_bins = num_bins // 3
 afp_efficiency = 1.0

@@ -8,11 +8,6 @@ in ``physics/ssrf_realtime/``, matching
 State, conversions, RF, spin-diffusion redistribution, DNP, and T1 all follow
 the realtime simulator conventions:
 
-* packet populations ``n[k, level]`` with fixed grid weights ``mu[k]``
-* intensities from transition differences and display calibration
-* positivity-preserving Euler integration with per-packet renormalization
-
-For multi-step simulations, use :class:`Spin1Model` directly.
 """
 
 from __future__ import annotations
@@ -22,28 +17,16 @@ from typing import Optional
 
 import numpy as np
 
-from ssrf_realtime import Spin1Model, Spin1Params
-from ssrf_realtime.model import PLUS, ZERO, MINUS
+from . import Spin1Model, Spin1Params
+from .model import PLUS, ZERO, MINUS
 
-__all__ = [
-    "Spin1Model",
-    "Spin1Params",
-    "PLUS",
-    "ZERO",
-    "MINUS",
-    "build_model_for_intensities",
-    "solve_rate_equations",
-    "verify_rates_response",
-    "burn_preserves_ps_sign",
-]
-
-
-def _ps_crosses_zero(ps_before: float, ps_after: float) -> bool:
-    if ps_before > 0:
-        return ps_after <= 0
-    if ps_before < 0:
-        return ps_after >= 0
-    return ps_after != 0.0
+def _value_crosses_zero(before: float, after: float) -> bool:
+    """True when a quantity moves to the opposite side of zero (or hits zero from one side)."""
+    if before > 0:
+        return after <= 0
+    if before < 0:
+        return after >= 0
+    return after != 0.0
 
 
 def burn_preserves_ps_sign(
@@ -53,15 +36,18 @@ def burn_preserves_ps_sign(
     iminus_new: np.ndarray,
     burn_idx: int,
 ) -> bool:
-    """True when Ps = I+ + I- at burn and mirror bins stays on its original side of zero."""
+    """True when I+, I-, and Ps at burn and mirror bins stay on their original side of zero."""
     n = len(iplus)
     burn_idx = int(burn_idx)
     mirror_idx = n - 1 - burn_idx
     for idx in (burn_idx, mirror_idx):
-        ps_before = float(iplus[idx] + iminus[idx])
-        ps_after = float(iplus_new[idx] + iminus_new[idx])
-        if _ps_crosses_zero(ps_before, ps_after):
-            return False
+        for before, after in (
+            (float(iplus[idx]), float(iplus_new[idx])),
+            (float(iminus[idx]), float(iminus_new[idx])),
+            (float(iplus[idx] + iminus[idx]), float(iplus_new[idx] + iminus_new[idx])),
+        ):
+            if _value_crosses_zero(before, after):
+                return False
     return True
 
 
@@ -137,35 +123,73 @@ def solve_rate_equations(
     model.params.rf_burn_R = float(model.Rplus[int(burn_idx)])
 
     use_rf_only = not full_dynamics and rf_only
-    model.step_once(dt=dt, rf_on=True, dnp_on=model.params.dnp_enabled, rf_only=use_rf_only)
-
-    Iplus_new, Iminus_new, _ = model.physical_intensities()
+    step_dt = float(dt)
+    dt_scale = 1.0
+    p = model.params
+    saved_rates = None
+    if use_rf_only:
+        saved_rates = (
+            p.d_same_plus0,
+            p.d_same_0minus,
+            p.d_spec_plus0,
+            p.d_spec_0minus,
+            p.dnp_rate,
+            p.t1_rate,
+        )
+        p.d_same_plus0 = 0.0
+        p.d_same_0minus = 0.0
+        p.d_spec_plus0 = 0.0
+        p.d_spec_0minus = 0.0
+        p.dnp_rate = 0.0
+        p.t1_rate = 0.0
+    for _ in range(model.params.steps):
+        model.load_from_physical_intensities(Iplus, Iminus)
+        model.step_once(
+            dt=step_dt,
+            rf_on=True,
+            dnp_on=False if use_rf_only else model.params.dnp_enabled,
+        )
+        Iplus_new, Iminus_new, _ = model.physical_intensities()
+        if burn_preserves_ps_sign(Iplus, Iminus, Iplus_new, Iminus_new, burn_idx):
+            break
+        dt_scale *= 0.5
+    if saved_rates is not None:
+        (
+            p.d_same_plus0,
+            p.d_same_0minus,
+            p.d_spec_plus0,
+            p.d_spec_0minus,
+            p.dnp_rate,
+            p.t1_rate,
+        ) = saved_rates
+    # else:
+    #     model.load_from_physical_intensities(Iplus, Iminus)
+    #     Iplus_new = np.asarray(Iplus, dtype=float).copy()
+    #     Iminus_new = np.asarray(Iminus, dtype=float).copy()
     rho_plus = model.n[:, PLUS].copy()
     rho_zero = model.n[:, ZERO].copy()
     rho_minus = model.n[:, MINUS].copy()
     return Iplus_new, Iminus_new, rho_plus, rho_zero, rho_minus
 
 
-def verify_rates_response(
+def verify_burn_response(
     Iplus,
     Iminus,
+    Iplus_new,
+    Iminus_new,
     burn_idx: int,
-    gamma_rf: float,
-    dt: float = 1.0,
     rtol: float = 1e-6,
 ):
     """
-    Check RF response ratios at the burn and mirror bins.
+    Check RF response ratios at the burn and mirror bins for given before/after intensities.
 
-    Uses a small ``dt`` relative to ``gamma_rf`` when possible so the linearized
-    2:1 burn/mirror relations hold.
+    Expected (magnitudes of changes):
+        Amp_burn  = 2 * Amp_mirror
+        dIplus_burn  = 2 * dIminus_mirror
+        dIminus_burn = 2 * dIplus_mirror
     """
     burn_idx = int(burn_idx)
     mirror_idx = len(Iplus) - 1 - burn_idx
-
-    Iplus_new, Iminus_new, _, _, _ = solve_rate_equations(
-        Iplus, Iminus, dt, gamma_rf, burn_idx, rf_only=True
-    )
 
     d_ip_burn = Iplus_new[burn_idx] - Iplus[burn_idx]
     d_im_burn = Iminus_new[burn_idx] - Iminus[burn_idx]
@@ -209,42 +233,21 @@ def verify_rates_response(
     }
 
 
-if __name__ == "__main__":
-    import matplotlib.pyplot as plt
+def verify_rates_response(
+    Iplus,
+    Iminus,
+    burn_idx: int,
+    gamma_rf: float,
+    dt: float = 1.0,
+    rtol: float = 1e-6,
+):
+    """
+    Check RF response ratios at the burn and mirror bins.
 
-    from ssrf_realtime.lineshape import plot_signal_reference
-
-    params = Spin1Params(
-        n_bins=501,
-        p0=0.45,
-        rf_burn_R=-0.92,
-        gamma_rf=10.0,
-        dnp_enabled=False,
-        dt=0.0015,
+    Uses a small ``dt`` relative to ``gamma_rf`` when possible so the linearized
+    2:1 burn/mirror relations hold.
+    """
+    Iplus_new, Iminus_new, _, _, _ = solve_rate_equations(
+        Iplus, Iminus, dt, gamma_rf, burn_idx, rf_only=True
     )
-    model = Spin1Model(params)
-    R = model.Rplus
-    _, Iplus, Iminus, _total = model.reference_spectrum()
-
-    burn_idx = model.burn_index(params.rf_burn_R)
-
-    print("Initial P:", model.polarizations()["P"])
-    for _ in range(400):
-        model.step(1, rf_on=True, dnp_on=False)
-    print("After RF P:", model.polarizations()["P"])
-
-    R2, Ip2, Im2, total2 = model.spectrum()
-    rates_check = verify_rates_response(Iplus, Iminus, burn_idx, params.gamma_rf, dt=0.0015)
-    print(f"single-step verify passed: {rates_check['passed']}")
-
-    fig, axes = plt.subplots(figsize=(12, 6))
-    axes.plot(R, _total, label="initial total")
-    axes.plot(R, Ip2, label="I+")
-    axes.plot(R, Im2, label="I-")
-    axes.plot(R2, total2, label="after RF + diffusion")
-    axes.axvline(params.rf_burn_R, linestyle="--", alpha=0.5)
-    axes.legend()
-
-    plt.tight_layout()
-    plt.show()
-    plt.close()
+    return verify_burn_response(Iplus, Iminus, Iplus_new, Iminus_new, burn_idx, rtol=rtol)

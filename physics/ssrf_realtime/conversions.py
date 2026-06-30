@@ -58,8 +58,6 @@ def physical_intensities_to_packet_n(
     Iminus = np.asarray(Iminus, dtype=float)
     mu = np.asarray(mu, dtype=float)
     n_bins = len(Iplus)
-    if len(Iminus) != n_bins or len(mu) != n_bins:
-        raise ValueError("Iplus, Iminus, and mu must have the same length")
 
     inv_scale = float(dR) / float(display_cal)
     n = np.zeros((n_bins, 3), dtype=float)

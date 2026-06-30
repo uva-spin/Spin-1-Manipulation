@@ -1,61 +1,6 @@
 import numpy as np
 import tqdm
 
-
-## ---- Old methods here for reference ----
-# def solve_populations(i_plus_total, i_minus_total, mu):
-
-#     delta_plus = i_plus_total / mu
-#     delta_minus = i_minus_total / mu
-
-#     n_naught = (mu - (delta_plus - delta_minus))/3.0
-#     n_plus = delta_plus + n_naught
-#     n_minus  = -delta_minus + n_naught
-
-#     return n_plus, n_minus, n_naught
-
-
-# def solve_populations_per_theta_bins(i_plus, i_minus):
-
-#     n_bins = len(i_plus)
-
-#     n_plus_bins = np.zeros(n_bins)
-#     n_minus_bins = np.zeros(n_bins)
-#     n_naught_bins = np.zeros(n_bins)
-#     cc_theta_bins = np.zeros(n_bins)
-#     theta_area_bins = np.zeros(n_bins)
-#     mirrored_indices = np.zeros(n_bins, dtype=int)
-
-#     tot_area_R = np.sum(i_plus + i_minus) / 2.0 
-
-
-#     for idx in range(n_bins):
-
-#         mirror_idx = (n_bins - idx - 1)
-#         mirrored_indices[idx] = mirror_idx
-
-#         i_plus_theta = i_plus[idx] + i_minus[mirror_idx]
-#         i_minus_theta = i_minus[idx] + i_plus[mirror_idx]
-
-#         theta_pair_area = (i_plus_theta + i_minus_theta)/2.0
-#         area_fraction = theta_pair_area / tot_area_R
-#         theta_area_bins[idx] = theta_pair_area
-
-#         c_theta = area_fraction
-
-#         cc_theta_bins[idx] = c_theta
-        
-#         n_plus_i, n_minus_i, n_naught_i = solve_populations(
-#             i_plus_total=i_plus_theta,
-#             i_minus_total=i_minus_theta,
-#             mu=c_theta,
-#         )
-
-#         n_plus_bins[idx] = n_plus_i * area_fraction
-#         n_minus_bins[idx] = n_minus_i * area_fraction
-#         n_naught_bins[idx] = n_naught_i * area_fraction
-
-
 class AFP:
     """
     Spin-1 AFP workflow: load I+/I- → per-bin populations, optional sweep; use to_intensities() for I±.

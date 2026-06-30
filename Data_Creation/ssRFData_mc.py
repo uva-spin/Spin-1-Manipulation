@@ -25,7 +25,7 @@ sys.path.insert(0, str(REPO_ROOT))
 
 from physics.afp import AFP
 from physics.lineshape.Lineshape import GenerateVectorLineshape
-from ssRFMapper import ssRFMapper
+from physics.lineshape.ssRFMapper import ssRFMapper
 
 # Bins within this distance of the spectrum center (n_bins // 2) skip AFP.
 AFP_CENTER_EXCLUSION_BINS = 5

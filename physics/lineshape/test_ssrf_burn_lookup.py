@@ -1,9 +1,10 @@
 """
-Mirror of test_ssrf_burn_lookup.py using direct rate-equation burns.
+Mirror of test_ssrf.py using burn_lookup_table.pkl trajectories.
 
-Burns P and P_REF down to the P_REF2 signal level at one bin via a single
-``solve_rate_equations`` step each (``dt`` chosen by root-finding), then
-prints the resulting Iplus/Iminus at the burn bin.
+Uses ``GenerateVectorLineshape`` (``Lineshape.py`` normalization: scale so
+``sum(Iplus + Iminus) == P``) for starting spectra, matching
+``burn_lookup_table.pkl`` and ``burn_lookup_realtime.initial_lineshape``.
+Loads ``burn_lookup_table.pkl`` directly (no on-the-fly trajectory generation).
 """
 
 from __future__ import annotations
@@ -13,28 +14,37 @@ from pathlib import Path
 
 import matplotlib.pyplot as plt
 import numpy as np
+import pandas as pd
 from scipy.optimize import brentq
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from physics.burn_lookup_realtime import BurnTrajectoryConfig
+from physics.burn_lookup_realtime import BurnTrajectoryConfig, build_burn_bin_index
 from physics.lineshape.Lineshape import GenerateVectorLineshape
-from physics.ssrf_realtime.rate_equations_realtime import (
-    solve_rate_equations,
-    verify_burn_response,
-    verify_rates_response,
-)
+from physics.lineshape.burnLookupMapper import BurnLookupMapper
+
+
+class PolarizationBurnLookupMapper(BurnLookupMapper):
+    """Map burned Ps using the lookup trajectory for this initial polarization."""
+
+    def compute_lookup_index(self) -> None:
+        self.burn_index = build_burn_bin_index(
+            self.burn_lookup_df,
+            self.burn_bin_idx,
+            polarization=self.polarization,
+        )
+
+from rate_equations_realtime import verify_burn_response, verify_rates_response  
 
 P = 0.60
 P_REF = 0.45
-P_REF2 = 0.44
+P_REF2 = 0.30
 NUM_BINS = 500
-x0 = -0.92
-gamma_rf = 2.0
+x0 = 0.92
 
-trajectory_cfg = BurnTrajectoryConfig(n_bins=NUM_BINS, max_steps=10000, dt=0.0015, gamma_rf=gamma_rf)
+trajectory_cfg = BurnTrajectoryConfig(n_bins=NUM_BINS, max_steps=500)
 f = trajectory_cfg.f
 signal, iplus, iminus = GenerateVectorLineshape(P, f)
 ref_signal, ref_iplus, ref_iminus = GenerateVectorLineshape(P_REF, f)
@@ -53,59 +63,58 @@ print(f"Iplus Amplitude at burned bin: {iplus[test_bin_idx]:.6e}")
 print(f"Iminus Amplitude at burned bin: {iminus[test_bin_idx]:.6e}")
 
 
-def _find_brentq_bracket(func, values):
+def _load_burn_lookup(
+    burn_bin_idx: int,
+    *,
+    lookup_path: Path,
+) -> pd.DataFrame:
+    df = pd.read_pickle(lookup_path)
+    return df[df["burn_bin_idx"] == burn_bin_idx]
+
+
+lookup_path = _DATA_CREATION_DIR / "burn_lookup_table.pkl"
+
+
+def _find_brentq_bracket(func, amps):
     """Return (lo, hi) where func changes sign, or raise ValueError."""
-    samples = [(value, func(value)) for value in values]
-    for (v0, f0), (v1, f1) in zip(samples, samples[1:]):
+    values = [(a, func(a)) for a in amps]
+    for (a0, f0), (a1, f1) in zip(values, values[1:]):
         if f0 == 0.0:
-            return v0, v0
+            return a0, a0
         if f0 * f1 < 0.0:
-            return v0, v1
+            return a0, a1
     raise ValueError(
         "No sign change in residual; cannot bracket root. "
-        f"Sampled values={list(values)}, residuals={[v for _, v in samples]}"
+        f"Sampled amps={amps}, residuals={[v for _, v in values]}"
     )
 
 
-def _burned_ps_single_step(
+def _find_burn_amp(
     polarization: float,
-    burn_iplus: np.ndarray,
-    burn_iminus: np.ndarray,
-    dt: float,
-) -> float:
-    """Return burn-bin Ps after one ``solve_rate_equations`` step at ``dt``."""
-    params = trajectory_cfg.spin1_params(polarization)
-    iplus_new, iminus_new, _, _, _ = solve_rate_equations(
-        burn_iplus,
-        burn_iminus,
-        dt,
-        trajectory_cfg.gamma_rf,
-        test_bin_idx,
-        params=params,
-        rf_only=True,
-    )
-    return float(iplus_new[test_bin_idx] + iminus_new[test_bin_idx])
-
-
-def _find_burn_dt(
-    polarization: float,
+    burn_signal: np.ndarray,
     burn_iplus: np.ndarray,
     burn_iminus: np.ndarray,
     *,
-    target_ps: float,
+    target_signal: float,
 ) -> float:
-    """Find ``dt`` for a single RF step that lands exactly on ``target_ps``."""
-    burn_iplus = np.asarray(burn_iplus, dtype=float)
-    burn_iminus = np.asarray(burn_iminus, dtype=float)
+    burn_lookup_df = _load_burn_lookup(test_bin_idx, lookup_path=lookup_path)
+    mapper = PolarizationBurnLookupMapper(f, polarization, test_bin_idx, burn_lookup_df)
+    mapper.compute_lookup_index()
 
-    def residual(dt: float) -> float:
-        return _burned_ps_single_step(
-            polarization, burn_iplus, burn_iminus, dt,
-        ) - target_ps
+    def _burned_signal_at_bin(burn_amp: float) -> float:
+        burned_signal, _, _ = mapper.apply_bin_burn(
+            burn_signal.copy(),
+            burn_iplus.copy(),
+            burn_iminus.copy(),
+            bin_idx=test_bin_idx,
+            amp=burn_amp,
+        )
+        return burned_signal[test_bin_idx]
 
-    max_dt = trajectory_cfg.dt * trajectory_cfg.max_steps
-    dts = np.linspace(trajectory_cfg.dt, max_dt, 200)
-    bracket_lo, bracket_hi = _find_brentq_bracket(residual, dts)
+    residual = lambda a: _burned_signal_at_bin(a) - target_signal
+    bracket_lo, bracket_hi = _find_brentq_bracket(
+        residual, np.linspace(0.0, 1.0, 41),
+    )
     return (
         bracket_lo
         if bracket_lo == bracket_hi
@@ -113,51 +122,41 @@ def _find_burn_dt(
     )
 
 
-def _apply_single_step_burn(
+def _apply_burn(
     polarization: float,
+    burn_signal: np.ndarray,
     burn_iplus: np.ndarray,
     burn_iminus: np.ndarray,
-    dt: float,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, float]:
-    """Apply one ``solve_rate_equations`` step at ``dt``."""
-    params = trajectory_cfg.spin1_params(polarization)
-    iplus_new, iminus_new, _, _, _ = solve_rate_equations(
+    burn_amp: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    burn_lookup_df = _load_burn_lookup(test_bin_idx, lookup_path=lookup_path)
+    mapper = PolarizationBurnLookupMapper(f, polarization, test_bin_idx, burn_lookup_df)
+    mapper.compute_lookup_index()
+    return mapper.apply_bin_burn(
+        burn_signal,
         burn_iplus,
         burn_iminus,
-        dt,
-        trajectory_cfg.gamma_rf,
-        test_bin_idx,
-        params=params,
-        rf_only=True,
+        bin_idx=test_bin_idx,
+        amp=burn_amp,
     )
-    iplus_new = np.asarray(iplus_new, dtype=float)
-    iminus_new = np.asarray(iminus_new, dtype=float)
-    burned_signal = iplus_new + iminus_new
-    ps_at_burn = float(burned_signal[test_bin_idx])
-    return burned_signal, iplus_new, iminus_new, ps_at_burn
 
 
-matched_dt_p = _find_burn_dt(P, iplus, iminus, target_ps=target_signal_amp)
-matched_dt_ref = _find_burn_dt(
-    P_REF, ref_iplus, ref_iminus, target_ps=target_signal_amp,
+matched_amp_p = _find_burn_amp(
+    P, signal, iplus, iminus, target_signal=target_signal_amp,
+)
+matched_amp_ref = _find_burn_amp(
+    P_REF, ref_signal, ref_iplus, ref_iminus, target_signal=target_signal_amp,
 )
 
-new_signal, new_iplus, new_iminus, ps_at_burn_p = _apply_single_step_burn(
-    P, iplus, iminus, matched_dt_p,
-)
-ref_burn_signal, ref_burn_iplus, ref_burn_iminus, ps_at_burn_ref = (
-    _apply_single_step_burn(P_REF, ref_iplus, ref_iminus, matched_dt_ref)
-)
+print(f"Burn amplitude (P={P*100:.0f}% -> P_REF2={P_REF2*100:.0f}%): {matched_amp_p:.6e}")
+print(f"Burn amplitude (P_REF={P_REF*100:.0f}% -> P_REF2={P_REF2*100:.0f}%): {matched_amp_ref:.6e}")
 
-print(
-    f"Burn dt (P={P*100:.0f}% -> P_REF2={P_REF2*100:.0f}%): "
-    f"{matched_dt_p:.6e}, Ps at burn bin={ps_at_burn_p:.6e}"
+new_signal, new_iplus, new_iminus = _apply_burn(
+    P, signal, iplus, iminus, matched_amp_p,
 )
-print(
-    f"Burn dt (P_REF={P_REF*100:.0f}% -> P_REF2={P_REF2*100:.0f}%): "
-    f"{matched_dt_ref:.6e}, Ps at burn bin={ps_at_burn_ref:.6e}"
+ref_burn_signal, ref_burn_iplus, ref_burn_iminus = _apply_burn(
+    P_REF, ref_signal, ref_iplus, ref_iminus, matched_amp_ref,
 )
-print(f"Target signal amplitude (P_REF2): {target_signal_amp:.6e}")
 
 rates_check = verify_burn_response(iplus, iminus, new_iplus, new_iminus, test_bin_idx)
 reference_rates_check = verify_rates_response(
@@ -176,12 +175,13 @@ print(f"Change in Iplus: {new_iplus[test_bin_idx] - iplus[test_bin_idx]:.6e}")
 print(f"Change in Iminus: {new_iminus[test_bin_idx] - iminus[test_bin_idx]:.6e}")
 
 print(f"Burned signal amplitude at burn bin (P):     {new_signal[test_bin_idx]:.6e}")
-print(f"Burned signal amplitude at burn bin (P_REF): {ref_burn_signal[test_bin_idx]:.6e}")
+print(f"Burned signal amplitude at burn bin (P_REF):  {ref_burn_signal[test_bin_idx]:.6e}")
 
-print(f"Burned Iplus amplitude at burn bin (P):     {new_iplus[test_bin_idx]:.10e}")
-print(f"Burned Iplus amplitude at burn bin (P_REF): {ref_burn_iplus[test_bin_idx]:.10e}")
-print(f"Burned Iminus amplitude at burn bin (P):     {new_iminus[test_bin_idx]:.10e}")
-print(f"Burned Iminus amplitude at burn bin (P_REF): {ref_burn_iminus[test_bin_idx]:.10e}")
+print(f"Burned Iplus ampltiude at burn bin (P):     {new_iplus[test_bin_idx]:.6e}")
+print(f"Burned Iplus ampltiude at burn bin (P_REF):  {ref_burn_iplus[test_bin_idx]:.6e}")
+print(f"Burned Iminus ampltiude at burn bin (P):     {new_iminus[test_bin_idx]:.6e}")
+print(f"Total burned area in Iplus + Iminus: {np.sum(new_iplus[test_bin_idx] + new_iminus[test_bin_idx]):.6e}")
+print(f"Burned Iminus ampltiude at burn bin (P_REF):  {ref_burn_iminus[test_bin_idx]:.6e}")
 
 iplus_diff = abs(new_iplus - iplus[test_bin_idx])
 iminus_diff = abs(new_iminus - iminus[test_bin_idx])
@@ -195,7 +195,7 @@ print(f"  at burn bin ({f[test_bin_idx]:.4f} MHz): {iminus_diff[test_bin_idx]:.6
 print(f"Iplus < Iminus: {iplus[test_bin_idx] < iminus[test_bin_idx]}")
 print(f"iplus_diff < iminus_diff: {iplus_diff[test_bin_idx] < iminus_diff[test_bin_idx]}")
 print()
-print("Rates response check (direct burn trajectory):")
+print("Rates response check (burn lookup mapper):")
 print(f"  passed: {rates_check['passed']}")
 print(f"  |Ps| decreased at burn bin: {rates_check['magnitude_decreased']}")
 print(f"  amp_burn / amp_mirror: {rates_check['ratios']['amp_burn_over_amp_mirror']:.4f}")
@@ -237,5 +237,5 @@ axes.plot(
 axes.set_xlabel("Frequency")
 axes.set_ylabel("Amplitude")
 axes.legend()
-plt.savefig("test_ssrf.png", dpi=300)
+plt.savefig("test_ssrf_burn_lookup.png", dpi=300)
 plt.close()

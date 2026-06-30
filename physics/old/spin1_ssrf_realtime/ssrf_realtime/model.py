@@ -1,7 +1,34 @@
 """
-Spin-1 Pake-doublet ss-RF real-time model, v11 (headless).
+Spin-1 Pake-doublet ss-RF real-time model, v11.
 
-Headless copy of ``physics/simulations/spin1_ssrf_realtime/ssrf_realtime/model.py``.
+v11 keeps the ideal-bin population/rate-equation structure and the realistic
+analytic Pake-doublet reference lineshape, but fixes the global polarization
+accounting:
+
+* The user can initialize any signed vector polarization P0.
+* DNP is optional.  When enabled, it drives the population distribution toward
+  a user-selected saturation polarization P_DNP_sat at a finite rate; it does
+  not maximize beyond that selected condition.
+* With DNP disabled, RF equalization is a depolarizing sink.  Subsequent spin
+  diffusion/recovery redistributes the remaining polarization and relaxes the
+  line toward the Boltzmann-shaped spectrum for the current, reduced P(t), not
+  back to the original pre-burn line.
+
+State convention
+----------------
+The dynamic state is stored in packet space using an x coordinate identified
+with the I_plus branch coordinate R_plus.  The same packet appears at two
+mirror-related physical positions:
+
+    I_plus  at physical R =  x, with n_plus <-> n_zero driven by RF
+    I_minus at physical R = -x, with n_zero <-> n_minus driven by RF
+
+At one physical RF bin R_RF, the two overlapping visible components are:
+
+    I_plus(R_RF)  : packet x= R_RF
+    I_minus(R_RF) : packet x=-R_RF
+
+The single common RF power gamma_rf is applied to both addressed transitions.
 """
 
 from __future__ import annotations
@@ -11,67 +38,83 @@ from typing import Dict, Optional, Tuple
 
 import numpy as np
 
-from .conversions import physical_intensities_to_packet_n, packet_n_to_physical_intensities
 from .lineshape import (
     boltzmann_Q,
     boltzmann_branch_ratio,
     level_populations_from_PQ,
     normalized_component,
     pake_component_raw,
+    trapezoid_integral,
 )
 
 PLUS, ZERO, MINUS = 0, 1, 2
+
+
+def _clamp_p(P: float) -> float:
+    """Keep P inside the physically safe open interval for numeric use."""
+    return float(np.clip(float(P), -0.999999, 0.999999))
+
 
 @dataclass
 class Spin1Params:
     """Numerical and phenomenological parameters for the spin-1 model."""
 
-    n_bins: int = 500
+    # Packet/display grid in dimensionless physical R units.
+    n_bins: int = 701
     r_min: float = -3.0
     r_max: float = 3.0
 
+    # Realistic analytic Pake branch parameters.  Defaults match Plot_Signal.py.
     line_gamma: float = 0.05
     line_asym: float = 0.04
 
+    # Display calibration.  The analytic branch shape is used for the spectral
+    # envelope.  calibration_p fixes the displayed scale; by default P=0.50
+    # matches the Plot_Signal.py convention for the minor branch when divisor=10.
     plot_signal_units: bool = True
     plot_divisor: float = 10.0
     display_scale: float = 1.0
     calibration_p: float = 0.50
 
+    # Initial vector polarization and optional tensor polarization.  If q0 is
+    # None, the Boltzmann relation is used.  Signed P is allowed.
     p0: float = 0.45
     q0: Optional[float] = None
 
+    # RF location is a physical R coordinate in the plotted spectrum.
     rf_burn_R: float = 0.40
-    rf_enabled: bool = True
+    rf_enabled: bool = False
 
+    # One common ideal-bin RF equalization rate for both overlap components.
     gamma_rf: float = 2.0
 
-    # d_same_plus0: float = 0.18
-    # d_same_0minus: float = 0.10
-    # d_spec_plus0: float = 2.0
-    # d_spec_0minus: float = 1.0
+    # Phenomenological spin-diffusion/recovery rates.  These operate on the
+    # RF-created perturbation relative to the current Boltzmann-shaped state at
+    # P(t), so they redistribute the remaining area rather than restoring the
+    # original pre-burn area when DNP is off.
+    d_same_plus0: float = 0.18
+    d_same_0minus: float = 0.10
+    d_spec_plus0: float = 2.0
+    d_spec_0minus: float = 1.0
 
-    # t2_width_R: float = 0.05
-    
-    
-    d_same_plus0: float = 0.0
-    d_same_0minus: float = 0.0
-    d_spec_plus0: float = 0.0
-    d_spec_0minus: float = 0.0
+    # T2-like spectral overlap scale in R units for neighbor coupling.
+    t2_width_R: float = 0.05
 
-    t2_width_R: float = 0.0
-
+    # DNP build/rebuild.  If enabled, this is an external reservoir that drives
+    # the full line toward P_DNP_sat at rate dnp_rate.
     dnp_enabled: bool = False
     p_dnp_sat: float = 0.58
     dnp_rate: float = 0.05
 
+    # Optional ordinary spin-lattice relaxation toward a user-specified thermal
+    # vector polarization.  Default is off so no-DNP tests isolate RF loss and
+    # spin diffusion redistribution.
     t1_rate: float = 0.0
     t1_p_eq: float = 0.0
 
+    # Integration and display parameters.
     dt: float = 0.0015
     noise_sigma: float = 0.0
-    
-    steps: int = 50
 
 
 class Spin1Model:
@@ -83,40 +126,54 @@ class Spin1Model:
 
     def reset(self) -> None:
         p = self.params
+        if p.n_bins < 5:
+            raise ValueError("n_bins must be at least 5")
+        if p.r_min >= p.r_max:
+            raise ValueError("r_min must be less than r_max")
         self.Rplus = np.linspace(p.r_min, p.r_max, p.n_bins)
         self.dR = float(self.Rplus[1] - self.Rplus[0])
 
+        # The analytic branch density replaces the toy 1/sqrt(1-R) powder law.
         density = normalized_component(self.Rplus, +1, gamma=p.line_gamma, asym=p.line_asym)
         mu = density * self.dR
         self.mu = mu / mu.sum()
         self.base_density = self.mu / self.dR
 
-        self.pref_initial = level_populations_from_PQ(p.p0, p.q0)
+        self.pref_initial = level_populations_from_PQ(_clamp_p(p.p0), p.q0)
         self.n_ref = self.mu[:, None] * self.pref_initial[None, :]
         self.n = self.n_ref.copy()
         self.t = 0.0
 
+        # Display calibration only.  The state/rates remain population-based.
         self.display_cal = self._compute_display_calibration()
 
     def _compute_display_calibration(self) -> float:
         p = self.params
         if not p.plot_signal_units:
             return float(p.display_scale)
-        Pcal = p.calibration_p
+        Pcal = _clamp_p(p.calibration_p)
         pref_cal = level_populations_from_PQ(Pcal, None)
+        # Use the absolute minor-branch population difference so signed P gives
+        # signed spectra instead of flipping the calibration sign.
         minor_diff = abs(float(pref_cal[ZERO] - pref_cal[MINUS]))
+        if minor_diff < 1e-15:
+            # Fall back to a well-behaved calibration point.
+            pref_cal = level_populations_from_PQ(0.50, None)
+            minor_diff = abs(float(pref_cal[ZERO] - pref_cal[MINUS]))
         raw = pake_component_raw(self.Rplus, +1, gamma=p.line_gamma, asym=p.line_asym)
-        raw_area = np.trapezoid(raw, self.Rplus)
+        raw_area = trapezoid_integral(raw, self.Rplus)
+        if raw_area <= 0 or not np.isfinite(raw_area):
+            return float(p.display_scale)
         return float(p.display_scale * raw_area / (max(p.plot_divisor, 1e-15) * minor_diff))
 
-    # def set_params(self, **kwargs) -> None:
-    #     for key, value in kwargs.items():
-    #         if not hasattr(self.params, key):
-    #             raise AttributeError(f"Unknown parameter: {key}")
-    #         setattr(self.params, key, value)
+    def set_params(self, **kwargs) -> None:
+        for key, value in kwargs.items():
+            if not hasattr(self.params, key):
+                raise AttributeError(f"Unknown parameter: {key}")
+            setattr(self.params, key, value)
 
-    # def as_dict(self) -> Dict[str, float]:
-    #     return asdict(self.params)
+    def as_dict(self) -> Dict[str, float]:
+        return asdict(self.params)
 
     def set_rf_enabled(self, enabled: bool) -> None:
         self.params.rf_enabled = bool(enabled)
@@ -124,21 +181,11 @@ class Spin1Model:
     def set_dnp_enabled(self, enabled: bool) -> None:
         self.params.dnp_enabled = bool(enabled)
 
-    def load_from_physical_intensities(self, Iplus: np.ndarray, Iminus: np.ndarray) -> None:
-        """Set ``self.n`` from physical R-grid intensities using model conversions."""
-        self.n = physical_intensities_to_packet_n(
-            Iplus,
-            Iminus,
-            self.mu,
-            display_cal=self.display_cal,
-            dR=self.dR,
-        )
-
     def equilibrium_reference(self, P: Optional[float] = None) -> np.ndarray:
         """Boltzmann-shaped packet state with the current grid weights."""
         if P is None:
             P = self.polarizations()["P"]
-        pref = level_populations_from_PQ(float(P), None)
+        pref = level_populations_from_PQ(_clamp_p(float(P)), None)
         return self.mu[:, None] * pref[None, :]
 
     def polarizations(self, n: Optional[np.ndarray] = None) -> Dict[str, float]:
@@ -154,7 +201,7 @@ class Spin1Model:
             "n_minus": float(pops[MINUS]),
             "P": P,
             "Q": Q,
-            "Q_boltz_at_P": boltzmann_Q(P),
+            "Q_boltz_at_P": boltzmann_Q(_clamp_p(P)),
         }
 
     def branch_areas(self, n: Optional[np.ndarray] = None) -> Dict[str, float]:
@@ -171,18 +218,22 @@ class Spin1Model:
         }
 
     def branch_indices(self, R: Optional[float] = None) -> Tuple[Optional[int], Optional[int]]:
-        """Return packet indices for the two components at physical R."""
-        
-        ## this seems to be done in theta space (two thetas for a single R value) ##
-        kp = int(np.argmin(np.abs(self.Rplus - R)))
-        km = int(np.argmin(np.abs(self.Rplus + R)))
-        return kp, km
+        """
+        Return packet indices for the two components at physical R.
 
-    def burn_index(self, R: Optional[float] = None) -> int:
-        """Index of physical +R on the symmetric grid (nearest bin to ``R``)."""
+        I_plus(R) exists if packet x=R exists.
+        I_minus(R) exists if packet x=-R exists.
+        """
         if R is None:
             R = self.params.rf_burn_R
-        return int(np.argmin(np.abs(self.Rplus - float(R))))
+        R = float(R)
+        kp: Optional[int] = None
+        km: Optional[int] = None
+        if self.Rplus[0] <= R <= self.Rplus[-1]:
+            kp = int(np.argmin(np.abs(self.Rplus - R)))
+        if self.Rplus[0] <= -R <= self.Rplus[-1]:
+            km = int(np.argmin(np.abs(self.Rplus + R)))
+        return kp, km
 
     def _transition_differences(self, n: Optional[np.ndarray] = None) -> Tuple[np.ndarray, np.ndarray]:
         if n is None:
@@ -200,13 +251,6 @@ class Spin1Model:
             Iplus = self.display_cal * Iplus
             Iminus = self.display_cal * Iminus
         return Iplus, Iminus
-
-    def physical_intensities(self, n: Optional[np.ndarray] = None) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """Return I+(R), I-(R), and total on the model's physical R grid."""
-        state = self.n if n is None else n
-        return packet_n_to_physical_intensities(
-            state, self.Rplus, display_cal=self.display_cal, dR=self.dR
-        )
 
     def local_intensities(self, R: Optional[float] = None, use_reference: bool = False) -> Dict[str, float]:
         kp, km = self.branch_indices(R)
@@ -265,10 +309,16 @@ class Spin1Model:
 
     def spectrum_from_state(self, n: np.ndarray):
         """Project a provided packet-population state to physical R bin centers."""
-        Iplus, Iminus, total = packet_n_to_physical_intensities(
-            n, self.Rplus, display_cal=self.display_cal, dR=self.dR
-        )
-        return self.Rplus.copy(), Iplus, Iminus, total
+        Iplus_packet, Iminus_packet = self._transition_differences(n)
+        Iplus_packet = self.display_cal * Iplus_packet / self.dR
+        Iminus_packet = self.display_cal * Iminus_packet / self.dR
+
+        R_axis = self.Rplus.copy()
+        Iplus = Iplus_packet.copy()
+        Rminus_phys = -self.Rplus
+        order = np.argsort(Rminus_phys)
+        Iminus = np.interp(R_axis, Rminus_phys[order], Iminus_packet[order], left=0.0, right=0.0)
+        return R_axis, Iplus, Iminus, Iplus + Iminus
 
     def spectrum(self, noise_sigma: Optional[float] = None):
         R_axis, Iplus, Iminus, total = self.spectrum_from_state(self.n)
@@ -312,6 +362,13 @@ class Spin1Model:
         return Rplus_phys, Iplus_packet, Rminus_ordered, Iminus_ordered
 
     def _rf_mode_amplitudes(self, reference: Optional[np.ndarray] = None) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Decompose perturbation relative to a reference into RF-created modes.
+
+        A pure I+ burn changes a packet by [-a/2, +a/2, 0].  Thus a>0 is an
+        I+ direct hole and an I- mirror peak.  A pure I- burn changes a packet
+        by [0, -b/2, +b/2].  Thus b>0 is an I- direct hole and an I+ mirror peak.
+        """
         if reference is None:
             reference = self.equilibrium_reference()
         delta = self.n - reference
@@ -320,6 +377,7 @@ class Spin1Model:
         return a_plus0, b_0minus
 
     def _mode_to_population_derivative(self, da_dt: np.ndarray, db_dt: np.ndarray) -> np.ndarray:
+        """Convert time derivatives of the two RF-hole modes into dn/dt."""
         dn = np.zeros_like(self.n)
         dn[:, PLUS] += -0.5 * da_dt
         dn[:, ZERO] += 0.5 * da_dt - 0.5 * db_dt
@@ -327,6 +385,7 @@ class Spin1Model:
         return dn
 
     def _project_conserve_vector(self, dn: np.ndarray) -> np.ndarray:
+        """Force an internal redistribution term to conserve total vector P."""
         dP = float(np.sum(dn[:, PLUS] - dn[:, MINUS]))
         if abs(dP) < 1e-18:
             return dn
@@ -336,6 +395,7 @@ class Spin1Model:
         return dn + correction
 
     def _mode_relax_reference(self, which: str, rate: float, reference: np.ndarray) -> np.ndarray:
+        """Same-bin backpath: decay an RF-created mode toward the current reference."""
         if rate == 0.0:
             return np.zeros_like(self.n)
         a_plus0, b_0minus = self._rf_mode_amplitudes(reference)
@@ -346,6 +406,7 @@ class Spin1Model:
         raise ValueError("which must be 'plus0' or '0minus'")
 
     def _mode_diffuse_delta(self, which: str, rate: float, reference: np.ndarray) -> np.ndarray:
+        """Conservative nearest-neighbor diffusion of an RF-created hole mode."""
         if rate == 0.0 or len(self.Rplus) < 2:
             return np.zeros_like(self.n)
         a_plus0, b_0minus = self._rf_mode_amplitudes(reference)
@@ -371,28 +432,32 @@ class Spin1Model:
             return self._mode_to_population_derivative(dmode_dt, np.zeros_like(mode))
         return self._mode_to_population_derivative(np.zeros_like(mode), dmode_dt)
 
-    def derivative(self, rf_on: Optional[bool] = True, dnp_on: Optional[bool] = None, breakdown: bool = False):
+    def derivative(self, rf_on: Optional[bool] = None, dnp_on: Optional[bool] = None, breakdown: bool = False):
         p = self.params
+        if rf_on is None:
+            rf_on = bool(p.rf_enabled)
+        if dnp_on is None:
+            dnp_on = bool(p.dnp_enabled)
         dn_terms: Dict[str, np.ndarray] = {}
 
         dn_rf = np.zeros_like(self.n)
         if rf_on and p.gamma_rf != 0.0:
             kp, km = self.branch_indices(p.rf_burn_R)
-            J = p.gamma_rf * (self.n[kp, PLUS] - self.n[kp, ZERO])
-            dn_rf[kp, PLUS] -= J
-            dn_rf[kp, ZERO] += J
-            
-            ### changed from km to kp for J here to matched rate_equations.py ###
-            J = p.gamma_rf * (self.n[kp, ZERO] - self.n[kp, MINUS])
-            
-            dn_rf[km, ZERO] -= J
-            dn_rf[km, MINUS] += J
+            if kp is not None:
+                # I_plus(+R): n_plus -> n_zero when n_plus > n_zero; reverse for negative P.
+                J = p.gamma_rf * (self.n[kp, PLUS] - self.n[kp, ZERO])
+                dn_rf[kp, PLUS] -= J
+                dn_rf[kp, ZERO] += J
+            if km is not None:
+                # I_minus(+R): n_zero -> n_minus when n_zero > n_minus; reverse for negative P.
+                J = p.gamma_rf * (self.n[km, ZERO] - self.n[km, MINUS])
+                dn_rf[km, ZERO] -= J
+                dn_rf[km, MINUS] += J
         dn_terms["RF"] = dn_rf
-        
-        # print(f"RF at burn bin {kp}: {dn_terms['RF'][kp]}")
-        # print(f"RF at mirror bin {km}: {dn_terms['RF'][km]}")
-        # print(f"|RF| max: {np.abs(dn_terms['RF']).max()}")
-        
+
+        # Internal diffusion/recovery uses the Boltzmann-shaped state at the
+        # current P(t).  Therefore, with DNP off, it redistributes the remaining
+        # area after RF depolarization instead of restoring the initial area.
         dynamic_ref = self.equilibrium_reference()
 
         dn_same = np.zeros_like(self.n)
@@ -400,25 +465,22 @@ class Spin1Model:
         dn_same += self._mode_relax_reference("0minus", p.d_same_0minus, dynamic_ref)
         dn_same = self._project_conserve_vector(dn_same)
         dn_terms["spin_temp_redistribution"] = dn_same
-        
 
         dn_spec = np.zeros_like(self.n)
         dn_spec += self._mode_diffuse_delta("plus0", p.d_spec_plus0, dynamic_ref)
         dn_spec += self._mode_diffuse_delta("0minus", p.d_spec_0minus, dynamic_ref)
         dn_spec = self._project_conserve_vector(dn_spec)
         dn_terms["spectral_neighbors"] = dn_spec
-        
 
         dn_dnp = np.zeros_like(self.n)
         if dnp_on and p.dnp_rate != 0.0:
-            dnp_target = self.equilibrium_reference(p.p_dnp_sat)
+            dnp_target = self.equilibrium_reference(_clamp_p(p.p_dnp_sat))
             dn_dnp = p.dnp_rate * (dnp_target - self.n)
         dn_terms["DNP_sat"] = dn_dnp
-        
 
         dn_t1 = np.zeros_like(self.n)
         if p.t1_rate != 0.0:
-            t1_target = self.equilibrium_reference(p.t1_p_eq)
+            t1_target = self.equilibrium_reference(_clamp_p(p.t1_p_eq))
             dn_t1 = p.t1_rate * (t1_target - self.n)
         dn_terms["T1"] = dn_t1
 
@@ -450,6 +512,7 @@ class Spin1Model:
         return dn, obs_terms
 
     def step(self, n_steps: int = 1, rf_on: Optional[bool] = None, dnp_on: Optional[bool] = None) -> None:
+        """Advance the model by n_steps using positivity-preserving Euler steps."""
         dt = float(self.params.dt)
         if rf_on is None:
             rf_on = bool(self.params.rf_enabled)
@@ -462,25 +525,6 @@ class Spin1Model:
             sums = self.n.sum(axis=1, keepdims=True)
             self.n *= self.mu[:, None] / np.maximum(sums, 1e-30)
             self.t += dt
-
-    def step_once(
-        self,
-        dt: Optional[float] = None,
-        rf_on: Optional[bool] = None,
-        dnp_on: Optional[bool] = None,
-    ) -> np.ndarray:
-        step_dt = float(self.params.dt if dt is None else dt)
-        if rf_on is None:
-            rf_on = bool(self.params.rf_enabled)
-        if dnp_on is None:
-            dnp_on = bool(self.params.dnp_enabled)
-        dn = self.derivative(rf_on=rf_on, dnp_on=dnp_on, breakdown=False)
-        self.n = self.n + step_dt * dn
-        self.n = np.maximum(self.n, 1e-30)
-        sums = self.n.sum(axis=1, keepdims=True)
-        self.n *= self.mu[:, None] / np.maximum(sums, 1e-30)
-        self.t += step_dt
-        return self.n.copy()
 
     def rf_balance_estimate(self, R: Optional[float] = None) -> Dict[str, float]:
         """Estimate common RF rate needed to hold the two direct components."""
@@ -508,8 +552,8 @@ class Spin1Model:
 
     @property
     def branch_ratio(self) -> float:
-        return boltzmann_branch_ratio(self.polarizations()["P"])
+        return boltzmann_branch_ratio(_clamp_p(self.polarizations()["P"]))
 
     @property
     def initial_branch_ratio(self) -> float:
-        return boltzmann_branch_ratio(self.params.p0)
+        return boltzmann_branch_ratio(_clamp_p(self.params.p0))

@@ -10,7 +10,6 @@ from .lineshape import (
     normalized_component,
     pake_component_raw,
     plot_signal_reference,
-    trapezoid_integral,
 )
 from .model import Spin1Model, Spin1Params
 
@@ -23,7 +22,6 @@ __all__ = [
     "normalized_component",
     "pake_component_raw",
     "plot_signal_reference",
-    "trapezoid_integral",
     "transition_differences",
     "physical_intensities_to_packet_n",
     "packet_n_to_physical_intensities",
