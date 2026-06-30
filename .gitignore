@@ -219,6 +219,7 @@ __marimo__/
 
 # Project outputs (generated artifacts)
 results/
+data/
 **/single_bin_results/
 **/combined_500_results/
 **/dae_denoise_results/
