@@ -1,7 +1,3 @@
-"""Offline step-count runner for the spin-1 ss-RF v14 lineshape model."""
-
-from __future__ import annotations
-
 import argparse
 import sys
 from pathlib import Path
@@ -11,23 +7,23 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-V14_ROOT = Path(__file__).resolve().parent / "spin1_ssrf_realtime_sim_v14"
-if str(V14_ROOT) not in sys.path:
-    sys.path.insert(0, str(V14_ROOT))
+ROOT = Path(__file__).resolve().parent / "spin1_ssrf_realtime"
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 from ssrf_realtime.model import Spin1Model, Spin1Params
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Run the v14 spin-1 ss-RF model for a fixed number of steps and plot the resulting lineshape."
+        description="Run the spin-1 ss-RF model for a fixed number of steps and plot the resulting lineshape."
     )
     parser.add_argument("--steps", type=int, required=True, help="Number of integration steps to perform.")
     parser.add_argument(
         "--output",
         type=Path,
         default=None,
-        help="Output PNG path. Defaults to physics/offline_lineshape_<steps>_steps.png.",
+        help="Output PNG path. Defaults to physics/burn_<steps>_steps.png.",
     )
     parser.add_argument("--show", action="store_true", help="Show the plot interactively after saving it.")
 
@@ -68,7 +64,7 @@ def build_model(args: argparse.Namespace) -> Spin1Model:
 
 
 def default_output_path(steps: int) -> Path:
-    return Path(__file__).resolve().parent / f"offline_lineshape_{steps}_steps.png"
+    return Path(__file__).resolve().parent / f"burn_{steps}_steps.png"
 
 
 def plot_lineshape(model: Spin1Model, steps: int, output_path: Path, show: bool = False) -> None:
@@ -88,7 +84,7 @@ def plot_lineshape(model: Spin1Model, steps: int, output_path: Path, show: bool 
     ax.set_xlabel("physical R")
     ax.set_ylabel("intensity density")
     ax.set_title(
-        f"v14 offline lineshape after {steps} steps "
+        f"burn after {steps} steps "
         f"(t={model.t:.4g}, RF={'on' if model.params.rf_enabled else 'off'}, DNP={'on' if model.params.dnp_enabled else 'off'})"
     )
     ax.text(
@@ -113,18 +109,13 @@ def plot_lineshape(model: Spin1Model, steps: int, output_path: Path, show: bool 
 
 def main() -> int:
     args = parse_args()
-    if args.steps < 0:
-        raise ValueError("--steps must be non-negative")
 
     model = build_model(args)
-    if args.steps > 0:
-        model.step(args.steps, rf_on=args.rf_on, dnp_on=args.dnp_on)
-
+    model.step(args.steps, rf_on=args.rf_on, dnp_on=args.dnp_on)
     output_path = args.output or default_output_path(args.steps)
     plot_lineshape(model, args.steps, output_path, show=args.show)
-
     pol = model.polarizations()
-    print(f"wrote offline lineshape to {output_path}")
+    print(f"wrote burn to {output_path}")
     print(f"steps={args.steps} time={model.t:.6g} P={pol['P']:.6g} Q={pol['Q']:.6g}")
     return 0
 

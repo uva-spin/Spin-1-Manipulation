@@ -1,15 +1,3 @@
-"""Sweep v14 gamma-burn I+/I- differences over simulation parameters.
-
-For each grid point, burns two RF rates to the same local Ps at the burn bin
-and records how I+ and I- differ between the two rates.
-
-Parameters swept:
-  - dt: integration timestep
-  - p0: initial vector polarization
-  - rf_burn_R: RF frequency position on the physical R axis
-  - target_ps_fraction: remaining bin height (fraction of initial Ps at burn bin)
-"""
-
 from __future__ import annotations
 
 import argparse
@@ -22,7 +10,7 @@ from pathlib import Path
 import numpy as np
 from tqdm import tqdm
 
-V14_ROOT = Path(__file__).resolve().parent / "spin1_ssrf_realtime_sim_v14"
+V14_ROOT = Path(__file__).resolve().parent / "spin1_ssrf_realtime"
 if str(V14_ROOT) not in sys.path:
     sys.path.insert(0, str(V14_ROOT))
 
@@ -33,6 +21,7 @@ PS_DTYPE = np.float64
 
 @dataclass(frozen=True)
 class SweepPoint:
+    bin_idx: int
     dt: float
     p0: float
     rf_burn_R: float
@@ -45,6 +34,8 @@ class SweepPoint:
     steps_b: int
     time_a: float
     time_b: float
+    ps_a: float
+    ps_b: float
     iplus_a: float
     iplus_b: float
     iminus_a: float
@@ -70,10 +61,33 @@ def parse_args() -> argparse.Namespace:
         "--gammas",
         type=float,
         nargs=2,
-        default=(0.1, 0.2),
+        default=None,
         metavar=("GAMMA_A", "GAMMA_B"),
-        help="Two RF burn rates to compare (default: 0.1 0.2).",
+        help="Single gamma_a/gamma_b pair when --gamma-as/--gamma-bs are not set.",
     )
+    parser.add_argument(
+        "--gamma-as",
+        type=parse_float_list,
+        default=None,
+        help="RF burn rates for branch A (comma-separated).",
+    )
+    parser.add_argument(
+        "--gamma-bs",
+        type=parse_float_list,
+        default=None,
+        help="RF burn rates for branch B (comma-separated).",
+    )
+    parser.add_argument(
+        "--bin-idx",
+        type=int,
+        default=None,
+        help=(
+            "Burn-bin index in [0, n_bins). Sets rf_burn_R from linspace(r_min, r_max, n_bins). "
+            "Use with burning.slurm array tasks."
+        ),
+    )
+    parser.add_argument("--r-min", type=float, default=Spin1Params.r_min, help="Physical R grid minimum.")
+    parser.add_argument("--r-max", type=float, default=Spin1Params.r_max, help="Physical R grid maximum.")
     parser.add_argument(
         "--dts",
         type=parse_float_list,
@@ -130,30 +144,65 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def resolve_grids(args: argparse.Namespace) -> tuple[list[float], list[float], list[float], list[float]]:
+def rf_burn_R_from_bin_idx(bin_idx: int, *, n_bins: int, r_min: float, r_max: float) -> float:
+    if bin_idx < 0 or bin_idx >= n_bins:
+        raise ValueError(f"bin-idx must be in [0, {n_bins}), got {bin_idx}")
+    return float(np.linspace(r_min, r_max, n_bins)[bin_idx])
+
+
+def resolve_gamma_pairs(args: argparse.Namespace) -> list[tuple[float, float]]:
+    if args.gamma_as is not None or args.gamma_bs is not None:
+        gamma_as = args.gamma_as or []
+        gamma_bs = args.gamma_bs or []
+        if not gamma_as or not gamma_bs:
+            raise ValueError("both --gamma-as and --gamma-bs are required when either is set")
+        return list(itertools.product(gamma_as, gamma_bs))
+
+    if args.gammas is not None:
+        return [(float(args.gammas[0]), float(args.gammas[1]))]
+
+    return [(0.1, 0.2)]
+
+
+def resolve_grids(
+    args: argparse.Namespace,
+) -> tuple[int | None, list[float], list[float], list[float], list[float], list[tuple[float, float]]]:
     if args.quick:
         dts = args.dts or [Spin1Params.dt, Spin1Params.dt * 2.0]
-        p0s = [0.35, 0.45, 0.55]
-        rf_burn_rs = [-0.95, -0.75, -0.55]
+        p0s = args.p0s or [0.35, 0.45, 0.55]
+        rf_burn_rs = args.rf_burn_Rs or [-0.95, -0.75, -0.55]
         bin_heights = args.bin_heights or [0.4, 0.5, 0.6]
     else:
         dts = args.dts or [Spin1Params.dt]
         p0s = args.p0s or [Spin1Params.p0]
-        rf_burn_rs = args.rf_burn_Rs or [Spin1Params.rf_burn_R]
         bin_heights = args.bin_heights or [0.5]
+        if args.bin_idx is not None:
+            rf_burn_rs = [
+                rf_burn_R_from_bin_idx(
+                    args.bin_idx,
+                    n_bins=args.n_bins,
+                    r_min=args.r_min,
+                    r_max=args.r_max,
+                )
+            ]
+        else:
+            rf_burn_rs = args.rf_burn_Rs or [Spin1Params.rf_burn_R]
+
+    gamma_pairs = resolve_gamma_pairs(args)
 
     for name, values in (
         ("dts", dts),
         ("p0s", p0s),
         ("rf_burn_Rs", rf_burn_rs),
         ("bin_heights", bin_heights),
+        ("gamma_pairs", gamma_pairs),
     ):
         if not values:
             raise ValueError(f"{name} must contain at least one value")
         if name == "bin_heights" and any(v <= 0.0 or v >= 1.0 for v in values):
             raise ValueError("bin-heights must be between 0 and 1 (exclusive)")
 
-    return dts, p0s, rf_burn_rs, bin_heights
+    return args.bin_idx, dts, p0s, rf_burn_rs, bin_heights, gamma_pairs
 
 
 def build_params(
@@ -252,6 +301,7 @@ def burn_to_target_ps_fast(
 
 def evaluate_point(
     *,
+    bin_idx: int | None,
     dt: float,
     p0: float,
     rf_burn_R: float,
@@ -302,6 +352,7 @@ def evaluate_point(
         d_ps = ps_b - ps_a
 
     return SweepPoint(
+        bin_idx=-1 if bin_idx is None else bin_idx,
         dt=dt,
         p0=p0,
         rf_burn_R=rf_burn_R,
@@ -314,6 +365,8 @@ def evaluate_point(
         steps_b=steps_b,
         time_a=time_a,
         time_b=time_b,
+        ps_a=ps_a,
+        ps_b=ps_b,
         iplus_a=iplus_a,
         iplus_b=iplus_b,
         iminus_a=iminus_a,
@@ -325,12 +378,16 @@ def evaluate_point(
     )
 
 
-def default_output_path() -> Path:
-    return Path(__file__).resolve().parent / "sweep_gamma_burn_diffs.csv"
+def default_output_path(bin_idx: int | None = None) -> Path:
+    parent = Path(__file__).resolve().parent
+    if bin_idx is None:
+        return parent / "sweep_gamma_burn_diffs.csv"
+    return parent / "burning_shards" / f"sweep_bin_{bin_idx}.csv"
 
 
 def write_csv(path: Path, rows: list[SweepPoint]) -> None:
     fieldnames = [
+        "bin_idx",
         "dt",
         "p0",
         "rf_burn_R",
@@ -343,6 +400,8 @@ def write_csv(path: Path, rows: list[SweepPoint]) -> None:
         "steps_b",
         "time_a",
         "time_b",
+        "ps_a",
+        "ps_b",
         "iplus_a",
         "iplus_b",
         "iminus_a",
@@ -388,14 +447,14 @@ def print_summary(rows: list[SweepPoint], *, output_path: Path) -> None:
 
 def main() -> int:
     args = parse_args()
-    dts, p0s, rf_burn_rs, bin_heights = resolve_grids(args)
-    gamma_a, gamma_b = args.gammas
+    bin_idx, dts, p0s, rf_burn_rs, bin_heights, gamma_pairs = resolve_grids(args)
 
-    combos = list(itertools.product(dts, p0s, rf_burn_rs, bin_heights))
+    combos = list(itertools.product(dts, p0s, rf_burn_rs, bin_heights, gamma_pairs))
     rows: list[SweepPoint] = []
-    for dt, p0, rf_burn_R, target_ps_fraction in tqdm(combos, desc="sweep", unit="pt"):
+    for dt, p0, rf_burn_R, target_ps_fraction, (gamma_a, gamma_b) in tqdm(combos, desc="sweep", unit="pt"):
         rows.append(
             evaluate_point(
+                bin_idx=bin_idx,
                 dt=dt,
                 p0=p0,
                 rf_burn_R=rf_burn_R,
@@ -410,9 +469,11 @@ def main() -> int:
             )
         )
 
-    output_path = args.output or default_output_path()
+    output_path = args.output or default_output_path(bin_idx)
     write_csv(output_path, rows)
     print_summary(rows, output_path=output_path)
+    if bin_idx is not None:
+        print(f"bin_idx={bin_idx} rf_burn_R={rf_burn_rs[0]:.6g}")
     return 0
 
 
