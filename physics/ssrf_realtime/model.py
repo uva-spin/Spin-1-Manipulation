@@ -13,7 +13,7 @@ external reservoir builds toward P_DNP_sat.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -60,7 +60,7 @@ class Spin1Params:
     d_same_0minus: float = 0.15
     d_spec_plus0: float = 1.5
     d_spec_0minus: float = 0.8
-    same_theta_mirror_gain: float = 1.5
+    same_theta_mirror_gain: float = 0.5
     
     boltzmann_distance_gain: float = 0.5
     population_availability: float = 1.0
@@ -83,6 +83,11 @@ class Spin1Params:
     noise_sigma: float = 0.0
 
     steps: int = 50
+
+    # Instantaneous AFP sweep config (applied via afp_sweep, not in derivative).
+    afp_efficiency: float = 1.0
+    afp_center_margin: int = 0
+    afp_subset_indices: Optional[List[int]] = None
 
 
 class Spin1Model:
@@ -157,6 +162,98 @@ class Spin1Model:
         self._populations_from_intensities = True
         self._sync_level_populations(capture_initial=True)
         self._invalidate_rate_cache()
+
+    @staticmethod
+    def _resolve_afp_subset(
+        n_bins: int,
+        subset_indices: Optional[List[int]] = None,
+        center_margin: int = 0,
+    ) -> List[int]:
+        if subset_indices is None:
+            subset = list(range(n_bins))
+        else:
+            subset = [int(i) for i in subset_indices]
+        if center_margin > 0:
+            c = n_bins // 2
+            forbidden = set(range(max(0, c - center_margin), min(n_bins, c + center_margin + 1)))
+            subset = [i for i in subset if i not in forbidden]
+        return subset
+
+    @staticmethod
+    def _perform_afp_on_populations(
+        rho_plus: np.ndarray,
+        rho_zero: np.ndarray,
+        rho_minus: np.ndarray,
+        sweep: List[int],
+        efficiency: float = 1.0,
+    ) -> None:
+        """AFP sweep on per-bin populations (in place): n+↔n0 at i, n0↔n- at mirror."""
+        n = len(rho_plus)
+        eff = float(efficiency)
+        for i in sweep:
+            m = n - 1 - i
+            rho_plus[i], rho_zero[i] = (
+                eff * rho_zero[i] + (1.0 - eff) * rho_plus[i],
+                eff * rho_plus[i] + (1.0 - eff) * rho_zero[i],
+            )
+            if m == i:
+                continue
+            rho_zero[m], rho_minus[m] = (
+                eff * rho_minus[m] + (1.0 - eff) * rho_zero[m],
+                eff * rho_zero[m] + (1.0 - eff) * rho_minus[m],
+            )
+
+    def afp_target_state(
+        self,
+        n: Optional[np.ndarray] = None,
+        subset_indices: Optional[List[int]] = None,
+        *,
+        efficiency: float = 1.0,
+        center_margin: int = 0,
+    ) -> Tuple[np.ndarray, List[int]]:
+        """Return the AFP-swapped packet state without mutating ``self.n``."""
+        state = self.n if n is None else n
+        out = np.array(state, dtype=float, copy=True)
+        subset = self._resolve_afp_subset(len(out), subset_indices, center_margin)
+        if subset:
+            self._perform_afp_on_populations(
+                out[:, PLUS],
+                out[:, ZERO],
+                out[:, MINUS],
+                subset,
+                efficiency=float(efficiency),
+            )
+        return out, subset
+
+    def afp_sweep(
+        self,
+        subset_indices: Optional[List[int]] = None,
+        *,
+        efficiency: Optional[float] = None,
+        center_margin: Optional[int] = None,
+    ) -> List[int]:
+        """Apply an instantaneous AFP sweep in place on packet populations ``self.n``.
+
+        Defaults to ``params.afp_subset_indices``, ``params.afp_efficiency``, and
+        ``params.afp_center_margin`` when arguments are omitted.
+        Returns the bin indices that were swept (after ``center_margin`` exclusion).
+        """
+        if subset_indices is None:
+            subset_indices = self.params.afp_subset_indices
+        if efficiency is None:
+            efficiency = self.params.afp_efficiency
+        if center_margin is None:
+            center_margin = self.params.afp_center_margin
+        target, subset = self.afp_target_state(
+            self.n,
+            subset_indices,
+            efficiency=float(efficiency),
+            center_margin=int(center_margin),
+        )
+        self.n = target
+        self._sync_level_populations(capture_initial=False)
+        self._invalidate_rate_cache()
+        return subset
 
     def _sync_level_populations(self, *, capture_initial: bool = False) -> None:
         """

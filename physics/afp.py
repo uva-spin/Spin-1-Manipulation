@@ -65,21 +65,15 @@ class AFP:
         return list(range(steps if steps is not None else n))
 
     @staticmethod
-    def _perform_afp_on_populations(rho_plus, rho_zero, rho_minus, sweep, efficiency=1.0):
+    def _perform_afp_on_populations(
+        rho_plus, rho_zero, rho_minus, sweep, efficiency=1.0, show_progress=True
+    ):
         """AFP sweep on per-bin populations (in place)."""
         n = len(rho_plus)
-        centre = n // 2
+        iterator = tqdm.tqdm(sweep, desc="AFP") if show_progress else sweep
 
-        for i in tqdm.tqdm(sweep, desc="AFP"):
+        for i in iterator:
             m = n - 1 - i
-
-            # if i == centre:
-            #     for idx in ({i, m}):
-            #         avg = (
-            #             rho_plus[idx] + rho_zero[idx] + rho_minus[idx]
-            #         ) / 3.0
-            #         rho_plus[idx] = rho_zero[idx] = rho_minus[idx] = avg
-            #     continue
 
             rho_plus[i], rho_zero[i] = (
                 efficiency * rho_zero[i] + (1 - efficiency) * rho_plus[i],
@@ -124,6 +118,7 @@ class AFP:
             subset_indices=subset_indices,
             bin_range=bin_range,
             efficiency=efficiency,
+            show_progress=False,
         )
         if return_intensities:
             return runner.to_intensities()
@@ -149,6 +144,7 @@ class AFP:
         subset_indices=None,
         bin_range=None,
         efficiency=1.0,
+        show_progress=True,
     ):
         """
         AFP sweep on stored per-bin populations (in place).
@@ -162,6 +158,11 @@ class AFP:
         n_bins = len(self.n_plus)
         sweep = self._resolve_afp_sweep(n_bins, steps, subset_indices, bin_range)
         self._perform_afp_on_populations(
-            self.n_plus, self.n_naught, self.n_minus, sweep, efficiency
+            self.n_plus,
+            self.n_naught,
+            self.n_minus,
+            sweep,
+            efficiency,
+            show_progress=show_progress,
         )
         return self.n_plus, self.n_naught, self.n_minus
