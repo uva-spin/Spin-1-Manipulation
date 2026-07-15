@@ -57,12 +57,15 @@ def build_model_for_intensities(
     *,
     params: Optional[Spin1Params] = None,
     rf_burn_R: Optional[float] = None,
+    initial_polarization: Optional[float] = None,
 ) -> Spin1Model:
     """
     Build a :class:`Spin1Model` whose grid matches ``Iplus`` / ``Iminus`` length.
 
     The model state is loaded from the supplied intensities using the same
-    packet conversion as the realtime simulator.
+    packet conversion as the realtime simulator.  ``initial_polarization`` sets
+    ``display_cal`` (matching ``GenerateVectorLineshape`` normalization); when
+    omitted, ``params.initial_polarization`` or ``params.p0`` is used.
     """
     Iplus = np.asarray(Iplus, dtype=float)
     Iminus = np.asarray(Iminus, dtype=float)
@@ -74,8 +77,12 @@ def build_model_for_intensities(
     p = replace(base, n_bins=n_bins)
     if rf_burn_R is not None:
         p = replace(p, rf_burn_R=float(rf_burn_R))
+    if initial_polarization is not None:
+        p = replace(p, initial_polarization=float(initial_polarization))
 
-    model = Spin1Model(p)
+    # print(f"initial_polarization: {initial_polarization}")
+
+    model = Spin1Model(p, initial_polarization=initial_polarization)
     model.load_from_physical_intensities(Iplus, Iminus)
     return model
 
@@ -88,84 +95,36 @@ def solve_rate_equations(
     burn_idx: int,
     *,
     params: Optional[Spin1Params] = None,
+    initial_polarization: Optional[float] = None,
     rf_only: bool = True,
     full_dynamics: bool = False,
 ):
-    """
-    Advance one integration step and return updated intensities and populations.
-
-    Parameters
-    ----------
-    Iplus, Iminus
-        Physical R-grid intensities (same length as the model grid).
-    dt
-        Integration timestep.
-    gamma_rf
-        Common ideal-bin RF equalization rate.
-    burn_idx
-        Index of physical +R on the symmetric grid.
-    params
-        Optional base parameters.  ``n_bins`` is set from the input length.
-    rf_only
-        When True (default), apply only the RF burn term for this step.
-    full_dynamics
-        When True, run the full derivative (RF + diffusion + DNP + T1).  Overrides
-        ``rf_only``.
-
-    Returns
-    -------
-    Iplus_new, Iminus_new, rho_plus, rho_zero, rho_minus
-        Updated intensities and per-packet level populations (the latter are the
-        three columns of the packet state ``n``).
-    """
-    model = build_model_for_intensities(Iplus, Iminus, params=params)
+    step_params = params or Spin1Params()
+    model = build_model_for_intensities(
+        Iplus, Iminus, params=step_params, initial_polarization=initial_polarization
+    )
     model.params.gamma_rf = float(gamma_rf)
     model.params.rf_burn_R = float(model.Rplus[int(burn_idx)])
 
-    use_rf_only = not full_dynamics and rf_only
-    step_dt = float(dt)
-    dt_scale = 1.0
-    p = model.params
-    saved_rates = None
-    if use_rf_only:
-        saved_rates = (
-            p.d_same_plus0,
-            p.d_same_0minus,
-            p.d_spec_plus0,
-            p.d_spec_0minus,
-            p.dnp_rate,
-            p.t1_rate,
-        )
-        p.d_same_plus0 = 0.0
-        p.d_same_0minus = 0.0
-        p.d_spec_plus0 = 0.0
-        p.d_spec_0minus = 0.0
-        p.dnp_rate = 0.0
-        p.t1_rate = 0.0
+    Iplus_cur = np.asarray(Iplus, dtype=float).copy()
+    Iminus_cur = np.asarray(Iminus, dtype=float).copy()
+    Iplus_new = Iplus_cur.copy()
+    Iminus_new = Iminus_cur.copy()
+
     for _ in range(model.params.steps):
-        model.load_from_physical_intensities(Iplus, Iminus)
+        state_before = model.n.copy()
         model.step_once(
-            dt=step_dt,
+            dt=dt,
             rf_on=True,
-            dnp_on=False if use_rf_only else model.params.dnp_enabled,
+            dnp_on=False,
         )
         Iplus_new, Iminus_new, _ = model.physical_intensities()
-        if burn_preserves_ps_sign(Iplus, Iminus, Iplus_new, Iminus_new, burn_idx):
+        if not burn_preserves_ps_sign(Iplus_cur, Iminus_cur, Iplus_new, Iminus_new, burn_idx):
+            model.n = state_before
+            Iplus_new, Iminus_new = Iplus_cur, Iminus_cur
             break
-        dt_scale *= 0.5
-    if saved_rates is not None:
-        (
-            p.d_same_plus0,
-            p.d_same_0minus,
-            p.d_spec_plus0,
-            p.d_spec_0minus,
-            p.dnp_rate,
-            p.t1_rate,
-        ) = saved_rates
-    # else:
-    #     model.load_from_physical_intensities(Iplus, Iminus)
-    #     Iplus_new = np.asarray(Iplus, dtype=float).copy()
-    #     Iminus_new = np.asarray(Iminus, dtype=float).copy()
+        Iplus_cur = np.asarray(Iplus_new, dtype=float).copy()
+        Iminus_cur = np.asarray(Iminus_new, dtype=float).copy()
     rho_plus = model.n[:, PLUS].copy()
     rho_zero = model.n[:, ZERO].copy()
     rho_minus = model.n[:, MINUS].copy()
@@ -240,6 +199,9 @@ def verify_rates_response(
     gamma_rf: float,
     dt: float = 1.0,
     rtol: float = 1e-6,
+    *,
+    params: Optional[Spin1Params] = None,
+    initial_polarization: Optional[float] = None,
 ):
     """
     Check RF response ratios at the burn and mirror bins.
@@ -247,7 +209,15 @@ def verify_rates_response(
     Uses a small ``dt`` relative to ``gamma_rf`` when possible so the linearized
     2:1 burn/mirror relations hold.
     """
+    diagnostic_params = replace(params or Spin1Params(), steps=1)
     Iplus_new, Iminus_new, _, _, _ = solve_rate_equations(
-        Iplus, Iminus, dt, gamma_rf, burn_idx, rf_only=True
+        Iplus,
+        Iminus,
+        dt,
+        gamma_rf,
+        burn_idx,
+        params=diagnostic_params,
+        initial_polarization=initial_polarization,
+        rf_only=True,
     )
     return verify_burn_response(Iplus, Iminus, Iplus_new, Iminus_new, burn_idx, rtol=rtol)
