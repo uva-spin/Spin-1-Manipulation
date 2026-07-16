@@ -29,6 +29,8 @@ PLUS, ZERO, MINUS = 0, 1, 2
 
 
 
+
+
 @dataclass
 class Spin1Params:
     """Numerical and phenomenological parameters for the spin-1 model."""
@@ -47,9 +49,8 @@ class Spin1Params:
     rf_burn_R: float = -0.92
     rf_enabled: bool = True
     gamma_rf: float = 2.0
-    # Bin indices to burn simultaneously. None → single ``rf_burn_R`` pair.
-    # Each index i drives +↔0 at i and 0↔- at mirror(i); do not also pass mirrors.
     ssrf_subset_indices: Optional[List[int]] = None
+    rf_profile: Optional[np.ndarray] = None
 
     relax_enabled: bool = True
     d_same_plus0: float = 0.25
@@ -144,6 +145,20 @@ class Spin1Model:
             self.params.d_spec_plus0 = 0.0
             self.params.d_spec_0minus = 0.0
 
+        if self.params.rf_enabled:
+            self.set_rf_profile()
+
+
+    def set_rf_profile(self) -> None:
+        """Per-bin RF rate from initial Q via ``rf_burn_profile`` (``gamma_rf`` = peak)."""
+        ip, im, _ = self.physical_intensities(self.n_initial)
+        q = ip - im
+        q_min = np.min(q)
+        if q_min >= 0.0:
+            self.params.rf_profile = np.zeros_like(q)
+        else:
+            self.params.rf_profile = self.params.gamma_rf * np.clip(q / q_min, 0.0, 1.0)
+
     def _event_display_calibration(self) -> float:
         """Intensity scale matching ``GenerateVectorLineshape`` event normalization (P₀)."""
         p = self.params
@@ -165,6 +180,8 @@ class Spin1Model:
         self._invalidate_rate_cache()
         self._afp_pending = bool(self.params.afp_enabled)
         self._afp_last_subset = []
+        if self.params.rf_enabled:
+            self.set_rf_profile()
 
     @staticmethod
     def _resolve_afp_subset(
@@ -274,11 +291,15 @@ class Spin1Model:
         When ``params.ssrf_subset_indices`` is set, each index ``i`` is a burn
         frequency: +↔0 at ``i`` and 0↔- at mirror(``i``). When it is ``None``,
         burns the single ``rf_burn_R`` branch pair (legacy).
+
+        Per-bin rates come from ``rf_profile`` (Q-shaped; peak ``gamma_rf`` at deepest Q<0).
         """
         dn_rf = np.zeros_like(self.n)
-        gamma = float(self.params.gamma_rf)
-        if gamma == 0.0:
+        if float(self.params.gamma_rf) == 0.0:
             return dn_rf
+
+        self.set_rf_profile()
+        profile = np.asarray(self.params.rf_profile, dtype=float)
 
         subset = self.params.ssrf_subset_indices
         if subset is None:
@@ -294,6 +315,14 @@ class Spin1Model:
                     pairs.append((i, n_bins - 1 - i))
 
         for kp, km in pairs:
+            if kp is not None:
+                gamma = float(profile[kp])
+            elif km is not None:
+                gamma = float(profile[km])
+            else:
+                continue
+            if gamma == 0.0:
+                continue
             if kp is not None:
                 J = gamma * (self.n[kp, PLUS] - self.n[kp, ZERO])
                 dn_rf[kp, PLUS] -= J
@@ -1115,3 +1144,5 @@ class Spin1Model:
     @property
     def initial_branch_ratio(self) -> float:
         return boltzmann_branch_ratio(self.params.p0)
+
+

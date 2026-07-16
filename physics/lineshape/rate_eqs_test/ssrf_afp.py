@@ -9,23 +9,22 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 from physics.lineshape.Lineshape import GenerateVectorLineshape
-from physics.ssrf_realtime.model import MINUS, PLUS, ZERO, Spin1Params
-from physics.ssrf_realtime.rate_equations_realtime import build_model_for_intensities
-import physics.lineshape.rate_eqs_test.rate_eqs_test_ssrf_all_bins_gamma_opt as gopt
+from physics.ssrf_realtime.model import MINUS, PLUS, ZERO, Spin1Model, Spin1Params
 
 P = 0.50
 NUM_BINS = 500
 DT = 0.005
-N_STEPS = 2000
+N_STEPS = 100
 
-RF_ON = False
+RF_ON = True
 GAMMA_RF = 1.0
 
-
+AFP_ON = False
 AFP_BIN_RANGE: tuple[int, int] | None = None
-AFP_EFFICIENCY = 1.0
+AFP_EFFICIENCY = 0.0
 AFP_CENTER_MARGIN = 0
-RELAXATION_ON = True
+
+RELAXATION_ON = False
 
 OUT_DIR = Path(__file__).resolve().parent
 STEM = "rate_eqs_test_ssrf_afp_window"
@@ -61,9 +60,9 @@ def run_event(
         rf_enabled=RF_ON,
         relax_enabled=RELAXATION_ON,
     )
-    model = build_model_for_intensities(
-        iplus, iminus, params=params, initial_polarization=polarization
-    )
+
+    model = Spin1Model(params)
+
     pops_before = model.level_populations()
 
     AFP_BINS = model._resolve_afp_subset(
@@ -120,14 +119,14 @@ def run_event(
         "iminus_post_afp": im_afp,
         "iplus": iplus,
         "iminus": iminus,
-        "q_unburned": gopt.q_total(iplus_unburned, iminus_unburned),
-        "p_unburned": gopt.p_total(iplus_unburned, iminus_unburned),
-        "q_pre_afp": gopt.q_total(iplus_pre_afp, iminus_pre_afp),
-        "p_pre_afp": gopt.p_total(iplus_pre_afp, iminus_pre_afp),
-        "q_post_afp": gopt.q_total(ip_afp, im_afp),
-        "p_post_afp": gopt.p_total(ip_afp, im_afp),
-        "q_final": gopt.q_total(iplus, iminus),
-        "p_final": gopt.p_total(iplus, iminus),
+        "q_unburned": np.sum(iplus_unburned - iminus_unburned),
+        "p_unburned": np.sum(iplus_unburned + iminus_unburned),
+        "q_pre_afp": np.sum(iplus_pre_afp - iminus_pre_afp),
+        "p_pre_afp": np.sum(iplus_pre_afp + iminus_pre_afp),
+        "q_post_afp": np.sum(ip_afp - im_afp),
+        "p_post_afp": np.sum(ip_afp + im_afp),
+        "q_final": np.sum(iplus - iminus),
+        "p_final": np.sum(iplus + iminus),
         "model": model,
         "pops_before": pops_before,
         "pops_after": pops_after,
@@ -146,10 +145,11 @@ def plot_event(result: dict, output_path: Path) -> None:
     axes[0].step(f, ip0 + im0, color="black", linestyle="--", alpha=0.5, label=r"$P_s$ unburned")
     # axes[0].step(f, ip0, color="tab:red", label=r"$I_+$ unburned")
     # axes[0].step(f, im0, color="tab:blue", label=r"$I_-$ unburned")
-    axes[0].step(f, ip1 + im1, color="tab:orange", alpha=0.85, label=r"$P_s$ pre-AFP")
-    axes[0].step(f, ip_a + im_a, color="tab:green", alpha=0.75, label=r"$P_s$ after AFP (pre-relax)")
-    axes[0].step(f, ip_a, color="tab:red", label=r"$I_+$ after AFP (pre-relax)")
-    axes[0].step(f, im_a, color="tab:blue", label=r"$I_-$ after AFP (pre-relax)")
+    if AFP_ON:
+        axes[0].step(f, ip1 + im1, color="tab:orange", alpha=0.85, label=r"$P_s$ pre-AFP")
+        axes[0].step(f, ip_a + im_a, color="tab:green", alpha=0.75, label=r"$P_s$ after AFP (pre-relax)")
+        axes[0].step(f, ip_a, color="tab:red", label=r"$I_+$ after AFP (pre-relax)")
+        axes[0].step(f, im_a, color="tab:blue", label=r"$I_-$ after AFP (pre-relax)")
     axes[0].step(f, ip2 + im2, color="black", label=r"$P_s$ after relax")
     axes[0].step(f, ip2, color="tab:red", label=r"$I_+$ after ssrf")
     axes[0].step(f, im2, color="tab:blue", label=r"$I_-$ after ssrf")
@@ -159,8 +159,9 @@ def plot_event(result: dict, output_path: Path) -> None:
     axes[0].grid(True, alpha=0.3)
 
     # axes[1].step(f, ip0 - im0, color="tab:purple", linestyle="--", alpha=0.5, label=r"$Q$ unburned")
-    axes[1].step(f, ip1 - im1, color="tab:orange", alpha=0.85, label=r"$Q$ pre-AFP")
-    axes[1].step(f, ip_a - im_a, color="tab:green", alpha=0.75, label=r"$Q$ after AFP (step 0)")
+    if AFP_ON:
+        axes[1].step(f, ip1 - im1, color="tab:orange", alpha=0.85, label=r"$Q$ pre-AFP")
+        axes[1].step(f, ip_a - im_a, color="tab:green", alpha=0.75, label=r"$Q$ after AFP (step 0)")
     axes[1].step(f, ip2 - im2, color="tab:purple", label=r"$Q$ after relax")
     axes[1].axhline(0.0, color="black", linestyle="--", linewidth=0.8)
     axes[1].set_xlabel(r"$R$")
