@@ -35,7 +35,6 @@ GAMMA_MAX = GAMMA_HI_INIT
 N_BISECT = 12
 MAX_GDT = 0.05
 MAX_NSUB = 20
-EVOLVE_WINDOW_RADIUS = 8
 
 # Post-burn AFP (physics.afp.AFP); None bin_range → full grid minus center exclusion.
 AFP_ENABLED = True
@@ -126,6 +125,15 @@ def enrich_trial_totals(
     return out
 
 
+def afp_touched_bins(n_bins: int, subset: list[int] | set[int]) -> list[int]:
+    """Intensity bins AFP changes: each sweep index i also updates mirror(i)."""
+    touched: set[int] = set()
+    for i in subset:
+        touched.add(int(i))
+        touched.add(mirror_bin_idx(n_bins, int(i)))
+    return sorted(touched)
+
+
 def apply_afp_sweep(
     iplus: np.ndarray,
     iminus: np.ndarray,
@@ -141,6 +149,10 @@ def apply_afp_sweep(
     AFP.intensities_to_populations re-normalizes Σρ, so raw to_intensities()×Σ(I++I−)
     globally rescales the spectrum. Match ssRF commit_burn_bins_only: recover intensity
     units from a pre-AFP round-trip, then write only sweep bins and their mirrors.
+
+    ``subset_indices`` / ``bin_range`` are sweep frequencies only. Do not also pass
+    RF-mirror indices — each sweep at i already swaps the mirror packet. Untouched
+    bins keep their pre-AFP intensities exactly.
 
     Returns (Iplus, Iminus, subset_used).
     """
@@ -175,16 +187,34 @@ def apply_afp_sweep(
     ip_new = np.asarray(ip_new, dtype=float) * scale
     im_new = np.asarray(im_new, dtype=float) * scale
 
-    # Commit only AFP-touched packets (and mirrors), like commit_burn_bins_only.
+    # Commit only AFP-touched intensity bins (sweep ∪ RF-mirrors), like ssRF.
     out_ip = iplus.copy()
     out_im = iminus.copy()
-    touched: set[int] = set()
-    for i in subset:
-        touched.add(int(i))
-        touched.add(mirror_bin_idx(n, int(i)))
+    touched = afp_touched_bins(n, subset)
+    touched_set = set(touched)
     for k in touched:
         out_ip[k] = float(ip_new[k])
         out_im[k] = float(im_new[k])
+
+    # Restore Σ(I⁺+I⁻) to the pre-AFP event area without changing Q=Σ(I⁺−I⁻):
+    # add common-mode intensity (equal Δ to I⁺ and I⁻) on touched bins only.
+    if touched:
+        unt_idx = [i for i in range(n) if i not in touched_set]
+        area_unt = float(np.sum(out_ip[unt_idx] + out_im[unt_idx])) if unt_idx else 0.0
+        ps_touch = out_ip[touched] + out_im[touched]
+        area_touch = float(np.sum(ps_touch))
+        missing = total_area - area_unt - area_touch
+        if abs(missing) > 1e-15:
+            weights = np.maximum(ps_touch, 0.0)
+            wsum = float(np.sum(weights))
+            if wsum > 1e-30:
+                adds = missing * (weights / wsum)
+            else:
+                adds = np.full(len(touched), missing / float(len(touched)))
+            for k, add in zip(touched, adds):
+                out_ip[k] += 0.5 * float(add)
+                out_im[k] += 0.5 * float(add)
+
     return out_ip, out_im, subset
 
 
@@ -238,6 +268,7 @@ def apply_rf_burn(
     model=None,
     n0: np.ndarray | None = None,
     light: bool = False,
+    gamma_off_after_steps: int | None = 10,
 ) -> dict | None:
     if gamma_rf <= 0.0 or n_steps <= 0:
         return None
@@ -258,7 +289,6 @@ def apply_rf_burn(
     model.params.gamma_rf = float(gamma_rf)
     model.n = n0.copy()
     model.t = 0.0
-    model.set_evolution_window(EVOLVE_WINDOW_RADIUS)
 
     mirror_idx = mirror_bin_idx(len(iplus), burn_idx)
     ip_prev = {burn_idx: float(iplus[burn_idx]), mirror_idx: float(iplus[mirror_idx])}
@@ -269,13 +299,18 @@ def apply_rf_burn(
     n_sub = min(max(1, int(np.ceil(abs(g) * dt_f / MAX_GDT))), int(MAX_NSUB)) if g else 1
     dt_sub = dt_f / float(n_sub)
     steps_done = 0
+    # After this many macro-steps, zero Γ_RF (diffusion/recovery only). None → always on.
+    off_after = None if gamma_off_after_steps is None else int(gamma_off_after_steps)
 
-    for _ in range(int(n_steps)):
+    for _step in range(int(n_steps)):
+        if off_after is not None and steps_done >= off_after:
+            model.params.gamma_rf = 0.0
         if abs(q_from_packet(model, burn_idx)) <= tol:
             break
         state_before = model.n.copy()
-        for _ in range(n_sub):
-            model.step_once(dt=dt_sub, rf_on=True, dnp_on=False, copy=False)
+        rf_on = model.params.gamma_rf != 0.0
+        for _ in range(n_sub if rf_on else 1):
+            model.step_once(dt=dt_sub if rf_on else dt_f, rf_on=rf_on, dnp_on=False, copy=False)
 
         ip_new, im_new = {}, {}
         sign_ok = True
@@ -342,7 +377,6 @@ def find_gamma_to_null_q_r(
         iplus, iminus, params=params, rf_burn_R=float(f[burn_idx]), initial_polarization=polarization
     )
     n0 = model.n.copy()
-    model.set_evolution_window(EVOLVE_WINDOW_RADIUS)
 
     def trial_at(gamma: float) -> dict | None:
         return apply_rf_burn(
@@ -488,14 +522,13 @@ def optimize_all_bins(
     iplus_pre_afp, iminus_pre_afp = iplus.copy(), iminus.copy()
     afp_subset: list[int] = []
     if afp:
+        # Sweep only burned R bins — mirrors are updated inside each AFP fire.
+        # Do not add mirror indices to the sweep list (that double-applies AFP).
         subset = None
         if afp_bin_range is None:
             burned = [i for i in range(num_bins) if float(gamma_profile[i]) > 0.0]
             if burned:
-                subset = sorted(
-                    {int(i) for i in burned}
-                    | {mirror_bin_idx(num_bins, int(i)) for i in burned}
-                )
+                subset = [int(i) for i in burned]
         iplus, iminus, afp_subset = apply_afp_sweep(
             iplus, iminus,
             bin_range=afp_bin_range,
@@ -551,8 +584,13 @@ def _afp_spans(ax, result: dict) -> None:
     if not subset:
         return
     f = result["f"]
+    n = len(f)
     lo, hi = min(subset), max(subset)
-    ax.axvspan(f[lo], f[hi], color="gold", alpha=0.12, label="AFP sweep")
+    ax.axvspan(f[lo], f[hi], color="gold", alpha=0.18, label="AFP sweep")
+    # Mirror branch also changes (each sweep at i updates packet n-1-i).
+    m_lo, m_hi = n - 1 - hi, n - 1 - lo
+    if m_lo != lo or m_hi != hi:
+        ax.axvspan(f[m_lo], f[m_hi], color="gold", alpha=0.08, label="AFP mirrors")
 
 
 def plot_result(result: dict, output_path: Path) -> None:

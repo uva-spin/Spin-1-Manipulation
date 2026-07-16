@@ -23,7 +23,6 @@ from .lineshape import (
     boltzmann_branch_ratio,
     level_populations_from_PQ,
     normalized_component,
-    pake_component_raw,
 )
 
 PLUS, ZERO, MINUS = 0, 1, 2
@@ -43,11 +42,6 @@ class Spin1Params:
     line_gamma: float = 0.05
     line_asym: float = 0.04
 
-    plot_signal_units: bool = True
-    plot_divisor: float = 10.0
-    display_scale: float = 1.0
-    calibration_p: float = 0.45
-
     p0: float = 0.60
     q0: Optional[float] = None
     initial_polarization: Optional[float] = None
@@ -60,7 +54,7 @@ class Spin1Params:
     d_same_0minus: float = 0.15
     d_spec_plus0: float = 1.5
     d_spec_0minus: float = 0.8
-    same_theta_mirror_gain: float = 0.5
+    same_theta_mirror_gain: float = 1.5
     
     boltzmann_distance_gain: float = 0.5
     population_availability: float = 1.0
@@ -84,7 +78,9 @@ class Spin1Params:
 
     steps: int = 50
 
-    # Instantaneous AFP sweep config (applied via afp_sweep, not in derivative).
+    # Instantaneous AFP: fired once before time stepping (apply_pending_afp / step), then cleared.
+    # Not a rate term — applied as a map before the Euler update that step.
+    afp_enabled: bool = False
     afp_efficiency: float = 1.0
     afp_center_margin: int = 0
     afp_subset_indices: Optional[List[int]] = None
@@ -132,21 +128,14 @@ class Spin1Model:
         self._invalidate_branch_cache()
         self._active_idx: Optional[np.ndarray] = None
         self._window_radius: Optional[int] = None
+        # One-shot AFP before the next step() / apply_pending_afp when params.afp_enabled.
+        self._afp_pending: bool = bool(self.params.afp_enabled)
+        self._afp_last_subset: List[int] = []
 
     def _event_display_calibration(self) -> float:
-        """Calibration scale matching ``GenerateVectorLineshape`` event normalization."""
+        """Intensity scale matching ``GenerateVectorLineshape`` event normalization (P₀)."""
         p = self.params
         return float(p.initial_polarization if p.initial_polarization is not None else p.p0)
-
-    def _compute_display_calibration(self) -> float:
-        p = self.params
-        if not p.plot_signal_units:
-            return float(p.display_scale)
-        pref_cal = level_populations_from_PQ(_clamp_p(p.calibration_p), None)
-        minor_diff = abs(float(pref_cal[ZERO] - pref_cal[MINUS]))
-        raw = pake_component_raw(self.Rplus, +1, gamma=p.line_gamma, asym=p.line_asym)
-        raw_area = np.trapezoid(raw, self.Rplus)
-        return float(p.display_scale * raw_area / (max(p.plot_divisor, 1e-15) * minor_diff))
 
     def load_from_physical_intensities(self, Iplus: np.ndarray, Iminus: np.ndarray) -> None:
         """Set ``self.n`` from physical R-grid intensities using model conversions."""
@@ -162,6 +151,8 @@ class Spin1Model:
         self._populations_from_intensities = True
         self._sync_level_populations(capture_initial=True)
         self._invalidate_rate_cache()
+        self._afp_pending = bool(self.params.afp_enabled)
+        self._afp_last_subset = []
 
     @staticmethod
     def _resolve_afp_subset(
@@ -225,18 +216,32 @@ class Spin1Model:
             )
         return out, subset
 
+    def arm_afp(self, subset_indices: Optional[List[int]] = None) -> None:
+        """Arm one-shot AFP to run before the next ``step`` / ``apply_pending_afp``."""
+        self.params.afp_enabled = True
+        if subset_indices is not None:
+            self.params.afp_subset_indices = [int(i) for i in subset_indices]
+        self._afp_pending = True
+
     def afp_sweep(
         self,
         subset_indices: Optional[List[int]] = None,
         *,
         efficiency: Optional[float] = None,
         center_margin: Optional[int] = None,
+        preserve_intensity_area: bool = False,
     ) -> List[int]:
-        """Apply an instantaneous AFP sweep in place on packet populations ``self.n``.
+        """
+        Instantaneous AFP on ``subset_indices`` (sweep frequencies only).
 
-        Defaults to ``params.afp_subset_indices``, ``params.afp_efficiency``, and
-        ``params.afp_center_margin`` when arguments are omitted.
-        Returns the bin indices that were swept (after ``center_margin`` exclusion).
+        Each index i swaps n+↔n0 at i and n0↔n- at mirror(i). Do not also pass
+        mirror indices in ``subset_indices`` or AFP is applied twice. Only those
+        packets are written; all other bins are left unchanged.
+
+        By default Σ(I⁺+I⁻) is left as the post-swap area (vector P can change).
+        When ``preserve_intensity_area`` is True, that sum is restored to the
+        pre-AFP event area by adding *common-mode* intensity on touched bins
+        (equal Δ to I⁺ and I⁻), leaving Q = Σ(I⁺−I⁻) unchanged.
         """
         if subset_indices is None:
             subset_indices = self.params.afp_subset_indices
@@ -244,16 +249,155 @@ class Spin1Model:
             efficiency = self.params.afp_efficiency
         if center_margin is None:
             center_margin = self.params.afp_center_margin
+
+        ip_before, im_before, _ = self.physical_intensities()
+        area_before = float(np.sum(ip_before + im_before))
+
         target, subset = self.afp_target_state(
             self.n,
             subset_indices,
             efficiency=float(efficiency),
             center_margin=int(center_margin),
         )
-        self.n = target
+        # Write only packets AFP touches (sweep ∪ mirrors).
+        n_bins = len(self.n)
+        touched = sorted(
+            {int(i) for i in subset} | {n_bins - 1 - int(i) for i in subset}
+        )
+        for k in touched:
+            self.n[k] = target[k]
+
+        if preserve_intensity_area and touched and abs(area_before) > 1e-30:
+            self._renormalize_touched_intensity_area(touched, area_before)
+
         self._sync_level_populations(capture_initial=False)
         self._invalidate_rate_cache()
+        self._afp_last_subset = list(subset)
         return subset
+
+    def _renormalize_touched_intensity_area(
+        self,
+        touched: List[int],
+        area_target: float,
+    ) -> None:
+        """
+        Restore Σ(I⁺+I⁻) to ``area_target`` on ``touched`` bins without changing Q.
+
+        Adds a common-mode offset (equal ΔI⁺ and ΔI⁻), weighted by local Ps on
+        touched bins. Untouched bins stay unchanged. Packet row sums stay ``mu``.
+        """
+        ip, im, _ = self.physical_intensities()
+        ip_new = np.asarray(ip, dtype=float).copy()
+        im_new = np.asarray(im, dtype=float).copy()
+        touched_list = [int(k) for k in touched]
+        touched_set = set(touched_list)
+
+        area_unt = 0.0
+        area_touch = 0.0
+        weights = np.zeros(len(touched_list), dtype=float)
+        for j, k in enumerate(touched_list):
+            s = float(ip_new[k] + im_new[k])
+            weights[j] = max(s, 0.0)
+            area_touch += s
+        for k in range(len(ip_new)):
+            if k not in touched_set:
+                area_unt += float(ip_new[k] + im_new[k])
+
+        missing = float(area_target) - area_unt - area_touch
+        if abs(missing) < 1e-15:
+            return
+
+        wsum = float(np.sum(weights))
+        if wsum > 1e-30:
+            for j, k in enumerate(touched_list):
+                add = missing * (weights[j] / wsum)
+                ip_new[k] += 0.5 * add
+                im_new[k] += 0.5 * add
+        else:
+            add = missing / float(len(touched_list))
+            for k in touched_list:
+                ip_new[k] += 0.5 * add
+                im_new[k] += 0.5 * add
+
+        inv_scale = float(self.dR) / float(self.display_cal)
+        n_bins = len(self.n)
+        for k in touched_set:
+            mirror = n_bins - 1 - k
+            a = float(ip_new[k]) * inv_scale
+            b = float(im_new[mirror]) * inv_scale
+            n_zero = (float(self.mu[k]) - a + b) / 3.0
+            self.n[k, PLUS] = n_zero + a
+            self.n[k, ZERO] = n_zero
+            self.n[k, MINUS] = n_zero - b
+        self.n = np.maximum(self.n, 1e-30)
+        for k in touched_set:
+            row = float(self.n[k].sum())
+            if row > 1e-30:
+                self.n[k] *= float(self.mu[k]) / row
+
+    def apply_pending_afp(self) -> List[int]:
+        """
+        Fire one-shot AFP if armed, before any time evolution.
+
+        Returns the sweep subset used (empty if nothing was pending).
+        """
+        if not (self._afp_pending and self.params.afp_enabled):
+            return []
+        subset = self.afp_sweep()
+        self._afp_pending = False
+        return subset
+
+    def step(self, n_steps: int = 1, rf_on: Optional[bool] = None, dnp_on: Optional[bool] = None) -> None:
+        """
+        Advance ``n_steps`` Euler steps.
+
+        Any armed AFP is applied once *before* the first step (no dt), then
+        cleared so every Euler update is RF/relaxation/DNP only.
+        """
+        self.apply_pending_afp()
+        dt = float(self.params.dt)
+        if rf_on is None:
+            rf_on = bool(self.params.rf_enabled)
+        if dnp_on is None:
+            dnp_on = bool(self.params.dnp_enabled)
+        for _ in range(max(1, int(n_steps))):
+            self.step_once(dt=dt, rf_on=rf_on, dnp_on=dnp_on, copy=False)
+
+    def step_once(
+        self,
+        dt: Optional[float] = None,
+        rf_on: Optional[bool] = None,
+        dnp_on: Optional[bool] = None,
+        *,
+        copy: bool = False,
+    ) -> np.ndarray:
+        """
+        One Euler macro-step of RF / relaxation / DNP (no AFP).
+
+        AFP is instantaneous and must run before time stepping via ``afp_sweep``,
+        ``apply_pending_afp``, or ``step`` (which flushes pending AFP first).
+        """
+        step_dt = float(self.params.dt if dt is None else dt)
+        if rf_on is None:
+            rf_on = bool(self.params.rf_enabled)
+        if dnp_on is None:
+            dnp_on = bool(self.params.dnp_enabled)
+
+        dn = self.derivative(rf_on=rf_on, dnp_on=dnp_on, breakdown=False)
+        active = self._active_idx
+        if active is None:
+            self.n = self.n + step_dt * dn
+            self.n = np.maximum(self.n, 1e-30)
+            sums = self.n.sum(axis=1, keepdims=True)
+            self.n *= self.mu[:, None] / np.maximum(sums, 1e-30)
+        elif active.size > 0:
+            self.n[active] = self.n[active] + step_dt * dn[active]
+            self.n[active] = np.maximum(self.n[active], 1e-30)
+            sums = self.n[active].sum(axis=1, keepdims=True)
+            self.n[active] *= self.mu[active, None] / np.maximum(sums, 1e-30)
+        self.t += step_dt
+        self._sync_level_populations(capture_initial=False)
+        return self.n.copy() if copy else self.n
 
     def _sync_level_populations(self, *, capture_initial: bool = False) -> None:
         """
@@ -333,8 +477,10 @@ class Spin1Model:
         ref_minus = self._transition_density_abs("0minus", reference)
         finite_p = ref_plus[np.isfinite(ref_plus)]
         finite_m = ref_minus[np.isfinite(ref_minus)]
-        plus_norm = max(float(np.nanpercentile(finite_p, 90.0)) if finite_p.size else 0.0, 1e-12)
-        minus_norm = max(float(np.nanpercentile(finite_m, 90.0)) if finite_m.size else 0.0, 1e-12)
+        # plus_norm = max(float(np.nanpercentile(finite_p, 90.0)) if finite_p.size else 0.0, 1e-12)
+        # minus_norm = max(float(np.nanpercentile(finite_m, 90.0)) if finite_m.size else 0.0, 1e-12)
+        plus_norm = max(finite_p)
+        minus_norm = max(finite_m)
         if len(self.Rplus) < 2:
             overlap = np.zeros(0, dtype=float)
             edge_mass = np.zeros(0, dtype=float)
@@ -364,47 +510,54 @@ class Spin1Model:
         self._cached_km = km
         return kp, km
 
-    def set_evolution_window(self, radius: Optional[int]) -> None:
-        """
-        Restrict Euler updates to packets near the RF burn and its mirror.
-
-        ``radius`` is half-width in bins around each of ``kp`` and ``km``.
-        ``None`` restores full-spectrum evolution. Neighbor spillover outside the
-        window is discarded (matches burn scripts that only commit burn/mirror).
-        """
-        if radius is None:
-            self._window_radius = None
-            self._active_idx = None
-            return
-        self._window_radius = max(0, int(radius))
-        self._rebuild_active_idx()
-
-    def _rebuild_active_idx(self) -> None:
-        if self._window_radius is None:
-            self._active_idx = None
-            return
-        kp, km = self.cached_branch_indices()
-        n = len(self.Rplus)
-        r = int(self._window_radius)
-        idxs: list[int] = []
-        for k in (kp, km):
-            if k is None:
-                continue
-            lo = max(0, int(k) - r)
-            hi = min(n, int(k) + r + 1)
-            idxs.extend(range(lo, hi))
-        self._active_idx = np.unique(np.asarray(idxs, dtype=int)) if idxs else np.zeros(0, dtype=int)
-
     def recovery_reference(self) -> np.ndarray:
         """Packet state that defines the recovery null manifold (initial event shape)."""
         return self.n_initial
 
     def equilibrium_reference(self, P: Optional[float] = None) -> np.ndarray:
-        """Reference packet state; with no target P, match the GUI's fixed baseline."""
+        """Boltzmann packet state at ``P``.
+
+        With no ``P``, return the fixed initial-event baseline ``n_ref`` (display /
+        response reference). Recovery pathways should pass the current vector
+        polarization so the null manifold tracks post-manipulation P, not P₀.
+        """
         if P is None:
             return self.n_ref
         pref = level_populations_from_PQ(_clamp_p(float(P)), None)
         return self.mu[:, None] * pref[None, :]
+
+    def recovery_equilibrium_reference(self) -> np.ndarray:
+        """Boltzmann reference at the current event-normalized vector P.
+
+        Uses stored ``n_plus - n_minus`` (intensity / level sync), not packet-sum
+        ``polarizations()['P']`` (~dR for intensity-loaded events).
+
+        Intensity-loaded states live in a different packet scale than
+        ``mu * pref(P)``: recover via the same I± ↔ n conversion as the event so
+        the null manifold matches ``n`` (when P is unchanged this is ``n_ref``).
+        """
+        P = _clamp_p(self.n_plus - self.n_minus)
+        if not self._populations_from_intensities:
+            return self.equilibrium_reference(P)
+
+        P0 = _clamp_p(self.n_plus_initial - self.n_minus_initial)
+        if abs(P - P0) <= 1e-10:
+            return self.n_ref
+
+        # Boltzmann at P in event intensity units, then into the loaded packet basis.
+        pref = level_populations_from_PQ(P, None)
+        n_ideal = self.mu[:, None] * pref[None, :]
+        ip, im, _ = packet_n_to_physical_intensities(
+            n_ideal, self.Rplus, display_cal=1.0, dR=self.dR
+        )
+        area = float(np.sum(ip + im))
+        if abs(area) > 1e-30:
+            scale = float(P) / area
+            ip = ip * scale
+            im = im * scale
+        return physical_intensities_to_packet_n(
+            ip, im, self.mu, display_cal=self.display_cal, dR=self.dR
+        )
 
     def polarizations(self, n: Optional[np.ndarray] = None) -> Dict[str, float]:
         """Return current dimensionless level populations, vector P, and tensor Q."""
@@ -420,19 +573,6 @@ class Spin1Model:
             "P": P,
             "Q": Q,
             "Q_boltz_at_P": boltzmann_Q(_clamp_p(P)),
-        }
-
-    def branch_areas(self, n: Optional[np.ndarray] = None) -> Dict[str, float]:
-        """Return display-calibrated integrated branch areas and total area."""
-        if n is None:
-            n = self.n
-        a_plus = float(self.display_cal * np.sum(n[:, PLUS] - n[:, ZERO]))
-        a_minus = float(self.display_cal * np.sum(n[:, ZERO] - n[:, MINUS]))
-        return {
-            "A_plus": a_plus,
-            "A_minus": a_minus,
-            "A_total": a_plus + a_minus,
-            "A_diff": a_plus - a_minus,
         }
 
     def branch_indices(self, R: Optional[float] = None) -> Tuple[Optional[int], Optional[int]]:
@@ -573,7 +713,7 @@ class Spin1Model:
 
     def _rf_mode_amplitudes(self, reference: Optional[np.ndarray] = None) -> Tuple[np.ndarray, np.ndarray]:
         if reference is None:
-            reference = self.equilibrium_reference()
+            reference = self.recovery_equilibrium_reference()
         delta = self.n - reference
         a_plus0 = -2.0 * delta[:, PLUS]
         b_0minus = 2.0 * delta[:, MINUS]
@@ -724,7 +864,7 @@ class Spin1Model:
     def local_recovery_rates(self, R: Optional[float] = None) -> Dict[str, float]:
         if R is None:
             R = self.params.rf_burn_R
-        reference = self.equilibrium_reference()
+        reference = self.recovery_equilibrium_reference()
         rates = self._position_rate_arrays(reference)
         kp, km = self.branch_indices(R)
 
@@ -844,14 +984,6 @@ class Spin1Model:
         if dnp_on is None:
             dnp_on = bool(p.dnp_enabled)
         dn_terms: Dict[str, np.ndarray] = {}
-
-        # --- RF term (stiff). Cached kp/km avoid per-step argmin. ---
-        # FUTURE (not applied yet): split stiff RF from slow recovery/diffusion —
-        # apply an exact/analytic RF map on packets (kp, km) for the full macro-dt
-        # (or closed-form exponential of the 2-level RF generator), then Euler only
-        # the sameθ + neighbor terms at a larger dt. That removes γ-proportional
-        # substepping. Change sites: this RF block, and callers that currently set
-        # n_sub = ceil(|γ|·dt/MAX_GDT) (e.g. rate_eqs_test_ssrf_all_bins_gamma_opt).
         dn_rf = np.zeros_like(self.n)
         if rf_on and p.gamma_rf != 0.0:
             kp, km = self.cached_branch_indices(p.rf_burn_R)
@@ -865,8 +997,8 @@ class Spin1Model:
                 dn_rf[km, MINUS] += J
         dn_terms["RF"] = dn_rf
 
-        # recovery_ref = self.recovery_reference()
-        dynamic_ref = self.equilibrium_reference()
+        # Recover toward Boltzmann at current P (post-manipulation), not initial n_ref.
+        dynamic_ref = self.recovery_equilibrium_reference()
         need_same = p.d_same_plus0 != 0.0 or p.d_same_0minus != 0.0
         need_spec = p.d_spec_plus0 != 0.0 or p.d_spec_0minus != 0.0
         rates = None
@@ -955,44 +1087,6 @@ class Spin1Model:
         obs_terms: Dict[str, Dict[str, float]] = {name: obs_for_term(term) for name, term in dn_terms.items()}
         obs_terms["net"] = obs_for_term(dn)
         return dn, obs_terms
-
-    def step(self, n_steps: int = 1, rf_on: Optional[bool] = None, dnp_on: Optional[bool] = None) -> None:
-        dt = float(self.params.dt)
-        if rf_on is None:
-            rf_on = bool(self.params.rf_enabled)
-        if dnp_on is None:
-            dnp_on = bool(self.params.dnp_enabled)
-        for _ in range(max(1, int(n_steps))):
-            self.step_once(dt=dt, rf_on=rf_on, dnp_on=dnp_on, copy=False)
-
-    def step_once(
-        self,
-        dt: Optional[float] = None,
-        rf_on: Optional[bool] = None,
-        dnp_on: Optional[bool] = None,
-        *,
-        copy: bool = False,
-    ) -> np.ndarray:
-        step_dt = float(self.params.dt if dt is None else dt)
-        if rf_on is None:
-            rf_on = bool(self.params.rf_enabled)
-        if dnp_on is None:
-            dnp_on = bool(self.params.dnp_enabled)
-        dn = self.derivative(rf_on=rf_on, dnp_on=dnp_on, breakdown=False)
-        active = self._active_idx
-        if active is None:
-            self.n = self.n + step_dt * dn
-            self.n = np.maximum(self.n, 1e-30)
-            sums = self.n.sum(axis=1, keepdims=True)
-            self.n *= self.mu[:, None] / np.maximum(sums, 1e-30)
-        elif active.size > 0:
-            self.n[active] = self.n[active] + step_dt * dn[active]
-            self.n[active] = np.maximum(self.n[active], 1e-30)
-            sums = self.n[active].sum(axis=1, keepdims=True)
-            self.n[active] *= self.mu[active, None] / np.maximum(sums, 1e-30)
-        self.t += step_dt
-        self._sync_level_populations(capture_initial=False)
-        return self.n.copy() if copy else self.n
 
     def rf_balance_estimate(self, R: Optional[float] = None) -> Dict[str, float]:
         """Estimate common RF rate needed to hold the two direct components."""
