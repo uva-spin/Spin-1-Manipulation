@@ -28,8 +28,6 @@ from .lineshape import (
 PLUS, ZERO, MINUS = 0, 1, 2
 
 
-def _clamp_p(P: float) -> float:
-    return float(np.clip(float(P), -0.999999, 0.999999))
 
 @dataclass
 class Spin1Params:
@@ -49,7 +47,11 @@ class Spin1Params:
     rf_burn_R: float = -0.92
     rf_enabled: bool = True
     gamma_rf: float = 2.0
+    # Bin indices to burn simultaneously. None → single ``rf_burn_R`` pair.
+    # Each index i drives +↔0 at i and 0↔- at mirror(i); do not also pass mirrors.
+    ssrf_subset_indices: Optional[List[int]] = None
 
+    relax_enabled: bool = True
     d_same_plus0: float = 0.25
     d_same_0minus: float = 0.15
     d_spec_plus0: float = 1.5
@@ -83,6 +85,7 @@ class Spin1Params:
     afp_enabled: bool = False
     afp_efficiency: float = 1.0
     afp_center_margin: int = 0
+    afp_preserve_intensity_area: bool = False
     afp_subset_indices: Optional[List[int]] = None
 
 
@@ -110,7 +113,7 @@ class Spin1Model:
         self.mu = mu / max(float(mu.sum()), 1e-30)
         self.base_density = self.mu / self.dR
 
-        self.pref_initial = level_populations_from_PQ(_clamp_p(p.p0), p.q0)
+        self.pref_initial = level_populations_from_PQ(p.p0, p.q0)
         self.n_ref = self.mu[:, None] * self.pref_initial[None, :]
         self.n = self.n_ref.copy()
         self.n_initial = self.n.copy()
@@ -131,6 +134,15 @@ class Spin1Model:
         # One-shot AFP before the next step() / apply_pending_afp when params.afp_enabled.
         self._afp_pending: bool = bool(self.params.afp_enabled)
         self._afp_last_subset: List[int] = []
+
+        self.ip_afp = None
+        self.im_afp = None
+
+        if not self.params.relax_enabled:
+            self.params.d_same_plus0 = 0.0
+            self.params.d_same_0minus = 0.0
+            self.params.d_spec_plus0 = 0.0
+            self.params.d_spec_0minus = 0.0
 
     def _event_display_calibration(self) -> float:
         """Intensity scale matching ``GenerateVectorLineshape`` event normalization (P₀)."""
@@ -216,21 +228,7 @@ class Spin1Model:
             )
         return out, subset
 
-    def arm_afp(self, subset_indices: Optional[List[int]] = None) -> None:
-        """Arm one-shot AFP to run before the next ``step`` / ``apply_pending_afp``."""
-        self.params.afp_enabled = True
-        if subset_indices is not None:
-            self.params.afp_subset_indices = [int(i) for i in subset_indices]
-        self._afp_pending = True
-
-    def afp_sweep(
-        self,
-        subset_indices: Optional[List[int]] = None,
-        *,
-        efficiency: Optional[float] = None,
-        center_margin: Optional[int] = None,
-        preserve_intensity_area: bool = False,
-    ) -> List[int]:
+    def afp_sweep(self) -> List[int]:
         """
         Instantaneous AFP on ``subset_indices`` (sweep frequencies only).
 
@@ -243,23 +241,17 @@ class Spin1Model:
         pre-AFP event area by adding *common-mode* intensity on touched bins
         (equal Δ to I⁺ and I⁻), leaving Q = Σ(I⁺−I⁻) unchanged.
         """
-        if subset_indices is None:
-            subset_indices = self.params.afp_subset_indices
-        if efficiency is None:
-            efficiency = self.params.afp_efficiency
-        if center_margin is None:
-            center_margin = self.params.afp_center_margin
 
         ip_before, im_before, _ = self.physical_intensities()
         area_before = float(np.sum(ip_before + im_before))
 
         target, subset = self.afp_target_state(
             self.n,
-            subset_indices,
-            efficiency=float(efficiency),
-            center_margin=int(center_margin),
+            self.params.afp_subset_indices,
+            efficiency=self.params.afp_efficiency,
+            center_margin=self.params.afp_center_margin,
         )
-        # Write only packets AFP touches (sweep ∪ mirrors).
+
         n_bins = len(self.n)
         touched = sorted(
             {int(i) for i in subset} | {n_bins - 1 - int(i) for i in subset}
@@ -267,13 +259,50 @@ class Spin1Model:
         for k in touched:
             self.n[k] = target[k]
 
-        if preserve_intensity_area and touched and abs(area_before) > 1e-30:
+        if self.params.afp_preserve_intensity_area and touched and abs(area_before) > 1e-30:
             self._renormalize_touched_intensity_area(touched, area_before)
 
         self._sync_level_populations(capture_initial=False)
         self._invalidate_rate_cache()
         self._afp_last_subset = list(subset)
+        self.ip_afp, self.im_afp, _ = self.physical_intensities()
         return subset
+
+    def ssrf_burn(self) -> np.ndarray:
+        """Return RF population rates for each ssRF burn bin in params.
+
+        When ``params.ssrf_subset_indices`` is set, each index ``i`` is a burn
+        frequency: +↔0 at ``i`` and 0↔- at mirror(``i``). When it is ``None``,
+        burns the single ``rf_burn_R`` branch pair (legacy).
+        """
+        dn_rf = np.zeros_like(self.n)
+        gamma = float(self.params.gamma_rf)
+        if gamma == 0.0:
+            return dn_rf
+
+        subset = self.params.ssrf_subset_indices
+        if subset is None:
+            pairs: List[Tuple[Optional[int], Optional[int]]] = [
+                self.cached_branch_indices(self.params.rf_burn_R)
+            ]
+        else:
+            n_bins = len(self.n)
+            pairs = []
+            for raw in subset:
+                i = int(raw)
+                if 0 <= i < n_bins:
+                    pairs.append((i, n_bins - 1 - i))
+
+        for kp, km in pairs:
+            if kp is not None:
+                J = gamma * (self.n[kp, PLUS] - self.n[kp, ZERO])
+                dn_rf[kp, PLUS] -= J
+                dn_rf[kp, ZERO] += J
+            if km is not None:
+                J = gamma * (self.n[km, ZERO] - self.n[km, MINUS])
+                dn_rf[km, ZERO] -= J
+                dn_rf[km, MINUS] += J
+        return dn_rf
 
     def _renormalize_touched_intensity_area(
         self,
@@ -335,26 +364,12 @@ class Spin1Model:
             if row > 1e-30:
                 self.n[k] *= float(self.mu[k]) / row
 
-    def apply_pending_afp(self) -> List[int]:
-        """
-        Fire one-shot AFP if armed, before any time evolution.
-
-        Returns the sweep subset used (empty if nothing was pending).
-        """
-        if not (self._afp_pending and self.params.afp_enabled):
-            return []
-        subset = self.afp_sweep()
-        self._afp_pending = False
-        return subset
-
     def step(self, n_steps: int = 1, rf_on: Optional[bool] = None, dnp_on: Optional[bool] = None) -> None:
-        """
-        Advance ``n_steps`` Euler steps.
 
-        Any armed AFP is applied once *before* the first step (no dt), then
-        cleared so every Euler update is RF/relaxation/DNP only.
-        """
-        self.apply_pending_afp()
+        if self.params.afp_enabled:
+            self.afp_sweep()
+            self.params.afp_enabled = False ### only apply AFP once, set bool to false afterwards
+
         dt = float(self.params.dt)
         if rf_on is None:
             rf_on = bool(self.params.rf_enabled)
@@ -417,7 +432,7 @@ class Spin1Model:
             else:
                 scale = float(self.dR) / max(abs(float(self.display_cal)), 1e-30)
                 p_vec, q_ten = p_raw * scale, q_raw * scale
-            pref = level_populations_from_PQ(_clamp_p(p_vec), q_ten)
+            pref = level_populations_from_PQ(p_vec, q_ten)
         else:
             pops = np.sum(self.n, axis=0)
             total = max(float(pops.sum()), 1e-30)
@@ -477,8 +492,6 @@ class Spin1Model:
         ref_minus = self._transition_density_abs("0minus", reference)
         finite_p = ref_plus[np.isfinite(ref_plus)]
         finite_m = ref_minus[np.isfinite(ref_minus)]
-        # plus_norm = max(float(np.nanpercentile(finite_p, 90.0)) if finite_p.size else 0.0, 1e-12)
-        # minus_norm = max(float(np.nanpercentile(finite_m, 90.0)) if finite_m.size else 0.0, 1e-12)
         plus_norm = max(finite_p)
         minus_norm = max(finite_m)
         if len(self.Rplus) < 2:
@@ -523,24 +536,16 @@ class Spin1Model:
         """
         if P is None:
             return self.n_ref
-        pref = level_populations_from_PQ(_clamp_p(float(P)), None)
+        pref = level_populations_from_PQ(float(P), None)
         return self.mu[:, None] * pref[None, :]
 
     def recovery_equilibrium_reference(self) -> np.ndarray:
-        """Boltzmann reference at the current event-normalized vector P.
 
-        Uses stored ``n_plus - n_minus`` (intensity / level sync), not packet-sum
-        ``polarizations()['P']`` (~dR for intensity-loaded events).
-
-        Intensity-loaded states live in a different packet scale than
-        ``mu * pref(P)``: recover via the same I± ↔ n conversion as the event so
-        the null manifold matches ``n`` (when P is unchanged this is ``n_ref``).
-        """
-        P = _clamp_p(self.n_plus - self.n_minus)
+        P = self.n_plus - self.n_minus
         if not self._populations_from_intensities:
             return self.equilibrium_reference(P)
 
-        P0 = _clamp_p(self.n_plus_initial - self.n_minus_initial)
+        P0 = self.n_plus_initial - self.n_minus_initial
         if abs(P - P0) <= 1e-10:
             return self.n_ref
 
@@ -572,7 +577,7 @@ class Spin1Model:
             "n_minus": float(pops[MINUS]),
             "P": P,
             "Q": Q,
-            "Q_boltz_at_P": boltzmann_Q(_clamp_p(P)),
+            "Q_boltz_at_P": boltzmann_Q(P),
         }
 
     def branch_indices(self, R: Optional[float] = None) -> Tuple[Optional[int], Optional[int]]:
@@ -978,29 +983,18 @@ class Spin1Model:
         return self._mode_to_population_derivative(np.zeros_like(mode), dmode_dt)
 
     def derivative(self, rf_on: Optional[bool] = None, dnp_on: Optional[bool] = None, breakdown: bool = False):
-        p = self.params
         if rf_on is None:
-            rf_on = bool(p.rf_enabled)
+            rf_on = bool(self.params.rf_enabled)
         if dnp_on is None:
-            dnp_on = bool(p.dnp_enabled)
+            dnp_on = bool(self.params.dnp_enabled)
         dn_terms: Dict[str, np.ndarray] = {}
-        dn_rf = np.zeros_like(self.n)
-        if rf_on and p.gamma_rf != 0.0:
-            kp, km = self.cached_branch_indices(p.rf_burn_R)
-            if kp is not None:
-                J = p.gamma_rf * (self.n[kp, PLUS] - self.n[kp, ZERO])
-                dn_rf[kp, PLUS] -= J
-                dn_rf[kp, ZERO] += J
-            if km is not None:
-                J = p.gamma_rf * (self.n[km, ZERO] - self.n[km, MINUS])
-                dn_rf[km, ZERO] -= J
-                dn_rf[km, MINUS] += J
+        dn_rf = self.ssrf_burn() if rf_on else np.zeros_like(self.n)
         dn_terms["RF"] = dn_rf
 
         # Recover toward Boltzmann at current P (post-manipulation), not initial n_ref.
         dynamic_ref = self.recovery_equilibrium_reference()
-        need_same = p.d_same_plus0 != 0.0 or p.d_same_0minus != 0.0
-        need_spec = p.d_spec_plus0 != 0.0 or p.d_spec_0minus != 0.0
+        need_same = self.params.d_same_plus0 != 0.0 or self.params.d_same_0minus != 0.0
+        need_spec = self.params.d_spec_plus0 != 0.0 or self.params.d_spec_0minus != 0.0
         rates = None
         amplitudes = None
         if need_same or need_spec:
@@ -1010,10 +1004,10 @@ class Spin1Model:
         if need_same:
             dn_same = (
                 self._mode_relax_reference(
-                    "plus0", p.d_same_plus0, dynamic_ref, rates=rates, amplitudes=amplitudes
+                    "plus0", self.params.d_same_plus0, dynamic_ref, rates=rates, amplitudes=amplitudes
                 )
                 + self._mode_relax_reference(
-                    "0minus", p.d_same_0minus, dynamic_ref, rates=rates, amplitudes=amplitudes
+                    "0minus", self.params.d_same_0minus, dynamic_ref, rates=rates, amplitudes=amplitudes
                 )
             )
             dn_same = self._project_conserve_vector(dn_same)
@@ -1024,10 +1018,10 @@ class Spin1Model:
         if need_spec:
             dn_spec = (
                 self._mode_diffuse_delta(
-                    "plus0", p.d_spec_plus0, dynamic_ref, rates=rates, amplitudes=amplitudes
+                    "plus0", self.params.d_spec_plus0, dynamic_ref, rates=rates, amplitudes=amplitudes
                 )
                 + self._mode_diffuse_delta(
-                    "0minus", p.d_spec_0minus, dynamic_ref, rates=rates, amplitudes=amplitudes
+                    "0minus", self.params.d_spec_0minus, dynamic_ref, rates=rates, amplitudes=amplitudes
                 )
             )
             dn_spec = self._project_conserve_vector(dn_spec)
@@ -1036,15 +1030,15 @@ class Spin1Model:
         dn_terms["spectral_neighbor_diffusion"] = dn_spec
 
         dn_dnp = np.zeros_like(self.n)
-        if dnp_on and p.dnp_rate != 0.0:
-            dnp_target = self.equilibrium_reference(_clamp_p(p.p_dnp_sat))
-            dn_dnp = p.dnp_rate * (dnp_target - self.n)
+        if dnp_on and self.params.dnp_rate != 0.0:
+            dnp_target = self.equilibrium_reference(self.params.p_dnp_sat)
+            dn_dnp = self.params.dnp_rate * (dnp_target - self.n)
         dn_terms["DNP_sat"] = dn_dnp
 
         dn_t1 = np.zeros_like(self.n)
-        if p.t1_rate != 0.0:
-            t1_target = self.equilibrium_reference(_clamp_p(p.t1_p_eq))
-            dn_t1 = p.t1_rate * (t1_target - self.n)
+        if self.params.t1_rate != 0.0:
+            t1_target = self.equilibrium_reference(self.params.t1_p_eq)
+            dn_t1 = self.params.t1_rate * (t1_target - self.n)
         dn_terms["T1"] = dn_t1
 
         dn = sum(dn_terms.values())
@@ -1065,7 +1059,7 @@ class Spin1Model:
         if not breakdown:
             return dn
 
-        kp, km = self.cached_branch_indices(p.rf_burn_R)
+        kp, km = self.cached_branch_indices(self.params.rf_burn_R)
         scale = self.display_cal / self.dR
 
         def obs_for_term(term: np.ndarray) -> Dict[str, float]:
@@ -1116,8 +1110,8 @@ class Spin1Model:
 
     @property
     def branch_ratio(self) -> float:
-        return boltzmann_branch_ratio(_clamp_p(self.polarizations()["P"]))
+        return boltzmann_branch_ratio(self.polarizations()["P"])
 
     @property
     def initial_branch_ratio(self) -> float:
-        return boltzmann_branch_ratio(_clamp_p(self.params.p0))
+        return boltzmann_branch_ratio(self.params.p0)
