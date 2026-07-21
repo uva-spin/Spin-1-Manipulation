@@ -24,11 +24,11 @@ import torch.nn as nn
 # ---------------------------------------------------------------------------
 
 MODEL_PATH = "models/combined_bin_model.pth"
-TEST_FILE = "data/random_burn_lineshapes_1000.pkl"
+TEST_FILE = "../data/manipulated_test_10000.pkl"
 OUTPUT_DIR = "results/test_binning"
 SCALING_FILE = None
 
-DEVICE = "cuda"
+DEVICE = "mps"
 NUM_BINS = 500
 FEATURE_CLIP_Z = 8.0
 EXAMPLES = 12
@@ -113,13 +113,21 @@ class LineshapeEvent:
             burn_progress[b] = np.float32(self.burn_progress)
 
         columns = {
+            "ps": self.ps,
             "ps_at_burn_bin": self.ps,
+            "p0": np.full(n, self.polarization, dtype=np.float32),
             "P": np.full(n, self.polarization, dtype=np.float32),
+            "amp": np.abs(self.ps),
             "burn_step_norm": burn_step_norm,
             "ps_ratio": ps_ratio,
             "burn_progress": burn_progress,
         }
         names = feature_names or list(BURN_CONTEXT_FEATURES)
+        missing = [name for name in names if name not in columns]
+        if missing:
+            raise KeyError(
+                f"Unknown feature names {missing}; supported: {sorted(columns)}"
+            )
         return np.column_stack([columns[name] for name in names]).astype(np.float32)
 
 
@@ -338,7 +346,7 @@ def integrated_polarization(iplus: np.ndarray, iminus: np.ndarray) -> Tuple[np.n
 def compute_rpe(pred: np.ndarray, true: np.ndarray, mask: np.ndarray) -> np.ndarray:
     rpe = np.full_like(true, np.nan, dtype=np.float64)
     valid = mask & (np.abs(true) > 1e-10)
-    rpe[valid] = (pred[valid] - true[valid]) / true[valid] * 100.0
+    rpe[valid] = abs((pred[valid] - true[valid]) / true[valid] * 100.0)
     return rpe
 
 
@@ -469,17 +477,6 @@ def main() -> None:
         p_true, q_true = integrated_polarization(ip_true, im_true)
     p_pred, q_pred = integrated_polarization(ip_pred, im_pred)
 
-    # sample_mask = (p_true <= -5.0) | (p_true >= 5.0)
-    sample_mask = np.ones(p_true.shape, dtype=bool)
-    if not sample_mask.any():
-        raise ValueError("No samples with |true P| >= 5.")
-
-    ps, ip_true, im_true = ps[sample_mask], ip_true[sample_mask], im_true[sample_mask]
-    ip_pred, im_pred = ip_pred[sample_mask], im_pred[sample_mask]
-    pred_mask = pred_mask[sample_mask]
-    p_true, q_true = p_true[sample_mask], q_true[sample_mask]
-    p_pred, q_pred = p_pred[sample_mask], q_pred[sample_mask]
-
     ip_rpe = compute_rpe(ip_pred, ip_true, pred_mask)
     im_rpe = compute_rpe(im_pred, im_true, pred_mask)
     ip_mask = pred_mask & (np.abs(ip_true) > 1e-10)
@@ -487,7 +484,8 @@ def main() -> None:
     res_ip = np.where(pred_mask, ip_pred - ip_true, np.nan)
     res_im = np.where(pred_mask, im_pred - im_true, np.nan)
 
-    p_mask, q_mask = np.abs(p_true) >= 5.0, np.abs(q_true) >= 5.0
+    p_mask = np.abs(p_true) > 1e-10
+    q_mask = np.abs(q_true) > 1e-10
     p_rpe = compute_rpe(p_pred, p_true, p_mask)
     q_rpe = compute_rpe(q_pred, q_true, q_mask)
     res_p = p_pred - p_true
@@ -503,10 +501,10 @@ def main() -> None:
         "L1_Iminus": float(np.mean(np.abs(im_pred[pred_mask] - im_true[pred_mask]))),
         "median_RPE_Iplus": float(np.nanmedian(ip_rpe[ip_mask])),
         "median_RPE_Iminus": float(np.nanmedian(im_rpe[im_mask])),
-        "mean_RPE_P": float(np.nanmean(p_rpe[p_mask])),
-        "std_RPE_P": float(np.nanstd(p_rpe[p_mask])),
-        "mean_RPE_Q": float(np.nanmean(q_rpe[q_mask])),
-        "std_RPE_Q": float(np.nanstd(q_rpe[q_mask])),
+        "mean_RPE_P": float(np.nanmean(p_rpe)),
+        "std_RPE_P": float(np.nanstd(p_rpe)),
+        "mean_RPE_Q": float(np.nanmean(q_rpe)),
+        "std_RPE_Q": float(np.nanstd(q_rpe)),
         "mean_residual_P": float(np.mean(res_p)),
         "std_residual_P": float(np.std(res_p)),
         "mean_residual_Q": float(np.mean(res_q)),

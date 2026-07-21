@@ -1,8 +1,9 @@
 """
 Per-bin ssRF burn trajectories for SLURM array jobs.
 
-Each task burns one R-bin from an unburned lineshape with a Voigt RF profile
-(±5 bins), marching until the mirrored intensity amplitude starts decreasing —
+Each task burns one R-bin from an unburned lineshape with a smooth Voigt RF profile,
+support selected where the envelope exceeds ``PROFILE_REL_THRESHOLD`` of peak
+``gamma_rf``. Marches until the mirrored intensity amplitude starts decreasing —
 the turnover after maximum semi-saturating RF, when relaxation begins restoring
 mirror populations. That decreasing step is discarded and the burn ends. Saves
 (ps, iplus, iminus) and amplitude |ps| at both the burn bin and its mirror at
@@ -40,10 +41,13 @@ from physics.ssrf_realtime.model import Spin1Model, Spin1Params
 NUM_BINS = 500
 DT = 0.005
 GAMMA_RF = 100.0
-# Voigt RF envelope (bin units): Gaussian sigma + Lorentzian HWHM, truncated to ±HALF_WIDTH.
+# Voigt RF envelope (bin units): Gaussian sigma + Lorentzian HWHM.
 SIGMA_BINS = 2.0
 VOIGT_GAMMA_BINS = 1.0
+# Legacy max-cap for SLURM jobs; smooth support uses PROFILE_REL_THRESHOLD instead.
 HALF_WIDTH = 5
+# Include bins down to this fraction of peak gamma_rf (matches ssRFMapper 10% rule).
+PROFILE_REL_THRESHOLD = 0.05
 MAX_STEPS = 5000
 P_MIN = -0.70
 P_MAX = 0.70
@@ -108,23 +112,43 @@ def make_voigt_rf_profile(
     *,
     sigma: float = SIGMA_BINS,
     lorentz_gamma: float = VOIGT_GAMMA_BINS,
-    half_width: int = HALF_WIDTH,
+    half_width: int | None = None,
+    rel_threshold: float = PROFILE_REL_THRESHOLD,
 ) -> tuple[np.ndarray, list[int]]:
     """
-    Voigt RF envelope peaked at ``center``, truncated to ±half_width bins.
+    Smooth Voigt RF envelope peaked at ``center``.
 
-    Peak is normalized to ``gamma_rf``. Support bins become ``ssrf_subset_indices``.
+    The profile is evaluated on the full bin grid. Support bins (for
+    ``ssrf_subset_indices``) are those with profile >= ``rel_threshold * gamma_rf``,
+    giving a smooth taper instead of a hard ±half_width cutoff. Optional
+    ``half_width`` caps support to ±half_width around ``center``.
     """
-    profile = np.zeros(int(n_bins), dtype=float)
+    n_bins = int(n_bins)
     c = int(center)
-    lo = max(0, c - int(half_width))
-    hi = min(int(n_bins) - 1, c + int(half_width))
-    xs = np.arange(lo, hi + 1, dtype=float)
+    xs = np.arange(n_bins, dtype=float)
     kernel = _voigt_kernel(xs, float(c), float(sigma), float(lorentz_gamma))
     peak = float(np.max(kernel)) if kernel.size else 0.0
-    support: list[int] = list(range(lo, hi + 1))
-    if peak > 0.0:
-        profile[lo : hi + 1] = float(gamma_rf) * (kernel / peak)
+    profile = np.zeros(n_bins, dtype=float)
+    if peak <= 0.0:
+        return profile, [c]
+
+    profile = float(gamma_rf) * (kernel / peak)
+    floor = float(rel_threshold) * float(gamma_rf)
+    support_idx = np.flatnonzero(profile >= floor)
+    if support_idx.size == 0:
+        return profile, [c]
+
+    if half_width is not None:
+        hw = int(half_width)
+        lo_cap = max(0, c - hw)
+        hi_cap = min(n_bins - 1, c + hw)
+        support_idx = support_idx[
+            (support_idx >= lo_cap) & (support_idx <= hi_cap)
+        ]
+        if support_idx.size == 0:
+            support_idx = np.asarray([c], dtype=int)
+
+    support = [int(i) for i in support_idx]
     return profile, support
 
 
@@ -188,7 +212,7 @@ def run_one_polarization(
     gamma_rf: float = GAMMA_RF,
     sigma_bins: float = SIGMA_BINS,
     voigt_gamma_bins: float = VOIGT_GAMMA_BINS,
-    half_width: int = HALF_WIDTH,
+    half_width: int | None = None,
     max_steps: int = MAX_STEPS,
 ) -> dict:
     f = np.linspace(-3.0, 3.0, int(num_bins))
@@ -220,7 +244,7 @@ def run_one_polarization(
         float(gamma_rf),
         sigma=float(sigma_bins),
         lorentz_gamma=float(voigt_gamma_bins),
-        half_width=int(half_width),
+        half_width=half_width,
     )
 
     params = Spin1Params(
@@ -307,7 +331,7 @@ def run_one_bin(
     gamma_rf: float = GAMMA_RF,
     sigma_bins: float = SIGMA_BINS,
     voigt_gamma_bins: float = VOIGT_GAMMA_BINS,
-    half_width: int = HALF_WIDTH,
+    half_width: int | None = None,
     max_steps: int = MAX_STEPS,
 ) -> dict:
     bin_idx = int(bin_idx)
@@ -354,6 +378,17 @@ def run_one_bin(
         iminus_m[j, :n] = traj["iminus_m"]
 
     f = np.linspace(-3.0, 3.0, int(num_bins))
+    profile, support = make_voigt_rf_profile(
+        int(num_bins),
+        bin_idx,
+        float(gamma_rf),
+        sigma=float(sigma_bins),
+        lorentz_gamma=float(voigt_gamma_bins),
+        half_width=half_width,
+    )
+    support_half_width = 0
+    if support:
+        support_half_width = int(max(bin_idx - support[0], support[-1] - bin_idx))
     return {
         "bin_idx": bin_idx,
         "mirror_idx": mirror_idx,
@@ -363,7 +398,8 @@ def run_one_bin(
         "gamma_rf": float(gamma_rf),
         "sigma_bins": float(sigma_bins),
         "voigt_gamma_bins": float(voigt_gamma_bins),
-        "half_width": int(half_width),
+        "half_width": half_width,
+        "support_half_width": int(support_half_width),
         "max_steps": int(max_steps),
         "p_values": p_values,
         "n_steps": n_steps,
@@ -393,7 +429,8 @@ def save_shard(result: dict, path: Path) -> None:
         "gamma_rf": float(result["gamma_rf"]),
         "sigma_bins": float(result["sigma_bins"]),
         "voigt_gamma_bins": float(result.get("voigt_gamma_bins", VOIGT_GAMMA_BINS)),
-        "half_width": int(result["half_width"]),
+        "half_width": result.get("half_width"),
+        "support_half_width": int(result.get("support_half_width", 0)),
         "max_steps": int(result["max_steps"]),
         "dataset": "ssrf_bin_traj",
     }
@@ -670,7 +707,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--gamma-rf", type=float, default=GAMMA_RF)
     p.add_argument("--sigma-bins", type=float, default=SIGMA_BINS)
     p.add_argument("--voigt-gamma-bins", type=float, default=VOIGT_GAMMA_BINS)
-    p.add_argument("--half-width", type=int, default=HALF_WIDTH)
+    p.add_argument(
+        "--half-width",
+        type=int,
+        default=None,
+        help="Optional max support cap (±bins); default uses Voigt threshold only",
+    )
     p.add_argument("--max-steps", type=int, default=MAX_STEPS)
     p.add_argument("--skip-if-exists", action="store_true")
     p.add_argument("--strict", action="store_true")
@@ -711,7 +753,8 @@ def main(argv: list[str] | None = None) -> None:
         f"bin_idx={bin_idx}  n_P={p_values.size}  "
         f"P=[{args.p_min},{args.p_max}] step={args.p_step}  "
         f"dt={args.dt}  gamma={args.gamma_rf}  "
-        f"sigma={args.sigma_bins}  voigt_gamma={args.voigt_gamma_bins}  +/-{args.half_width}  "
+        f"sigma={args.sigma_bins}  voigt_gamma={args.voigt_gamma_bins}  "
+        f"half_width_cap={args.half_width}  "
         f"max_steps={args.max_steps}  stop=mirror_turnover",
         flush=True,
     )

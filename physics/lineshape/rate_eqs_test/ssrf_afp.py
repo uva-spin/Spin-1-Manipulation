@@ -10,7 +10,6 @@ if str(_REPO_ROOT) not in sys.path:
 
 from physics.lineshape.Lineshape import GenerateVectorLineshape
 from physics.lineshape.rate_eqs_test.ssrf_bin_traj import (
-    HALF_WIDTH,
     SIGMA_BINS,
     VOIGT_GAMMA_BINS,
     freeze_rf_profile,
@@ -22,20 +21,19 @@ from physics.ssrf_realtime.model import MINUS, PLUS, ZERO, Spin1Model, Spin1Para
 P = 0.50
 NUM_BINS = 500
 DT = 0.005
-N_STEPS = 100
+N_STEPS = 0
 
 RF_ON = True
-GAMMA_RF = 1.0
-# Single-bin Voigt burn preview (matches parallel traj: ±HALF_WIDTH around BURN_BIN).
+GAMMA_RF = 0.0
+# Single-bin Voigt burn preview (smooth threshold-based support around BURN_BIN).
 # None -> deepest Q<0 bin.
 BURN_BIN: int | None = None
-RF_HALF_WIDTH = HALF_WIDTH
 RF_SIGMA_BINS = SIGMA_BINS
 RF_VOIGT_GAMMA_BINS = VOIGT_GAMMA_BINS
 
-AFP_ON = False
-AFP_BINS: list[int] | None = None
-AFP_EFFICIENCY = 0.0
+AFP_ON = True
+AFP_BINS: list[int] | None = list(np.arange(170,200))
+AFP_EFFICIENCY = 1.0
 AFP_CENTER_MARGIN = 0
 
 RELAXATION_ON = True
@@ -99,9 +97,9 @@ def run_event(
     afp_center_margin: int = AFP_CENTER_MARGIN,
     afp_bins: list[int] | None = AFP_BINS,
     burn_bin: int | None = BURN_BIN,
-    half_width: int = RF_HALF_WIDTH,
     sigma_bins: float = RF_SIGMA_BINS,
     voigt_gamma_bins: float = RF_VOIGT_GAMMA_BINS,
+    half_width: int | None = None,
 ) -> dict:
     f = np.linspace(-3.0, 3.0, num_bins)
     _, iplus0, iminus0 = GenerateVectorLineshape(polarization, f)
@@ -117,7 +115,7 @@ def run_event(
         float(gamma_rf),
         sigma=float(sigma_bins),
         lorentz_gamma=float(voigt_gamma_bins),
-        half_width=int(half_width),
+        half_width=half_width,
     )
     SSRF_BINS = np.asarray(ssrf_subset, dtype=int)
 
@@ -183,6 +181,7 @@ def run_event(
     afp_hi = int(afp_bins[-1]) + 1 if afp_bins else 0
     ssrf_lo = int(SSRF_BINS[0]) if len(SSRF_BINS) else burn_idx
     ssrf_hi = int(SSRF_BINS[-1]) if len(SSRF_BINS) else burn_idx
+    support_half_width = max(burn_idx - ssrf_lo, ssrf_hi - burn_idx)
 
     return {
         "polarization": polarization,
@@ -194,7 +193,8 @@ def run_event(
         "mirror_bin": mirror_bin_idx(num_bins, burn_idx),
         "ssrf_bins": SSRF_BINS,
         "ssrf_bin_range": (ssrf_lo, ssrf_hi),
-        "half_width": int(half_width),
+        "support_half_width": int(support_half_width),
+        "half_width": half_width,
         "sigma_bins": float(sigma_bins),
         "voigt_gamma_bins": float(voigt_gamma_bins),
         "afp_bin_range": (afp_lo, afp_hi),
@@ -268,7 +268,7 @@ def plot_event(result: dict, output_path: Path) -> None:
     mir = result.get("mirror_bin", mirror_bin_idx(len(f), int(burn)))
     fig.suptitle(
         f"ssRF Voigt burn={burn} mirror={mir} support=[{s0},{s1}] "
-        f"gamma_rf={result['gamma_rf']} +/-{result.get('half_width', 5)}  |  "
+        f"gamma_rf={result['gamma_rf']} +/-{result.get('support_half_width', '?')}  |  "
         f"AFP [{a0},{a1})  |  {result['n_steps']} steps  "
         f"Q: {result['q_pre_afp']:.4f} -> {result['q_final']:.4f}  |  "
         f"P: {result['p_pre_afp']:.4f} -> {result['p_final']:.4f}"
@@ -288,7 +288,7 @@ def main() -> None:
     s0, s1 = result["ssrf_bin_range"]
     print(
         f"ssRF Voigt: burn={result['burn_bin']} mirror={result['mirror_bin']}  "
-        f"support=[{s0}, {s1}]  +/-{result['half_width']}  "
+        f"support=[{s0}, {s1}]  +/-{result['support_half_width']}  "
         f"sigma={result['sigma_bins']}  voigt_gamma={result['voigt_gamma_bins']}  "
         f"gamma_rf={result['gamma_rf']}  dt={result['dt']}  n_steps={result['n_steps']}"
     )
