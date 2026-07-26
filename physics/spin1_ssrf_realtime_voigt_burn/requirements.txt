@@ -1,0 +1,7 @@
+numpy>=1.20
+matplotlib>=3.5
+scipy>=1.7
+PyQt6; platform_system != "Linux" or platform_machine != "aarch64"
+# PySide6 or PyQt5 can be used instead of PyQt6 if preferred.
+# The model contains a pseudo-Voigt fallback if SciPy is unavailable, but
+# SciPy is recommended so the RF rate profile uses the exact Voigt function.

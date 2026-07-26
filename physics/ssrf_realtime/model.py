@@ -150,14 +150,16 @@ class Spin1Model:
 
 
     def set_rf_profile(self) -> None:
-        """Per-bin RF rate from initial Q via ``rf_burn_profile`` (``gamma_rf`` = peak)."""
+        """Per-bin RF rate. Flat ``gamma_rf`` for now (Q-shaped profile commented out)."""
         ip, im, _ = self.physical_intensities(self.n_initial)
+        # Q-shaped profile (peak ``gamma_rf`` at deepest Q<0):
         q = ip - im
         q_min = np.min(q)
         if q_min >= 0.0:
             self.params.rf_profile = np.zeros_like(q)
         else:
             self.params.rf_profile = self.params.gamma_rf * np.clip(q / q_min, 0.0, 1.0)
+        # self.params.rf_profile = np.full_like(ip, float(self.params.gamma_rf), dtype=float)
 
     def _event_display_calibration(self) -> float:
         """Intensity scale matching ``GenerateVectorLineshape`` event normalization (P₀)."""

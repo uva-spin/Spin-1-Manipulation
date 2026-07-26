@@ -34,6 +34,8 @@ from physics.lineshape.Lineshape import GenerateVectorLineshape
 from physics.ssrf_realtime.model import Spin1Model, Spin1Params
 
 NUM_BINS = 500
+R_MIN = -3.0
+R_MAX = 3.0
 DT = 0.005
 N_RELAX = 5000
 AFP_WINDOW = 3
@@ -157,7 +159,7 @@ def run_one_polarization(
     afp_window: int = AFP_WINDOW,
     afp_efficiency: float = AFP_EFFICIENCY,
 ) -> dict:
-    f = np.linspace(-3.0, 3.0, int(num_bins))
+    f = np.linspace(R_MIN, R_MAX, int(num_bins))
     _, iplus0, iminus0 = GenerateVectorLineshape(float(polarization), f)
     iplus0 = np.asarray(iplus0, dtype=float)
     iminus0 = np.asarray(iminus0, dtype=float)
@@ -168,8 +170,8 @@ def run_one_polarization(
 
     params = Spin1Params(
         n_bins=int(num_bins),
-        r_min=-3.0,
-        r_max=3.0,
+        r_min=float(R_MIN),
+        r_max=float(R_MAX),
         p0=float(polarization),
         q0=0.0,
         p_dnp_sat=float(polarization),
@@ -289,7 +291,7 @@ def run_one_bin(
         iplus_m[j, :n] = traj["iplus_m"]
         iminus_m[j, :n] = traj["iminus_m"]
 
-    f = np.linspace(-3.0, 3.0, int(num_bins))
+    f = np.linspace(R_MIN, R_MAX, int(num_bins))
     return {
         "bin_idx": bin_idx,
         "mirror_idx": mirror_idx,

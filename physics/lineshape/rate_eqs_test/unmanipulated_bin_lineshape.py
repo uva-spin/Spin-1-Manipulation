@@ -28,6 +28,8 @@ if str(_REPO_ROOT) not in sys.path:
 from physics.lineshape.Lineshape import GenerateVectorLineshape
 
 NUM_BINS = 500
+R_MIN = -3.0
+R_MAX = 3.0
 P_MIN = -0.70
 P_MAX = 0.70
 P_STEP = 0.005
@@ -58,7 +60,7 @@ def generate_unmanipulated_cube(
     Returns p_values plus ps/iplus/iminus/amp with shape (n_p, n_bins).
     """
     p_values = polarization_grid(p_min, p_max, p_step)
-    f = np.linspace(-3.0, 3.0, int(num_bins))
+    f = np.linspace(R_MIN, R_MAX, int(num_bins))
     n_p = int(p_values.size)
     n_bins = int(num_bins)
 

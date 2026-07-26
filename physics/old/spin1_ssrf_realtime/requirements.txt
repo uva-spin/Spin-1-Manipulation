@@ -1,4 +1,0 @@
-numpy
-matplotlib
-PyQt6; platform_system != "Linux" or platform_machine != "aarch64"
-# PySide6 or PyQt5 can be used instead of PyQt6 if preferred.

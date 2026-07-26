@@ -43,37 +43,25 @@ def Lineshape(x, eps):
     return icurve(x, eps) / 10
 
 
-def GenerateVectorLineshape(P,x):
+def GenerateVectorLineshape(P, x):
 
-    r = (np.sqrt(4-3*P**(2))+P)/(2-2*P)
-    
+    r = (np.sqrt(4 - 3 * P ** 2) + P) / (2 - 2 * P)
+
     if P > 0:
-        Iplus = r*Lineshape(x,1)
-        Iminus = Lineshape(x,-1)
-        r = r
+        Iplus = r * Lineshape(x, 1)
+        Iminus = Lineshape(x, -1)
     else:
-        r = 1/r
-        Iplus = -r*Lineshape(x,1)
-        Iminus = -Lineshape(x,-1)
+        r = 1 / r
+        Iplus = -r * Lineshape(x, 1)
+        Iminus = -Lineshape(x, -1)
 
     ### Scaling
     CC = 1.0
     pSummed = np.sum(Iplus + Iminus)
-    deltaP = P/pSummed*CC
-    Iplus = Iplus*deltaP
-    Iminus = Iminus*deltaP
+    deltaP = P / pSummed * CC
+    Iplus = Iplus * deltaP
+    Iminus = Iminus * deltaP
     signal = Iplus + Iminus
 
-    return signal,Iplus,Iminus
+    return signal, Iplus, Iminus
 
-if __name__ == "__main__":
-    import matplotlib.pyplot as plt
-    import numpy as np
-    P = -0.6
-    x = np.linspace(-3, 3, 500)
-    signal, Iplus, Iminus = GenerateVectorLineshape(P, x)
-    plt.plot(x, signal)
-    plt.plot(x, Iplus, label="Iplus")
-    plt.plot(x, Iminus, label="Iminus")
-    plt.legend()
-    plt.savefig("Lineshape.png")

@@ -39,6 +39,8 @@ from physics.lineshape.Lineshape import GenerateVectorLineshape
 from physics.ssrf_realtime.model import Spin1Model, Spin1Params
 
 NUM_BINS = 500
+R_MIN = -3.0
+R_MAX = 3.0
 DT = 0.005
 GAMMA_RF = 100.0
 # Voigt RF envelope (bin units): Gaussian sigma + Lorentzian HWHM.
@@ -116,15 +118,18 @@ def make_voigt_rf_profile(
     rel_threshold: float = PROFILE_REL_THRESHOLD,
 ) -> tuple[np.ndarray, list[int]]:
     """
-    Smooth Voigt RF envelope peaked at ``center``.
+    Compact Voigt RF envelope peaked at ``center``.
 
-    The profile is evaluated on the full bin grid. Support bins (for
-    ``ssrf_subset_indices``) are those with profile >= ``rel_threshold * gamma_rf``,
-    giving a smooth taper instead of a hard ±half_width cutoff. Optional
-    ``half_width`` caps support to ±half_width around ``center``.
+    Evaluates a Voigt on the bin grid, then confines it to a local window so
+    RF does not bleed across the full lineshape:
+
+    - Optional ``half_width`` hard-caps support to ``center ± half_width``.
+    - A raised-cosine taper smooths the window edges (avoids a hard clip).
+    - Bins below ``rel_threshold * gamma_rf`` are dropped from support, and the
+      returned profile is exactly zero outside the compact support.
     """
     n_bins = int(n_bins)
-    c = int(center)
+    c = int(np.clip(int(center), 0, n_bins - 1))
     xs = np.arange(n_bins, dtype=float)
     kernel = _voigt_kernel(xs, float(c), float(sigma), float(lorentz_gamma))
     peak = float(np.max(kernel)) if kernel.size else 0.0
@@ -133,23 +138,47 @@ def make_voigt_rf_profile(
         return profile, [c]
 
     profile = float(gamma_rf) * (kernel / peak)
-    floor = float(rel_threshold) * float(gamma_rf)
+    floor = float(rel_threshold) * abs(float(gamma_rf))
+
+    # Compact window: explicit half_width, else threshold-derived span.
     support_idx = np.flatnonzero(profile >= floor)
     if support_idx.size == 0:
+        profile[:] = 0.0
+        profile[c] = float(gamma_rf)
         return profile, [c]
 
     if half_width is not None:
-        hw = int(half_width)
-        lo_cap = max(0, c - hw)
-        hi_cap = min(n_bins - 1, c + hw)
-        support_idx = support_idx[
-            (support_idx >= lo_cap) & (support_idx <= hi_cap)
-        ]
-        if support_idx.size == 0:
-            support_idx = np.asarray([c], dtype=int)
+        hw = max(0, int(half_width))
+    else:
+        hw = int(max(int(c - support_idx[0]), int(support_idx[-1] - c)))
 
+    lo = max(0, c - hw)
+    hi = min(n_bins - 1, c + hw)
+    window = np.zeros(n_bins, dtype=float)
+    if hw <= 0:
+        window[c] = 1.0
+        lo = hi = c
+    else:
+        # Raised-cosine taper: 1 at center, 0 at ±half_width.
+        t = np.abs(np.arange(lo, hi + 1, dtype=float) - float(c)) / float(hw)
+        window[lo : hi + 1] = 0.5 * (1.0 + np.cos(np.pi * np.clip(t, 0.0, 1.0)))
+
+    profile *= window
+    profile[:lo] = 0.0
+    if hi + 1 < n_bins:
+        profile[hi + 1 :] = 0.0
+
+    support_idx = np.flatnonzero(profile >= floor)
+    if support_idx.size == 0:
+        profile[:] = 0.0
+        profile[c] = float(gamma_rf)
+        return profile, [c]
+
+    # Exact zeros outside burned support (no Voigt tails through the lineshape).
+    compact = np.zeros(n_bins, dtype=float)
+    compact[support_idx] = profile[support_idx]
     support = [int(i) for i in support_idx]
-    return profile, support
+    return compact, support
 
 
 def freeze_rf_profile(model: Spin1Model, profile: np.ndarray) -> Callable[[], None]:
@@ -215,7 +244,7 @@ def run_one_polarization(
     half_width: int | None = None,
     max_steps: int = MAX_STEPS,
 ) -> dict:
-    f = np.linspace(-3.0, 3.0, int(num_bins))
+    f = np.linspace(R_MIN, R_MAX, int(num_bins))
     _, iplus0, iminus0 = GenerateVectorLineshape(float(polarization), f)
     iplus0 = np.asarray(iplus0, dtype=float)
     iminus0 = np.asarray(iminus0, dtype=float)
@@ -249,8 +278,8 @@ def run_one_polarization(
 
     params = Spin1Params(
         n_bins=int(num_bins),
-        r_min=-3.0,
-        r_max=3.0,
+        r_min=float(R_MIN),
+        r_max=float(R_MAX),
         p0=float(polarization),
         q0=0.0,
         p_dnp_sat=float(polarization),
@@ -377,7 +406,7 @@ def run_one_bin(
         iplus_m[j, :n] = traj["iplus_m"]
         iminus_m[j, :n] = traj["iminus_m"]
 
-    f = np.linspace(-3.0, 3.0, int(num_bins))
+    f = np.linspace(R_MIN, R_MAX, int(num_bins))
     profile, support = make_voigt_rf_profile(
         int(num_bins),
         bin_idx,

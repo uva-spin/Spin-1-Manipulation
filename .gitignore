@@ -230,3 +230,5 @@ models/
 **/sgd_animation.gif
 **/sgd_path_simple.gif
 **/sgd_trajectory_3d_rotating.gif
+
+*.pkl
