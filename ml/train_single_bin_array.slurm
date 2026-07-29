@@ -8,7 +8,7 @@
 # Override:
 #   DATA_DIR=physics/lineshape/rate_eqs_test/combined_train \
 #   OUTPUT_DIR=TensorStudies/single_bin_results_v2 \
-#   FEATURE_SET=ps_p0 \
+#   FEATURE_SET=ps \
 #     sbatch --array=0-499 ml/train_single_bin_array.slurm
 
 #SBATCH --job-name=bin-train
@@ -27,7 +27,7 @@ set -euo pipefail
 REPO_ROOT="${SLURM_SUBMIT_DIR:-$(pwd)}"
 DATA_DIR="${DATA_DIR:-physics/lineshape/rate_eqs_test/combined_train_all}"
 OUTPUT_DIR="${OUTPUT_DIR:-TensorStudies/single_bin_results_v2}"
-FEATURE_SET="${FEATURE_SET:-ps_p0}"
+FEATURE_SET="${FEATURE_SET:-ps}"
 FEATURE_CLIP_Z="${FEATURE_CLIP_Z:-0.0}"
 
 cd "${REPO_ROOT}"

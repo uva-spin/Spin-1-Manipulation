@@ -34,8 +34,159 @@ from common import (
 )
 
 
+PROFILE_REL_THRESHOLD = 0.01
+KERNEL_CUTOFF_WIDTHS = 3.0
+INTENSITY_DELTA_ABS_TOL = 1e-15
+
+
 def mirror_bin_idx(n_bins: int, bin_idx: int) -> int:
     return int(n_bins) - 1 - int(bin_idx)
+
+
+def afp_touched_bins(n_bins: int, subset: list[int] | np.ndarray) -> list[int]:
+    touched: set[int] = set()
+    for i in subset:
+        touched.add(int(i))
+        touched.add(mirror_bin_idx(n_bins, int(i)))
+    return sorted(touched)
+
+
+def ssrf_touched_bins(n_bins: int, subset: list[int] | np.ndarray) -> list[int]:
+    """Packet/intensity bins ssRF changes: each burn index i also updates mirror(i)."""
+    return afp_touched_bins(n_bins, subset)
+
+
+def bins_within_R_radius(
+    R: np.ndarray, seed_bins: list[int] | np.ndarray, radius_R: float
+) -> list[int]:
+    grid = np.asarray(R, dtype=float)
+    radius = float(radius_R)
+    out: set[int] = set()
+    for i in seed_bins:
+        ri = float(grid[int(i)])
+        for j in range(grid.size):
+            if abs(float(grid[j]) - ri) <= radius:
+                out.add(int(j))
+    return sorted(out)
+
+
+def diffusion_spillover_bins(
+    R: np.ndarray,
+    seed_bins: list[int] | np.ndarray,
+    *,
+    zq_width_R: float = ZQ_WIDTH_R,
+    kernel_cutoff_widths: float = KERNEL_CUTOFF_WIDTHS,
+) -> list[int]:
+    """Bins within the spin-diffusion kernel reach of ``seed_bins``."""
+    return bins_within_R_radius(
+        R, seed_bins, float(kernel_cutoff_widths) * float(zq_width_R)
+    )
+
+
+def bins_with_intensity_delta(
+    iplus: np.ndarray,
+    iminus: np.ndarray,
+    iplus_sim: np.ndarray,
+    iminus_sim: np.ndarray,
+    candidates: list[int] | np.ndarray,
+    *,
+    abs_tol: float = INTENSITY_DELTA_ABS_TOL,
+) -> list[int]:
+    changed: list[int] = []
+    for i in candidates:
+        idx = int(i)
+        if (
+            abs(float(iplus_sim[idx]) - float(iplus[idx])) > abs_tol
+            or abs(float(iminus_sim[idx]) - float(iminus[idx])) > abs_tol
+        ):
+            changed.append(idx)
+    return changed
+
+
+def physical_voigt_rf_support_bins(
+    R: np.ndarray,
+    burn_idx: int,
+    *,
+    gaussian_fwhm_R: float,
+    lorentzian_fwhm_R: float,
+    rel_threshold: float = PROFILE_REL_THRESHOLD,
+) -> list[int]:
+    """Bins with non-negligible physical-R Voigt RF at the burn center."""
+    from ssrf_realtime_v2.voigt_physical import bin_averaged_voigt
+
+    grid = np.asarray(R, dtype=float)
+    burn_idx = int(burn_idx)
+    if burn_idx < 0 or burn_idx >= grid.size:
+        raise ValueError(f"burn_idx={burn_idx} out of range for n_bins={grid.size}")
+    dR = float(grid[1] - grid[0]) if grid.size > 1 else 1.0
+    profile = bin_averaged_voigt(
+        grid,
+        center_R=float(grid[burn_idx]),
+        bin_width_R=dR,
+        gaussian_fwhm_R=float(gaussian_fwhm_R),
+        lorentzian_fwhm_R=float(lorentzian_fwhm_R),
+        normalization="center_bin",
+    )
+    peak = float(np.max(profile)) if profile.size else 0.0
+    if peak <= 0.0:
+        return [burn_idx]
+    floor = float(rel_threshold) * peak
+    support = [int(i) for i in np.flatnonzero(np.asarray(profile, dtype=float) >= floor)]
+    return support if support else [burn_idx]
+
+
+def burn_commit_touched_bins(
+    n_bins: int,
+    burn_idx: int,
+    *,
+    rf_mode: str,
+    R: np.ndarray | None = None,
+    gaussian_fwhm_R: float = RF_GAUSSIAN_FWHM_R,
+    lorentzian_fwhm_R: float = RF_LORENTZIAN_FWHM_R,
+    iplus: np.ndarray | None = None,
+    iminus: np.ndarray | None = None,
+    iplus_sim: np.ndarray | None = None,
+    iminus_sim: np.ndarray | None = None,
+    include_diffusion_spillover: bool = True,
+    zq_width_R: float = ZQ_WIDTH_R,
+) -> list[int]:
+    """Bins whose intensities should be committed after a burn trial."""
+    burn_idx = int(burn_idx)
+    if rf_mode == RF_MODE_SINGLE_BIN:
+        return ssrf_touched_bins(n_bins, [burn_idx])
+    if rf_mode == RF_MODE_PHYSICAL_VOIGT:
+        if R is None:
+            raise ValueError("R grid required for physical Voigt burn commit")
+        support = physical_voigt_rf_support_bins(
+            R,
+            burn_idx,
+            gaussian_fwhm_R=gaussian_fwhm_R,
+            lorentzian_fwhm_R=lorentzian_fwhm_R,
+        )
+        touched: set[int] = set(ssrf_touched_bins(n_bins, support))
+        if include_diffusion_spillover:
+            spill_candidates = diffusion_spillover_bins(
+                R, support, zq_width_R=zq_width_R
+            )
+            if (
+                iplus is not None
+                and iminus is not None
+                and iplus_sim is not None
+                and iminus_sim is not None
+            ):
+                spill = bins_with_intensity_delta(
+                    iplus, iminus, iplus_sim, iminus_sim, spill_candidates
+                )
+            else:
+                spill = spill_candidates
+            for i in spill:
+                touched.add(int(i))
+                touched.add(mirror_bin_idx(n_bins, int(i)))
+        return sorted(touched)
+    raise ValueError(
+        f"unknown rf_mode={rf_mode!r}; expected "
+        f"{RF_MODE_PHYSICAL_VOIGT!r} or {RF_MODE_SINGLE_BIN!r}"
+    )
 
 
 def commit_touched_bins_only(
@@ -89,14 +240,6 @@ def restore_touched_intensity_area(
             out_ip[k] += 0.5 * add
             out_im[k] += 0.5 * add
     return out_ip, out_im
-
-
-def afp_touched_bins(n_bins: int, subset: list[int] | np.ndarray) -> list[int]:
-    touched: set[int] = set()
-    for i in subset:
-        touched.add(int(i))
-        touched.add(mirror_bin_idx(n_bins, int(i)))
-    return sorted(touched)
 
 
 def afp_window_indices(bin_idx: int, n_bins: int, window: int) -> list[int]:
@@ -318,4 +461,9 @@ def traj_to_fit_scale(traj: dict, from_spin1: float) -> dict:
     for key in ("ip_spectrum0", "im_spectrum0", "ip_spectrum", "im_spectrum"):
         if key in traj and traj[key] is not None:
             traj[key] = np.asarray(traj[key], dtype=float) * scale
+    for key in ("ps_full", "iplus_full", "iminus_full"):
+        if key in traj and traj[key] is not None:
+            arr = np.asarray(traj[key], dtype=float)
+            if arr.size:
+                traj[key] = arr * scale
     return traj

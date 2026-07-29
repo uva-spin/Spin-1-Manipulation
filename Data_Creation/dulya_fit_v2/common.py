@@ -114,8 +114,18 @@ SSRF_TRAIN_DIR = DATA_DIR / "ssrf_train"
 AFP_SHARD_DIR = DATA_DIR / "afp_shards"
 AFP_TRAIN_DIR = DATA_DIR / "afp_train"
 UNMANIP_TRAIN_DIR = DATA_DIR / "unmanip_train"
+SPECTRUM_SSRF_SHARD_DIR = DATA_DIR / "spectrum_ssrf_shards"
+SPECTRUM_AFP_SHARD_DIR = DATA_DIR / "spectrum_afp_shards"
+SPECTRUM_TRAIN_DIR = DATA_DIR / "spectrum_train"
+SPECTRUM_TRAIN_NPZ = SPECTRUM_TRAIN_DIR / "spectrum_train.npz"
 # Unified per-bin train files (source 0=ssrf, 1=afp, 2=unmanipulated).
 COMBINED_TRAIN_ALL_DIR = DATA_DIR / "combined_train_all"
+# Full-spectrum training coverage defaults.
+MULTI_BURN_MIN = 2
+MULTI_BURN_MAX = 5
+AFP_STEP_SUBSAMPLE = 50
+UNMANIP_TRAIN_FRACTION = 0.10
+DEFAULT_RANDOM_SSRF_SAMPLES = 0
 SOURCE_SSRF = 0
 SOURCE_AFP = 1
 SOURCE_UNMANIP = 2

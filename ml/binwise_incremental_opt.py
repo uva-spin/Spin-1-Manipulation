@@ -1,10 +1,10 @@
 """
 Bin-wise Q optimization over spectral bins with ssrf_realtime_v2.
 
-Burn trials rollback integration steps when I± or Ps would cross zero at the
-burn or RF-mirror bin. Only those two bins are committed; neighbor diffusion
-spillover is discarded so burns do not propagate across the R grid beyond the
-ssRF mirror pair. Voigt RF widths are zero (single-bin limit).
+Burn trials rollback integration steps when I± or Ps would cross zero on
+committed bins. Physical-Voigt burns commit the full RF support (center bin,
+Voigt neighbors, and their ssRF mirrors); single-bin mode commits burn+mirror
+only.
 """
 
 from __future__ import annotations
@@ -35,16 +35,16 @@ from common import (  # noqa: E402
     RF_MODE_SINGLE_BIN,
 )
 
-RF_GAUSSIAN_FWHM_R = 0.0
-RF_LORENTZIAN_FWHM_R = 0.0
+RF_GAUSSIAN_FWHM_R = 0.03
+RF_LORENTZIAN_FWHM_R = 0.015
 
 from model_bridge import (  # noqa: E402
     build_spin1_model,
+    burn_commit_touched_bins,
     commit_touched_bins_only,
     configure_ssrf_burn,
     euler_n_sub,
     level_pq,
-    mirror_bin_idx,
 )
 from physics.lineshape.Lineshape import GenerateVectorLineshape  # noqa: E402
 from physics.ssrf_realtime_v2.conversions import physical_intensities_to_packet_n  # noqa: E402
@@ -69,7 +69,8 @@ def theta_q_profile(iplus: np.ndarray, iminus: np.ndarray) -> np.ndarray:
 
 
 def q_at_bin(iplus: np.ndarray, iminus: np.ndarray, bin_idx: int) -> float:
-    return float(theta_q_profile(iplus, iminus)[bin_idx])
+    # return float(theta_q_profile(iplus, iminus)[bin_idx])
+    return float(iplus[bin_idx] - iminus[bin_idx])
 
 
 def candidate_burn_bins(
@@ -97,14 +98,6 @@ def candidate_burn_bins(
         ff = np.asarray(f, dtype=float)
         cands = cands[np.abs(ff[cands]) >= float(burn_r_abs_min)]
     return cands
-
-
-def ssrf_touched_bins(n_bins: int, bin_idx: int) -> list[int]:
-    """Burn bin plus RF mirror; incremental commit stays on this pair only."""
-    mirror = mirror_bin_idx(n_bins, int(bin_idx))
-    if mirror == int(bin_idx):
-        return [int(bin_idx)]
-    return [int(bin_idx), mirror]
 
 
 def sync_model_from_spectrum(
@@ -138,9 +131,25 @@ def commit_burn_to_spectrum(
     iplus_sim: np.ndarray,
     iminus_sim: np.ndarray,
     bin_idx: int,
+    *,
+    rf_mode: str,
+    f: np.ndarray,
+    gaussian_fwhm_R: float,
+    lorentzian_fwhm_R: float,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Apply burn trial at burn+mirror only; discard neighbor diffusion spillover."""
-    touched = ssrf_touched_bins(len(iplus), bin_idx)
+    """Apply burn trial on RF-touched bins (Voigt support + mirrors when applicable)."""
+    touched = burn_commit_touched_bins(
+        len(iplus),
+        bin_idx,
+        rf_mode=rf_mode,
+        R=f,
+        gaussian_fwhm_R=gaussian_fwhm_R,
+        lorentzian_fwhm_R=lorentzian_fwhm_R,
+        iplus=iplus,
+        iminus=iminus,
+        iplus_sim=iplus_sim,
+        iminus_sim=iminus_sim,
+    )
     return commit_touched_bins_only(iplus, iminus, iplus_sim, iminus_sim, touched)
 
 
@@ -185,9 +194,9 @@ class BurnConfig:
     f_min: float = -3.0
     f_max: float = 3.0
     dt: float = DT
-    steps: int = 3000
+    steps: int = 100
     gamma_min: float = 0.0
-    gamma_max: float = 2.0
+    gamma_max: float = 50.0
     n_gamma_steps: int = 11
     n_gamma_coarse: int = 5
     n_gamma_fine: int = 5
@@ -284,7 +293,14 @@ def apply_spin1_burn(
     f_before, iplus_before, iminus_before = model_spectrum(model)
     bin_idx = int(bin_idx)
     n_bins = len(iplus_before)
-    touched = ssrf_touched_bins(n_bins, bin_idx)
+    touched = burn_commit_touched_bins(
+        n_bins,
+        bin_idx,
+        rf_mode=rf_mode,
+        R=f_before,
+        gaussian_fwhm_R=gaussian_fwhm_R,
+        lorentzian_fwhm_R=lorentzian_fwhm_R,
+    )
     if burn_R is None:
         burn_R = float(f_before[bin_idx])
     ps_before = float(iplus_before[bin_idx] + iminus_before[bin_idx])
@@ -304,6 +320,7 @@ def apply_spin1_burn(
 
     ip_prev = {k: float(iplus_before[k]) for k in touched}
     im_prev = {k: float(iminus_before[k]) for k in touched}
+    q_prev = q_at_bin(iplus_before, iminus_before, bin_idx)
 
     n_sub, dt_sub = euler_n_sub(float(gamma_rf), float(burned.params.dt))
     steps_done = 0
@@ -329,9 +346,15 @@ def apply_spin1_burn(
             burned.n = state_before
             break
 
+        q_step = q_at_bin(ip_step, im_step, bin_idx)
+        if q_step < q_prev:
+            burned.n = state_before
+            break
+
         for idx in touched:
             ip_prev[idx] = float(ip_step[idx])
             im_prev[idx] = float(im_step[idx])
+        q_prev = q_step
         steps_done += 1
 
     if steps_done == 0:
@@ -369,7 +392,7 @@ def _evaluate_gamma_rf(
     best_iplus: np.ndarray | None,
     best_iminus: np.ndarray | None,
 ) -> tuple[float, float, float, float, np.ndarray | None, np.ndarray | None, bool]:
-    """Try one gamma on committed burn+mirror bins; return updated bests."""
+    """Try one gamma on committed RF-touched bins; return updated bests."""
     burned = apply_spin1_burn(
         model,
         bin_idx,
@@ -391,7 +414,17 @@ def _evaluate_gamma_rf(
         )
 
     _, ip_sim, im_sim = model_spectrum(burned)
-    ip_try, im_try = commit_burn_to_spectrum(iplus, iminus, ip_sim, im_sim, bin_idx)
+    ip_try, im_try = commit_burn_to_spectrum(
+        iplus,
+        iminus,
+        ip_sim,
+        im_sim,
+        bin_idx,
+        rf_mode=config.rf_mode,
+        f=config.f,
+        gaussian_fwhm_R=config.gaussian_fwhm_R,
+        lorentzian_fwhm_R=config.lorentzian_fwhm_R,
+    )
 
     trial = clone_model(model)
     sync_model_from_spectrum(
@@ -791,7 +824,8 @@ def main() -> None:
     print(
         f"Bin-wise Q opt (ssrf_realtime_v2 + GenerateVectorLineshape, "
         f"rf_mode={config.rf_mode}, diffusion_scale={config.diffusion_scale}, "
-        f"voigt_width=0, only_Q<0 bins={config.only_negative_initial_q}) "
+        f"voigt_g/l_fwhm={config.gaussian_fwhm_R}/{config.lorentzian_fwhm_R}, "
+        f"only_Q<0 bins={config.only_negative_initial_q}) "
         f"at P={polarization * 100:.2f}%:"
     )
     print(

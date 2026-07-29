@@ -1,6 +1,10 @@
 """
 Evaluate the combined per-bin burn-context model on test lineshapes.
 
+For full-spectrum Ps-only inference with a single global model, see:
+  ml/spectrum_split_model.py  (training + inference)
+  ml/test_spectrum_split.py   (holdout evaluation)
+
 Run:
   python ml/test-binning.py
 """

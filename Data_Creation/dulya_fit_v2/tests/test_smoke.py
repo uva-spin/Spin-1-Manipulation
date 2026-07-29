@@ -18,10 +18,15 @@ from afp_bin_traj import run_one_polarization as run_afp_one
 from bin_io import (
     load_ssrf_shard,
     organize_ssrf_shards,
+    save_afp_spectrum_shard,
     save_ssrf_shard,
+    save_ssrf_spectrum_shard,
     ssrf_shard_path,
+    ssrf_spectrum_shard_path,
     ssrf_train_bin_path,
+    afp_spectrum_shard_path,
 )
+from combine_spectrum_train import combine_spectrum_shards
 from bin_setup import equilibrium_lineshape, get_shape_params
 from common import (
     DEMO_BURN_BIN,
@@ -230,6 +235,72 @@ def test_demo_polarization_ssrf_and_afp_effects() -> None:
     d_im = float(np.max(np.abs(afp["im_spectrum"] - afp["im_spectrum0"])))
     assert d_ip + d_im > 1e-8
     assert float(np.std(afp["ps"])) > 1e-8
+
+
+def test_ssrf_full_spectrum_capture() -> None:
+    traj = run_ssrf_one(
+        SMOKE_BIN,
+        0.3,
+        gamma_rf=1.5,
+        n_steps=10,
+        capture_spectrum=True,
+    )
+    assert not traj["skipped"]
+    ps_full = np.asarray(traj["ps_full"], dtype=float)
+    assert ps_full.shape == (int(traj["n_steps"]), NUM_BINS)
+    ip_full = np.asarray(traj["iplus_full"], dtype=float)
+    im_full = np.asarray(traj["iminus_full"], dtype=float)
+    assert np.max(np.abs(ip_full + im_full - ps_full)) < 1e-8
+
+
+def test_afp_full_spectrum_capture() -> None:
+    traj = run_afp_one(
+        SMOKE_BIN,
+        0.3,
+        n_relax=20,
+        capture_spectrum=True,
+    )
+    ps_full = np.asarray(traj["ps_full"], dtype=float)
+    assert ps_full.shape == (int(traj["n_steps"]), NUM_BINS)
+    assert np.all(np.isfinite(ps_full))
+
+
+def test_combine_spectrum_train_smoke(tmp_path: Path) -> None:
+    ssrf_dir = tmp_path / "ssrf_spec"
+    afp_dir = tmp_path / "afp_spec"
+    ssrf_dir.mkdir()
+    afp_dir.mkdir()
+
+    ssrf_res = run_ssrf_bin(
+        SMOKE_BIN,
+        p_values=SMOKE_P[:1],
+        gamma_values=np.array([1.0], dtype=float),
+        steps_values=np.array([10], dtype=np.int32),
+        num_bins=NUM_BINS,
+        capture_spectrum=True,
+    )
+    save_ssrf_spectrum_shard(ssrf_res, ssrf_spectrum_shard_path(ssrf_dir, SMOKE_BIN))
+
+    afp_res = run_afp_bin(
+        SMOKE_BIN,
+        p_values=SMOKE_P[:1],
+        num_bins=NUM_BINS,
+        n_relax=20,
+        capture_spectrum=True,
+    )
+    save_afp_spectrum_shard(afp_res, afp_spectrum_shard_path(afp_dir, SMOKE_BIN))
+
+    out = tmp_path / "spectrum_train.npz"
+    result = combine_spectrum_shards(
+        ssrf_dir,
+        afp_dir,
+        out,
+        num_bins=NUM_BINS,
+        strict=False,
+        unmanip_fraction=0.0,
+    )
+    assert result["n_samples"] > 0
+    assert Path(out).is_file()
 
 
 def test_plot_physics_demo_writes_pngs(smoke_dirs: dict[str, Path]) -> None:

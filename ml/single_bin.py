@@ -1,12 +1,12 @@
 """
-Train one per-bin model: (ps, …) -> (iplus, iminus) at that spectral bin.
+Train one per-bin model: ps -> (iplus, iminus) at that spectral bin.
 
 Expects a per-bin training NPZ from the rate_eqs_test organize/combine pipeline:
   combined_train/train_bin_XXXX.npz
   ssrf_train/ssrf_train_bin_XXXX.npz
   afp_train/afp_train_bin_XXXX.npz
 
-Required arrays: ps, iplus, iminus, p0
+Required arrays: ps, iplus, iminus, p0 (p0 is used for train/holdout splits only)
 Optional: amp, is_mirror, source, center_bin / burn_bin
 """
 
@@ -29,7 +29,7 @@ SEED = 42
 ### Training parameters ###
 
 TRAIN_POLARIZATION_FRACTION = 0.8
-FEATURE_SET = "ps_p0"
+FEATURE_SET = "ps"
 NUM_BINS = 500
 NUM_EPOCHS = 1000
 BATCH_SIZE = 64
@@ -147,13 +147,12 @@ def build_features(
 ) -> Tuple[np.ndarray, List[str]]:
     """Build model input matrix and ordered feature names."""
     name = str(feature_set).strip().lower()
-    # Legacy alias from the pickle-lookup era.
-    if name in ("burn_context", "ps_p0"):
-        cols = [arrays["ps"], arrays["p0"]]
-        names = ["ps", "p0"]
-    elif name in ("ps", "ps_only"):
+    if name in ("ps", "ps_only", "burn_context"):
         cols = [arrays["ps"]]
         names = ["ps"]
+    elif name in ("ps_p0",):
+        cols = [arrays["ps"], arrays["p0"]]
+        names = ["ps", "p0"]
     elif name in ("amp_p0",):
         cols = [arrays["amp"], arrays["p0"]]
         names = ["amp", "p0"]
@@ -171,7 +170,7 @@ def build_features(
     else:
         raise ValueError(
             f"Unknown feature_set={feature_set!r}; "
-            "expected one of: ps_p0, burn_context, ps, amp_p0, ps_p0_source, full"
+            "expected one of: ps, ps_p0, amp_p0, ps_p0_source, full"
         )
     features = np.column_stack(cols).astype(np.float32, copy=False)
     return features, names
@@ -265,7 +264,7 @@ def parse_args() -> argparse.Namespace:
         "--feature-set",
         type=str,
         default=FEATURE_SET,
-        help="Feature set: ps_p0|burn_context|ps|amp_p0|ps_p0_source|full",
+        help="Feature set: ps|ps_p0|amp_p0|ps_p0_source|full (default: ps)",
     )
     parser.add_argument(
         "--feature-clip-z",

@@ -48,6 +48,41 @@ def _save(fig: plt.Figure, path: Path) -> Path:
     return path
 
 
+def _plot_q_lineshape_panel(
+    ax: plt.Axes,
+    f: np.ndarray,
+    ip0: np.ndarray,
+    im0: np.ndarray,
+    ip1: np.ndarray,
+    im1: np.ndarray,
+    *,
+    q_initial: float | None = None,
+    q_final: float | None = None,
+    burn_R: float | None = None,
+    mirror_R: float | None = None,
+    afp_span: tuple[float, float] | None = None,
+) -> None:
+    q0 = np.asarray(ip0, dtype=float) - np.asarray(im0, dtype=float)
+    q1 = np.asarray(ip1, dtype=float) - np.asarray(im1, dtype=float)
+    ax.plot(f, q0, color="tab:purple", alpha=0.35, ls="--", lw=1.0, label=r"$Q$ before")
+    ax.plot(f, q1, color="tab:purple", lw=1.4, label=r"$Q$ after")
+    ax.axhline(0.0, color="black", ls=":", alpha=0.5, lw=0.8)
+    if burn_R is not None:
+        ax.axvline(float(burn_R), color="green", ls=":", alpha=0.7)
+    if mirror_R is not None:
+        ax.axvline(float(mirror_R), color="orange", ls=":", alpha=0.6)
+    if afp_span is not None:
+        ax.axvspan(float(afp_span[0]), float(afp_span[1]), color="green", alpha=0.12)
+    ax.set_xlabel("R")
+    ax.set_ylabel(r"$Q = I_+ - I_-$")
+    title = "Tensor Q lineshape"
+    if q_initial is not None and q_final is not None:
+        title += f"  (Q: {q_initial:.4g} → {q_final:.4g})"
+    ax.set_title(title)
+    ax.legend(fontsize=8, loc="upper right")
+    ax.grid(True, alpha=0.3)
+
+
 def plot_ssrf_burn_and_trajectory(
     *,
     polarization: float,
@@ -78,8 +113,8 @@ def plot_ssrf_burn_and_trajectory(
     t = np.arange(n)
     burn_R = float(f[burn_bin])
 
-    fig = plt.figure(figsize=(12.5, 8.5))
-    gs = fig.add_gridspec(2, 2, height_ratios=(1.15, 1.0), hspace=0.35, wspace=0.28)
+    fig = plt.figure(figsize=(12.5, 10.5))
+    gs = fig.add_gridspec(3, 2, height_ratios=(1.15, 1.0, 0.75), hspace=0.35, wspace=0.28)
 
     ax0 = fig.add_subplot(gs[0, :])
     ax0.plot(f, ip0, color="tab:red", alpha=0.35, ls="--", lw=1.0, label=r"$I_+$ before")
@@ -101,6 +136,7 @@ def plot_ssrf_burn_and_trajectory(
     ax1.plot(t, traj["iplus"][:n], color="tab:red", lw=1.4, label=r"$I_+$ burn")
     ax1.plot(t, traj["iminus"][:n], color="tab:blue", lw=1.4, label=r"$I_-$ burn")
     ax1.plot(t, traj["ps"][:n], color="black", lw=1.1, ls="--", alpha=0.8, label=r"$P_s$ burn")
+    ax1.plot(t, traj["iplus"][:n] - traj["iminus"][:n], color="tab:orange", lw=1.1, ls="--", alpha=0.8, label=r"$Q$")
     ax1.set_xlabel("step")
     ax1.set_ylabel("intensity (fit scale)")
     ax1.set_title(f"Burn bin {burn_bin}")
@@ -111,11 +147,26 @@ def plot_ssrf_burn_and_trajectory(
     ax2.plot(t, traj["iplus_m"][:n], color="tab:red", lw=1.4, label=r"$I_+$ mirror")
     ax2.plot(t, traj["iminus_m"][:n], color="tab:blue", lw=1.4, label=r"$I_-$ mirror")
     ax2.plot(t, traj["ps_m"][:n], color="black", lw=1.1, ls="--", alpha=0.8, label=r"$P_s$ mirror")
+    ax2.plot(t, traj["iplus_m"][:n] - traj["iminus_m"][:n], color="tab:orange", lw=1.1, ls="--", alpha=0.8, label=r"$Q$ mirror")
     ax2.set_xlabel("step")
     ax2.set_ylabel("intensity (fit scale)")
     ax2.set_title(f"Mirror bin {mirror}")
     ax2.legend(fontsize=8)
     ax2.grid(True, alpha=0.3)
+
+    ax3 = fig.add_subplot(gs[2, :])
+    _plot_q_lineshape_panel(
+        ax3,
+        f,
+        ip0,
+        im0,
+        ip1,
+        im1,
+        q_initial=float(traj["q_initial"]),
+        q_final=float(traj["q_final"]),
+        burn_R=burn_R,
+        mirror_R=float(f[mirror]),
+    )
 
     fig.suptitle(
         f"ssrf_realtime_v2 + Dulya fit_params  |  diffusion={DIFFUSION_SCALE}  "
@@ -159,8 +210,8 @@ def plot_afp_and_relaxation(
     t = np.arange(n) * float(DT)
     subset = list(traj["afp_subset"])
 
-    fig = plt.figure(figsize=(12.5, 8.5))
-    gs = fig.add_gridspec(2, 2, height_ratios=(1.15, 1.0), hspace=0.35, wspace=0.28)
+    fig = plt.figure(figsize=(12.5, 10.5))
+    gs = fig.add_gridspec(3, 2, height_ratios=(1.15, 1.0, 0.75), hspace=0.35, wspace=0.28)
 
     ax0 = fig.add_subplot(gs[0, :])
     ax0.plot(f, ip0, color="tab:red", alpha=0.35, ls="--", lw=1.0, label=r"$I_+$ before AFP")
@@ -183,6 +234,7 @@ def plot_afp_and_relaxation(
     ax1.plot(t, traj["iplus"][:n], color="tab:red", lw=1.4, label=r"$I_+$ center")
     ax1.plot(t, traj["iminus"][:n], color="tab:blue", lw=1.4, label=r"$I_-$ center")
     ax1.plot(t, traj["ps"][:n], color="black", lw=1.1, ls="--", alpha=0.8, label=r"$P_s$ center")
+    ax1.plot(t, traj["iplus"][:n] - traj["iminus"][:n], color="tab:orange", lw=1.1, ls="--", alpha=0.8, label=r"$Q$")
     ax1.set_xlabel("time [arb.]")
     ax1.set_ylabel("intensity (fit scale)")
     ax1.set_title(f"Center bin {burn_bin} during relaxation")
@@ -198,6 +250,21 @@ def plot_afp_and_relaxation(
     ax2.set_title(f"Mirror bin {mirror} during relaxation")
     ax2.legend(fontsize=8)
     ax2.grid(True, alpha=0.3)
+
+    ax3 = fig.add_subplot(gs[2, :])
+    _plot_q_lineshape_panel(
+        ax3,
+        f,
+        ip0,
+        im0,
+        ip1,
+        im1,
+        q_initial=float(traj["q_initial"]),
+        q_final=float(traj["q_final"]),
+        burn_R=float(f[burn_bin]),
+        mirror_R=float(f[mirror]),
+        afp_span=(float(f[subset[0]]), float(f[subset[-1]])),
+    )
 
     fig.suptitle(
         r"ssrf_realtime_v2 AFP + Boltzmann recovery at $P_{\mathrm{AFP}}$ ($Q\to Q_B(P)$)",
@@ -242,21 +309,35 @@ def plot_rf_mode_compare(
         capture_spectrum=True,
     )
     f = np.asarray(voigt["frequency"], dtype=float)
-    fig, axes = plt.subplots(1, 2, figsize=(12.0, 4.4), layout="constrained")
-    for ax, run, title in (
-        (axes[0], single, "single-bin RF"),
-        (axes[1], voigt, "physical-R Voigt RF"),
+    fig, axes = plt.subplots(2, 2, figsize=(12.0, 7.2), layout="constrained")
+    for col, run, title in (
+        (0, single, "single-bin RF"),
+        (1, voigt, "physical-R Voigt RF"),
     ):
-        ax.plot(f, run["ip_spectrum0"], color="tab:red", alpha=0.3, ls="--")
-        ax.plot(f, run["im_spectrum0"], color="tab:blue", alpha=0.3, ls="--")
-        ax.plot(f, run["ip_spectrum"], color="tab:red", lw=1.3, label=r"$I_+$ after")
-        ax.plot(f, run["im_spectrum"], color="tab:blue", lw=1.3, label=r"$I_-$ after")
-        ax.axvline(float(f[burn_bin]), color="green", ls=":", alpha=0.6)
-        ax.set_xlabel("R")
-        ax.set_ylabel("intensity (fit scale)")
-        ax.set_title(f"{title}  steps={run['n_steps']}")
-        ax.legend(fontsize=8)
-        ax.grid(True, alpha=0.3)
+        ax_ip = axes[0, col]
+        ax_ip.plot(f, run["ip_spectrum0"], color="tab:red", alpha=0.3, ls="--")
+        ax_ip.plot(f, run["im_spectrum0"], color="tab:blue", alpha=0.3, ls="--")
+        ax_ip.plot(f, run["ip_spectrum"], color="tab:red", lw=1.3, label=r"$I_+$ after")
+        ax_ip.plot(f, run["im_spectrum"], color="tab:blue", lw=1.3, label=r"$I_-$ after")
+        ax_ip.axvline(float(f[burn_bin]), color="green", ls=":", alpha=0.6)
+        ax_ip.set_xlabel("R")
+        ax_ip.set_ylabel("intensity (fit scale)")
+        ax_ip.set_title(f"{title}  steps={run['n_steps']}")
+        ax_ip.legend(fontsize=8)
+        ax_ip.grid(True, alpha=0.3)
+
+        ax_q = axes[1, col]
+        _plot_q_lineshape_panel(
+            ax_q,
+            f,
+            run["ip_spectrum0"],
+            run["im_spectrum0"],
+            run["ip_spectrum"],
+            run["im_spectrum"],
+            q_initial=float(run["q_initial"]),
+            q_final=float(run["q_final"]),
+            burn_R=float(f[burn_bin]),
+        )
     fig.suptitle(
         f"Same Dulya equilibrium + recovery  |  P={polarization:.2f}  γ={gamma_rf}",
         fontsize=11,

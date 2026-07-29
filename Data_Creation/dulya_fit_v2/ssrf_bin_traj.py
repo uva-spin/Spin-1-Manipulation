@@ -15,6 +15,7 @@ Run from this directory (self-contained; no parent-repo imports):
 from __future__ import annotations
 
 import argparse
+import random
 from pathlib import Path
 
 import numpy as np
@@ -23,7 +24,9 @@ import _bootstrap  # noqa: F401
 from bin_io import (
     organize_ssrf_shards,
     save_ssrf_shard,
+    save_ssrf_spectrum_shard,
     ssrf_shard_path,
+    ssrf_spectrum_shard_path,
 )
 from bin_setup import (
     equilibrium_lineshape,
@@ -35,7 +38,9 @@ from bin_setup import (
     spin1_scale_factors,
 )
 from common import (
+    BURN_BIN_CHOICES,
     BURN_STEPS_STEP,
+    DEFAULT_RANDOM_SSRF_SAMPLES,
     DIFFUSION_SCALE,
     DT,
     F_MAX,
@@ -45,6 +50,8 @@ from common import (
     GAMMA_RF_STEP,
     MAX_BURN_STEPS,
     MIN_BURN_STEPS,
+    MULTI_BURN_MAX,
+    MULTI_BURN_MIN,
     NUM_BINS,
     P_MAX,
     P_MIN,
@@ -55,8 +62,11 @@ from common import (
     RF_MODE,
     RF_MODE_PHYSICAL_VOIGT,
     RF_MODE_SINGLE_BIN,
+    SEED,
+    SPECTRUM_SSRF_SHARD_DIR,
     SSRF_SHARD_DIR,
     SSRF_TRAIN_DIR,
+    UNMANIP_TRAIN_FRACTION,
     burn_steps_grid,
     gamma_rf_grid,
 )
@@ -76,6 +86,53 @@ R_MAX = F_MAX
 
 DEFAULT_SHARD_DIR = SSRF_SHARD_DIR
 DEFAULT_TRAIN_DIR = SSRF_TRAIN_DIR
+DEFAULT_SPECTRUM_SHARD_DIR = SPECTRUM_SSRF_SHARD_DIR
+
+
+def _rng(seed: int | None = None) -> random.Random:
+    return random.Random(SEED if seed is None else int(seed))
+
+
+def _sample_random_burn_params(
+    rng: random.Random,
+    *,
+    gamma_min: float = GAMMA_RF_MIN,
+    gamma_max: float = GAMMA_RF_MAX,
+    steps_min: int = MIN_BURN_STEPS,
+    steps_max: int = MAX_BURN_STEPS,
+) -> tuple[float, int]:
+    gamma = rng.uniform(float(gamma_min), float(gamma_max))
+    n_steps = rng.randint(int(steps_min), int(steps_max))
+    return float(gamma), int(n_steps)
+
+
+def _sample_multi_burn_plan(
+    rng: random.Random,
+    num_bins: int,
+    *,
+    n_burns: int,
+    gamma_min: float = GAMMA_RF_MIN,
+    gamma_max: float = GAMMA_RF_MAX,
+    steps_min: int = MIN_BURN_STEPS,
+    steps_max: int = MAX_BURN_STEPS,
+) -> tuple[list[int], list[float], list[int]]:
+    choices = np.asarray(BURN_BIN_CHOICES, dtype=int)
+    if choices.size == 0:
+        choices = np.arange(int(num_bins), dtype=int)
+    burn_bins = [int(rng.choice(choices)) for _ in range(int(n_burns))]
+    gammas: list[float] = []
+    steps: list[int] = []
+    for _ in range(int(n_burns)):
+        g, n = _sample_random_burn_params(
+            rng,
+            gamma_min=gamma_min,
+            gamma_max=gamma_max,
+            steps_min=steps_min,
+            steps_max=steps_max,
+        )
+        gammas.append(g)
+        steps.append(n)
+    return burn_bins, gammas, steps
 
 
 def run_one_polarization(
@@ -150,11 +207,15 @@ def run_one_polarization(
     )
     p_initial, q_initial = level_pq(model)
 
+    t_len = n_burn + 1
     ip_spec0 = im_spec0 = ip_spec = im_spec = None
+    ps_full = iplus_full = iminus_full = None
     if capture_spectrum:
         ip_spec0, im_spec0, _ = full_spectrum_intensities(model)
+        ps_full = np.empty((t_len, int(num_bins)), dtype=float)
+        iplus_full = np.empty((t_len, int(num_bins)), dtype=float)
+        iminus_full = np.empty((t_len, int(num_bins)), dtype=float)
 
-    t_len = n_burn + 1
     ps = np.empty(t_len, dtype=float)
     iplus = np.empty(t_len, dtype=float)
     iminus = np.empty(t_len, dtype=float)
@@ -162,9 +223,18 @@ def run_one_polarization(
     iplus_m = np.empty(t_len, dtype=float)
     iminus_m = np.empty(t_len, dtype=float)
 
+    def _record_spectrum(k: int) -> None:
+        if not capture_spectrum or ps_full is None:
+            return
+        ip_s, im_s, ps_s = full_spectrum_intensities(model)
+        iplus_full[k] = ip_s
+        iminus_full[k] = im_s
+        ps_full[k] = ps_s
+
     ip, im, ps0_b, ip_m, im_m, ps_m0 = intensities_at_bins(model, bin_idx, mirror_idx)
     iplus[0], iminus[0], ps[0] = ip, im, ps0_b
     iplus_m[0], iminus_m[0], ps_m[0] = ip_m, im_m, ps_m0
+    _record_spectrum(0)
 
     n_sub, dt_sub = euler_n_sub(float(gamma_rf), float(dt))
     for k in range(1, t_len):
@@ -173,12 +243,13 @@ def run_one_polarization(
         ip, im, ps_k, ip_m, im_m, ps_mk = intensities_at_bins(model, bin_idx, mirror_idx)
         iplus[k], iminus[k], ps[k] = ip, im, ps_k
         iplus_m[k], iminus_m[k], ps_m[k] = ip_m, im_m, ps_mk
+        _record_spectrum(k)
 
     if capture_spectrum:
         ip_spec, im_spec, _ = full_spectrum_intensities(model)
     p_final, q_final = level_pq(model)
 
-    return traj_to_fit_scale(
+    out = traj_to_fit_scale(
         {
             "polarization": float(polarization),
             "skipped": False,
@@ -198,14 +269,190 @@ def run_one_polarization(
             "im_spectrum0": im_spec0,
             "ip_spectrum": ip_spec,
             "im_spectrum": im_spec,
+            "ps_full": ps_full,
+            "iplus_full": iplus_full,
+            "iminus_full": iminus_full,
             "frequency": f,
             "p_initial": float(p_initial),
             "q_initial": float(q_initial),
             "p_final": float(p_final),
             "q_final": float(q_final),
+            "center_bin": int(bin_idx),
+            "n_burns": 1,
         },
         from_spin1,
     )
+    return out
+
+
+def run_multi_burn_polarization(
+    polarization: float,
+    burn_bins: list[int],
+    gamma_values: list[float],
+    n_steps_values: list[int],
+    *,
+    num_bins: int = NUM_BINS,
+    dt: float = DT,
+    rf_mode: str = RF_MODE,
+    gaussian_fwhm_R: float = RF_GAUSSIAN_FWHM_R,
+    lorentzian_fwhm_R: float = RF_LORENTZIAN_FWHM_R,
+    diffusion_scale: float = DIFFUSION_SCALE,
+    shape_params: dict[str, float] | None = None,
+    capture_spectrum: bool = True,
+) -> dict:
+    """Apply a sequence of ssRF burns and record the full spectrum each macro-step."""
+    if len(burn_bins) != len(gamma_values) or len(burn_bins) != len(n_steps_values):
+        raise ValueError("burn_bins, gamma_values, and n_steps_values must match")
+    if not burn_bins:
+        raise ValueError("burn_bins must be non-empty")
+
+    P = float(polarization)
+    shape = shape_params if shape_params is not None else get_shape_params()
+    f = np.linspace(float(F_MIN), float(F_MAX), int(num_bins))
+    _, ip_fit, im_fit = equilibrium_lineshape(P, f, shape)
+    ip_fit = np.asarray(ip_fit, dtype=float)
+    im_fit = np.asarray(im_fit, dtype=float)
+    to_spin1, from_spin1 = spin1_scale_factors(P, ip_fit, im_fit)
+    iplus0 = ip_fit * to_spin1
+    iminus0 = im_fit * to_spin1
+    primary_bin = int(burn_bins[0])
+    mirror_idx = mirror_bin_idx(int(num_bins), primary_bin)
+
+    model = build_spin1_model(
+        iplus0,
+        iminus0,
+        polarization=P,
+        num_bins=num_bins,
+        dt=dt,
+        rf_enabled=True,
+        relax_enabled=True,
+        diffusion_scale=diffusion_scale,
+        rf_gaussian_fwhm_R=gaussian_fwhm_R,
+        rf_lorentzian_fwhm_R=lorentzian_fwhm_R,
+    )
+    p_initial, q_initial = level_pq(model)
+
+    total_steps = int(sum(int(n) for n in n_steps_values))
+    t_len = total_steps + 1
+    ps = np.empty(t_len, dtype=float)
+    iplus = np.empty(t_len, dtype=float)
+    iminus = np.empty(t_len, dtype=float)
+    ps_m = np.empty(t_len, dtype=float)
+    iplus_m = np.empty(t_len, dtype=float)
+    iminus_m = np.empty(t_len, dtype=float)
+    ps_full = iplus_full = iminus_full = None
+    if capture_spectrum:
+        ps_full = np.empty((t_len, int(num_bins)), dtype=float)
+        iplus_full = np.empty((t_len, int(num_bins)), dtype=float)
+        iminus_full = np.empty((t_len, int(num_bins)), dtype=float)
+
+    def _record_step(k: int) -> None:
+        ip, im, ps_k, ip_m, im_m, ps_mk = intensities_at_bins(
+            model, primary_bin, mirror_idx
+        )
+        iplus[k], iminus[k], ps[k] = ip, im, ps_k
+        iplus_m[k], iminus_m[k], ps_m[k] = ip_m, im_m, ps_mk
+        if capture_spectrum and ps_full is not None:
+            ip_s, im_s, ps_s = full_spectrum_intensities(model)
+            iplus_full[k] = ip_s
+            iminus_full[k] = im_s
+            ps_full[k] = ps_s
+
+    _record_step(0)
+    k = 1
+    used_mode = str(rf_mode)
+    for burn_idx, gamma_rf, n_burn in zip(burn_bins, gamma_values, n_steps_values):
+        used_mode = configure_ssrf_burn(
+            model,
+            int(burn_idx),
+            float(gamma_rf),
+            rf_mode=rf_mode,
+            gaussian_fwhm_R=gaussian_fwhm_R,
+            lorentzian_fwhm_R=lorentzian_fwhm_R,
+        )
+        n_sub, dt_sub = euler_n_sub(float(gamma_rf), float(dt))
+        for _ in range(int(n_burn)):
+            for _ in range(n_sub):
+                model.step_once(dt=dt_sub, rf_on=True, dnp_on=False, copy=False)
+            _record_step(k)
+            k += 1
+
+    p_final, q_final = level_pq(model)
+    ip_spec0 = None if ps_full is None else ps_full[0].copy()
+    return traj_to_fit_scale(
+        {
+            "polarization": float(polarization),
+            "skipped": False,
+            "n_steps": t_len,
+            "burn_steps": int(total_steps),
+            "gamma_rf": float(gamma_values[-1]),
+            "ps": ps,
+            "iplus": iplus,
+            "iminus": iminus,
+            "ps_m": ps_m,
+            "iplus_m": iplus_m,
+            "iminus_m": iminus_m,
+            "ps0": float(ps[0]),
+            "stop_reason": "multi_burn",
+            "rf_mode": used_mode,
+            "ip_spectrum0": None if iplus_full is None else iplus_full[0].copy(),
+            "im_spectrum0": None if iminus_full is None else iminus_full[0].copy(),
+            "ip_spectrum": None if iplus_full is None else iplus_full[-1].copy(),
+            "im_spectrum": None if iminus_full is None else iminus_full[-1].copy(),
+            "ps_full": ps_full,
+            "iplus_full": iplus_full,
+            "iminus_full": iminus_full,
+            "frequency": f,
+            "p_initial": float(p_initial),
+            "q_initial": float(q_initial),
+            "p_final": float(p_final),
+            "q_final": float(q_final),
+            "center_bin": primary_bin,
+            "n_burns": int(len(burn_bins)),
+            "burn_bins": [int(b) for b in burn_bins],
+            "gamma_values": [float(g) for g in gamma_values],
+            "steps_values": [int(n) for n in n_steps_values],
+        },
+        from_spin1,
+    )
+
+
+def run_unmanipulated_polarization(
+    polarization: float,
+    *,
+    num_bins: int = NUM_BINS,
+    shape_params: dict[str, float] | None = None,
+) -> dict:
+    """Return equilibrium full-spectrum sample (no manipulation)."""
+    P = float(polarization)
+    shape = shape_params if shape_params is not None else get_shape_params()
+    f = np.linspace(float(F_MIN), float(F_MAX), int(num_bins))
+    ps_eq, ip_eq, im_eq = equilibrium_lineshape(P, f, shape)
+    ps_eq = np.asarray(ps_eq, dtype=float)
+    ip_eq = np.asarray(ip_eq, dtype=float)
+    im_eq = np.asarray(im_eq, dtype=float)
+    return {
+        "polarization": P,
+        "skipped": False,
+        "n_steps": 1,
+        "burn_steps": 0,
+        "gamma_rf": 0.0,
+        "ps": np.asarray([float(ps_eq[num_bins // 2])], dtype=float),
+        "iplus": np.asarray([float(ip_eq[num_bins // 2])], dtype=float),
+        "iminus": np.asarray([float(im_eq[num_bins // 2])], dtype=float),
+        "ps_m": np.asarray([float(ps_eq[num_bins // 2])], dtype=float),
+        "iplus_m": np.asarray([float(ip_eq[num_bins // 2])], dtype=float),
+        "iminus_m": np.asarray([float(im_eq[num_bins // 2])], dtype=float),
+        "ps0": float(ps_eq[num_bins // 2]),
+        "stop_reason": "unmanipulated",
+        "rf_mode": "none",
+        "ps_full": ps_eq.reshape(1, -1),
+        "iplus_full": ip_eq.reshape(1, -1),
+        "iminus_full": im_eq.reshape(1, -1),
+        "frequency": f,
+        "center_bin": int(num_bins // 2),
+        "n_burns": 0,
+    }
 
 
 def run_one_bin(
@@ -220,6 +467,7 @@ def run_one_bin(
     gaussian_fwhm_R: float = RF_GAUSSIAN_FWHM_R,
     lorentzian_fwhm_R: float = RF_LORENTZIAN_FWHM_R,
     diffusion_scale: float = DIFFUSION_SCALE,
+    capture_spectrum: bool = False,
 ) -> dict:
     """Cartesian product over P × gamma_rf × burn_steps for one burn bin."""
     bin_idx = int(bin_idx)
@@ -261,6 +509,11 @@ def run_one_bin(
     ps_m = np.full((n_samples, t_max), np.nan, dtype=float)
     iplus_m = np.full((n_samples, t_max), np.nan, dtype=float)
     iminus_m = np.full((n_samples, t_max), np.nan, dtype=float)
+    ps_full = iplus_full = iminus_full = None
+    if capture_spectrum:
+        ps_full = np.full((n_samples, t_max, int(num_bins)), np.nan, dtype=float)
+        iplus_full = np.full((n_samples, t_max, int(num_bins)), np.nan, dtype=float)
+        iminus_full = np.full((n_samples, t_max, int(num_bins)), np.nan, dtype=float)
 
     for j, (p0, g, n_burn) in enumerate(combos):
         print(
@@ -278,6 +531,7 @@ def run_one_bin(
             gaussian_fwhm_R=gaussian_fwhm_R,
             lorentzian_fwhm_R=lorentzian_fwhm_R,
             diffusion_scale=diffusion_scale,
+            capture_spectrum=capture_spectrum,
         )
         p_out[j] = float(p0)
         gamma_out[j] = float(g)
@@ -293,9 +547,16 @@ def run_one_bin(
         ps_m[j, :n] = traj["ps_m"]
         iplus_m[j, :n] = traj["iplus_m"]
         iminus_m[j, :n] = traj["iminus_m"]
+        if capture_spectrum and ps_full is not None:
+            pf = traj.get("ps_full")
+            if pf is not None:
+                pf_arr = np.asarray(pf, dtype=float)
+                ps_full[j, :n] = pf_arr[:n]
+                iplus_full[j, :n] = np.asarray(traj["iplus_full"], dtype=float)[:n]
+                iminus_full[j, :n] = np.asarray(traj["iminus_full"], dtype=float)[:n]
 
     f = np.linspace(R_MIN, R_MAX, int(num_bins))
-    return {
+    out = {
         "bin_idx": bin_idx,
         "mirror_idx": mirror_idx,
         "R": float(f[bin_idx]),
@@ -320,6 +581,165 @@ def run_one_bin(
         "iplus_m": iplus_m,
         "iminus_m": iminus_m,
     }
+    if capture_spectrum:
+        out["ps_full"] = ps_full
+        out["iplus_full"] = iplus_full
+        out["iminus_full"] = iminus_full
+    return out
+
+
+def run_one_bin_spectrum(
+    bin_idx: int,
+    *,
+    p_values: np.ndarray,
+    gamma_values: np.ndarray | None = None,
+    steps_values: np.ndarray | None = None,
+    num_bins: int = NUM_BINS,
+    dt: float = DT,
+    rf_mode: str = RF_MODE,
+    gaussian_fwhm_R: float = RF_GAUSSIAN_FWHM_R,
+    lorentzian_fwhm_R: float = RF_LORENTZIAN_FWHM_R,
+    diffusion_scale: float = DIFFUSION_SCALE,
+    random_samples: int = DEFAULT_RANDOM_SSRF_SAMPLES,
+    multi_burn: bool = False,
+    unmanip_fraction: float = UNMANIP_TRAIN_FRACTION,
+    seed: int | None = None,
+    gamma_min: float = GAMMA_RF_MIN,
+    gamma_max: float = GAMMA_RF_MAX,
+    steps_min: int = MIN_BURN_STEPS,
+    steps_max: int = MAX_BURN_STEPS,
+) -> dict:
+    """Generate full-spectrum ssRF trajectories with optional random/multi-burn samples."""
+    rng = _rng(seed)
+    base = run_one_bin(
+        bin_idx,
+        p_values=p_values,
+        gamma_values=gamma_values,
+        steps_values=steps_values,
+        num_bins=num_bins,
+        dt=dt,
+        rf_mode=rf_mode,
+        gaussian_fwhm_R=gaussian_fwhm_R,
+        lorentzian_fwhm_R=lorentzian_fwhm_R,
+        diffusion_scale=diffusion_scale,
+        capture_spectrum=True,
+    )
+
+    extra_trajs: list[dict] = []
+    n_random = int(random_samples)
+    for _ in range(n_random):
+        p0 = float(rng.choice(np.asarray(p_values, dtype=float)))
+        g, n_burn = _sample_random_burn_params(
+            rng,
+            gamma_min=gamma_min,
+            gamma_max=gamma_max,
+            steps_min=steps_min,
+            steps_max=steps_max,
+        )
+        if multi_burn:
+            n_burns = rng.randint(MULTI_BURN_MIN, MULTI_BURN_MAX)
+            burn_bins, gammas, steps = _sample_multi_burn_plan(
+                rng,
+                num_bins,
+                n_burns=n_burns,
+                gamma_min=gamma_min,
+                gamma_max=gamma_max,
+                steps_min=steps_min,
+                steps_max=steps_max,
+            )
+            burn_bins[0] = int(bin_idx)
+            traj = run_multi_burn_polarization(
+                p0,
+                burn_bins,
+                gammas,
+                steps,
+                num_bins=num_bins,
+                dt=dt,
+                rf_mode=rf_mode,
+                gaussian_fwhm_R=gaussian_fwhm_R,
+                lorentzian_fwhm_R=lorentzian_fwhm_R,
+                diffusion_scale=diffusion_scale,
+                capture_spectrum=True,
+            )
+        else:
+            traj = run_one_polarization(
+                bin_idx,
+                p0,
+                num_bins=num_bins,
+                dt=dt,
+                gamma_rf=g,
+                n_steps=n_burn,
+                rf_mode=rf_mode,
+                gaussian_fwhm_R=gaussian_fwhm_R,
+                lorentzian_fwhm_R=lorentzian_fwhm_R,
+                diffusion_scale=diffusion_scale,
+                capture_spectrum=True,
+            )
+        extra_trajs.append(traj)
+
+    n_base = int(base["p_values"].size)
+    n_extra = len(extra_trajs)
+    n_unmanip = 0
+    if float(unmanip_fraction) > 0.0 and n_base + n_extra > 0:
+        target = int(round(float(unmanip_fraction) * (n_base + n_extra) / max(1e-12, 1.0 - float(unmanip_fraction))))
+        n_unmanip = max(1, target)
+        for _ in range(n_unmanip):
+            p0 = float(rng.choice(np.asarray(p_values, dtype=float)))
+            extra_trajs.append(run_unmanipulated_polarization(p0, num_bins=num_bins))
+
+    if not extra_trajs:
+        base["dataset"] = "ssrf_spectrum_bin_v2"
+        return base
+
+    def _append_traj(traj: dict) -> None:
+        nonlocal base
+        n = int(traj["n_steps"])
+        if n <= 0 or bool(traj.get("skipped", False)):
+            return
+        old_n = int(base["p_values"].size)
+        t_max_old = int(base["ps"].shape[1])
+        t_max_new = max(t_max_old, n)
+        num_b = int(base["num_bins"])
+
+        def _pad3(arr: np.ndarray | None) -> np.ndarray | None:
+            if arr is None:
+                return None
+            out = np.full((old_n + 1, t_max_new, num_b), np.nan, dtype=float)
+            out[:old_n, : arr.shape[1]] = arr
+            return out
+
+        def _pad2(arr: np.ndarray) -> np.ndarray:
+            out = np.full((old_n + 1, t_max_new), np.nan, dtype=float)
+            out[:old_n, : arr.shape[1]] = arr
+            return out
+
+        base["p_values"] = np.concatenate([base["p_values"], [float(traj["polarization"])]])
+        base["gamma_rf"] = np.concatenate(
+            [base["gamma_rf"], [float(traj.get("gamma_rf", 0.0))]]
+        )
+        base["burn_steps"] = np.concatenate(
+            [base["burn_steps"], [int(traj.get("burn_steps", 0))]]
+        )
+        base["n_steps"] = np.concatenate([base["n_steps"], [n]])
+        base["skipped"] = np.concatenate([base["skipped"], [False]])
+        for key in ("ps", "iplus", "iminus", "ps_m", "iplus_m", "iminus_m"):
+            base[key] = _pad2(base[key])
+            base[key][old_n, :n] = np.asarray(traj[key], dtype=float)
+        for key in ("ps_full", "iplus_full", "iminus_full"):
+            if key in base:
+                padded = _pad3(base[key])
+                if padded is not None and traj.get(key) is not None:
+                    padded[old_n, :n] = np.asarray(traj[key], dtype=float)[:n]
+                    base[key] = padded
+
+    for traj in extra_trajs:
+        _append_traj(traj)
+
+    base["dataset"] = "ssrf_spectrum_bin_v2"
+    base["n_random_samples"] = n_random
+    base["n_unmanip_samples"] = n_unmanip
+    base["multi_burn"] = bool(multi_burn)
+    return base
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -356,6 +776,29 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--gauss-fwhm", type=float, default=RF_GAUSSIAN_FWHM_R)
     p.add_argument("--lorentz-fwhm", type=float, default=RF_LORENTZIAN_FWHM_R)
     p.add_argument("--diffusion-scale", type=float, default=DIFFUSION_SCALE)
+    p.add_argument(
+        "--spectrum-mode",
+        action="store_true",
+        help="Store full 500-bin spectra at each timestep (spectrum shard format)",
+    )
+    p.add_argument(
+        "--random-samples",
+        type=int,
+        default=DEFAULT_RANDOM_SSRF_SAMPLES,
+        help="Extra random (gamma_rf, n_steps) trajectories per bin (spectrum mode)",
+    )
+    p.add_argument(
+        "--multi-burn",
+        action="store_true",
+        help="Generate multi-burn (2-5 burns) random trajectories (spectrum mode)",
+    )
+    p.add_argument(
+        "--unmanip-fraction",
+        type=float,
+        default=UNMANIP_TRAIN_FRACTION,
+        help="Fraction of unmanipulated equilibrium samples (spectrum mode)",
+    )
+    p.add_argument("--seed", type=int, default=SEED)
     p.add_argument("--skip-if-exists", action="store_true")
     p.add_argument("--strict", action="store_true")
     return p
@@ -385,7 +828,11 @@ def main(argv: list[str] | None = None) -> None:
             "Provide --bin-idx <int>, or set SLURM_ARRAY_TASK_ID, or pass --organize"
         )
 
-    out = ssrf_shard_path(args.shard_dir, bin_idx)
+    out = (
+        ssrf_spectrum_shard_path(args.shard_dir, bin_idx)
+        if args.spectrum_mode
+        else ssrf_shard_path(args.shard_dir, bin_idx)
+    )
     if args.skip_if_exists and out.is_file():
         print(f"Skipping existing shard {out}", flush=True)
         return
@@ -400,37 +847,73 @@ def main(argv: list[str] | None = None) -> None:
     print(
         f"bin_idx={bin_idx}  n_P={p_values.size}  n_gamma={g_values.size}  "
         f"n_steps_grid={s_values.size}  n_combos={n_combos}  "
+        f"spectrum_mode={bool(args.spectrum_mode)}  "
+        f"random_samples={int(args.random_samples)}  multi_burn={bool(args.multi_burn)}  "
+        f"unmanip_fraction={float(args.unmanip_fraction):.3f}  "
         f"P=[{args.p_min},{args.p_max}] step={args.p_step}  "
         f"gamma=[{args.gamma_min},{args.gamma_max}] step={args.gamma_step}  "
         f"burn_steps=[{args.steps_min},{args.steps_max}] step={args.steps_step}  "
         f"dt={args.dt}  rf_mode={args.rf_mode}  "
         f"Gauss={args.gauss_fwhm:.4f} Lorentz={args.lorentz_fwhm:.4f}  "
-        f"diffusion={args.diffusion_scale}  mode=fixed_(gamma,n_steps)",
+        f"diffusion={args.diffusion_scale}",
         flush=True,
     )
-    result = run_one_bin(
-        bin_idx,
-        p_values=p_values,
-        gamma_values=g_values,
-        steps_values=s_values,
-        num_bins=args.num_bins,
-        dt=args.dt,
-        rf_mode=str(args.rf_mode),
-        gaussian_fwhm_R=float(args.gauss_fwhm),
-        lorentzian_fwhm_R=float(args.lorentz_fwhm),
-        diffusion_scale=float(args.diffusion_scale),
-    )
-    save_ssrf_shard(
-        result,
-        out,
-        extra_meta=shape_meta(
-            shape,
+    if args.spectrum_mode:
+        result = run_one_bin_spectrum(
+            bin_idx,
+            p_values=p_values,
+            gamma_values=g_values,
+            steps_values=s_values,
+            num_bins=args.num_bins,
+            dt=args.dt,
             rf_mode=str(args.rf_mode),
             gaussian_fwhm_R=float(args.gauss_fwhm),
             lorentzian_fwhm_R=float(args.lorentz_fwhm),
             diffusion_scale=float(args.diffusion_scale),
-        ),
-    )
+            random_samples=int(args.random_samples),
+            multi_burn=bool(args.multi_burn),
+            unmanip_fraction=float(args.unmanip_fraction),
+            seed=int(args.seed),
+            gamma_min=float(args.gamma_min),
+            gamma_max=float(args.gamma_max),
+            steps_min=int(args.steps_min),
+            steps_max=int(args.steps_max),
+        )
+        save_ssrf_spectrum_shard(
+            result,
+            out,
+            extra_meta=shape_meta(
+                shape,
+                rf_mode=str(args.rf_mode),
+                gaussian_fwhm_R=float(args.gauss_fwhm),
+                lorentzian_fwhm_R=float(args.lorentz_fwhm),
+                diffusion_scale=float(args.diffusion_scale),
+            ),
+        )
+    else:
+        result = run_one_bin(
+            bin_idx,
+            p_values=p_values,
+            gamma_values=g_values,
+            steps_values=s_values,
+            num_bins=args.num_bins,
+            dt=args.dt,
+            rf_mode=str(args.rf_mode),
+            gaussian_fwhm_R=float(args.gauss_fwhm),
+            lorentzian_fwhm_R=float(args.lorentz_fwhm),
+            diffusion_scale=float(args.diffusion_scale),
+        )
+        save_ssrf_shard(
+            result,
+            out,
+            extra_meta=shape_meta(
+                shape,
+                rf_mode=str(args.rf_mode),
+                gaussian_fwhm_R=float(args.gauss_fwhm),
+                lorentzian_fwhm_R=float(args.lorentz_fwhm),
+                diffusion_scale=float(args.diffusion_scale),
+            ),
+        )
     print(
         f"Wrote {out}  mirror={result['mirror_idx']}  "
         f"n_samples={result['p_values'].size}  "

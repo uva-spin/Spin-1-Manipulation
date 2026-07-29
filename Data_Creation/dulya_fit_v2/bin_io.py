@@ -9,7 +9,15 @@ from pathlib import Path
 import numpy as np
 
 import _bootstrap  # noqa: F401
-from common import NUM_BINS, PHYSICS_MODEL, RF_MODE
+from common import NUM_BINS, PHYSICS_MODEL, RF_MODE, SOURCE_AFP, SOURCE_SSRF, SOURCE_UNMANIP
+
+
+def ssrf_spectrum_shard_path(output_dir: Path, bin_idx: int) -> Path:
+    return Path(output_dir) / f"ssrf_spectrum_bin_{int(bin_idx):04d}.npz"
+
+
+def afp_spectrum_shard_path(output_dir: Path, bin_idx: int) -> Path:
+    return Path(output_dir) / f"afp_spectrum_bin_{int(bin_idx):04d}.npz"
 
 
 def ssrf_shard_path(output_dir: Path, bin_idx: int) -> Path:
@@ -85,6 +93,203 @@ def save_ssrf_shard(result: dict, path: Path, *, extra_meta: dict | None = None)
         if tmp_path.is_file():
             tmp_path.unlink(missing_ok=True)
         raise
+
+
+def _save_spectrum_shard(
+    result: dict,
+    path: Path,
+    *,
+    dataset: str,
+    extra_meta: dict | None = None,
+) -> None:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    meta = {
+        "bin_idx": int(result["bin_idx"]),
+        "mirror_idx": int(result["mirror_idx"]),
+        "R": float(result["R"]),
+        "num_bins": int(result["num_bins"]),
+        "dt": float(result["dt"]),
+        "physics_model": PHYSICS_MODEL,
+        "dataset": dataset,
+        "fields": "ps_full,iplus_full,iminus_full (n_samples, n_steps, num_bins)",
+    }
+    if extra_meta:
+        meta.update(extra_meta)
+    for opt_key in (
+        "rf_mode",
+        "gaussian_fwhm_R",
+        "lorentzian_fwhm_R",
+        "diffusion_scale",
+        "gamma_values",
+        "steps_values",
+        "max_burn_steps",
+        "n_relax",
+        "afp_window",
+        "afp_efficiency",
+        "afp_subset",
+        "step_subsample",
+        "n_random_samples",
+        "n_unmanip_samples",
+        "multi_burn",
+    ):
+        if opt_key in result:
+            val = result[opt_key]
+            if isinstance(val, np.ndarray):
+                meta[opt_key] = val.tolist()
+            else:
+                meta[opt_key] = val
+
+    payload = {
+        "meta_json": np.asarray(json.dumps(meta)),
+        "p_values": np.asarray(result["p_values"], dtype=float),
+        "n_steps": np.asarray(result["n_steps"], dtype=np.int32),
+        "skipped": np.asarray(result["skipped"], dtype=bool),
+        "bin_idx": np.asarray(int(result["bin_idx"]), dtype=np.int32),
+        "mirror_idx": np.asarray(int(result["mirror_idx"]), dtype=np.int32),
+        "dt": np.asarray(float(result["dt"]), dtype=float),
+    }
+    if "gamma_rf" in result:
+        payload["gamma_rf"] = np.asarray(result["gamma_rf"], dtype=float)
+    if "burn_steps" in result:
+        payload["burn_steps"] = np.asarray(result["burn_steps"], dtype=np.int32)
+    for key in ("ps_full", "iplus_full", "iminus_full"):
+        if key in result and result[key] is not None:
+            payload[key] = np.asarray(result[key], dtype=float)
+
+    tmp_path = path.with_name(f".{path.stem}.{os.getpid()}.tmp.npz")
+    try:
+        np.savez_compressed(tmp_path, **payload)
+        tmp_path.replace(path)
+    except Exception:
+        if tmp_path.is_file():
+            tmp_path.unlink(missing_ok=True)
+        raise
+
+
+def save_ssrf_spectrum_shard(
+    result: dict, path: Path, *, extra_meta: dict | None = None
+) -> None:
+    _save_spectrum_shard(
+        result,
+        path,
+        dataset=str(result.get("dataset", "ssrf_spectrum_bin_v2")),
+        extra_meta=extra_meta,
+    )
+
+
+def save_afp_spectrum_shard(
+    result: dict, path: Path, *, extra_meta: dict | None = None
+) -> None:
+    _save_spectrum_shard(
+        result,
+        path,
+        dataset=str(result.get("dataset", "afp_spectrum_bin_v2")),
+        extra_meta=extra_meta,
+    )
+
+
+def load_spectrum_shard(path: Path) -> dict:
+    with np.load(path, allow_pickle=False) as data:
+        meta = json.loads(str(data["meta_json"]))
+        out = {
+            **meta,
+            "p_values": np.asarray(data["p_values"], dtype=float),
+            "n_steps": np.asarray(data["n_steps"], dtype=np.int32),
+            "skipped": np.asarray(data["skipped"], dtype=bool),
+        }
+        for key in ("gamma_rf", "burn_steps", "ps_full", "iplus_full", "iminus_full"):
+            if key in data.files:
+                out[key] = np.asarray(data[key])
+        return out
+
+
+def _flatten_spectrum_shard(
+    shard: dict,
+    *,
+    source: int,
+    center_bin: int,
+    step_subsample: int = 1,
+) -> dict[str, np.ndarray]:
+    """Flatten (sample, timestep) trajectories into spectrum-level rows."""
+    p_values = np.asarray(shard["p_values"], dtype=float)
+    n_steps = np.asarray(shard["n_steps"], dtype=np.int32)
+    skipped = np.asarray(shard.get("skipped", np.zeros_like(p_values, dtype=bool)), dtype=bool)
+    ps_full = np.asarray(shard["ps_full"], dtype=float)
+    ip_full = np.asarray(shard["iplus_full"], dtype=float)
+    im_full = np.asarray(shard["iminus_full"], dtype=float)
+    n_samp = int(p_values.size)
+    num_bins = int(ps_full.shape[-1])
+    sub = max(1, int(step_subsample))
+
+    gamma_rf = np.full(n_samp, np.nan, dtype=float)
+    if "gamma_rf" in shard:
+        gamma_rf = np.asarray(shard["gamma_rf"], dtype=float)
+    burn_steps = np.full(n_samp, -1, dtype=np.int32)
+    if "burn_steps" in shard:
+        burn_steps = np.asarray(shard["burn_steps"], dtype=np.int32)
+
+    rows: list[int] = []
+    for j in range(n_samp):
+        if bool(skipped[j]):
+            continue
+        n = int(n_steps[j])
+        if n <= 0:
+            continue
+        for step in range(0, n, sub):
+            rows.append((j, step))
+
+    total = len(rows)
+    if total <= 0:
+        return {
+            "p0": np.zeros(0, dtype=float),
+            "step": np.zeros(0, dtype=np.int32),
+            "center_bin": np.zeros(0, dtype=np.int32),
+            "source": np.zeros(0, dtype=np.uint8),
+            "gamma_rf": np.zeros(0, dtype=float),
+            "burn_steps": np.zeros(0, dtype=np.int32),
+            "ps": np.zeros((0, num_bins), dtype=float),
+            "iplus": np.zeros((0, num_bins), dtype=float),
+            "iminus": np.zeros((0, num_bins), dtype=float),
+        }
+
+    out = {
+        "p0": np.empty(total, dtype=float),
+        "step": np.empty(total, dtype=np.int32),
+        "center_bin": np.full(total, int(center_bin), dtype=np.int32),
+        "source": np.full(total, int(source), dtype=np.uint8),
+        "gamma_rf": np.empty(total, dtype=float),
+        "burn_steps": np.empty(total, dtype=np.int32),
+        "ps": np.empty((total, num_bins), dtype=float),
+        "iplus": np.empty((total, num_bins), dtype=float),
+        "iminus": np.empty((total, num_bins), dtype=float),
+    }
+    for idx, (j, step) in enumerate(rows):
+        out["p0"][idx] = float(p_values[j])
+        out["step"][idx] = int(step)
+        out["gamma_rf"][idx] = float(gamma_rf[j])
+        out["burn_steps"][idx] = int(burn_steps[j])
+        out["ps"][idx] = ps_full[j, step]
+        out["iplus"][idx] = ip_full[j, step]
+        out["iminus"][idx] = im_full[j, step]
+    return out
+
+
+def _concat_spectrum_rows(parts: list[dict[str, np.ndarray]]) -> dict[str, np.ndarray]:
+    parts = [p for p in parts if int(np.asarray(p["ps"]).shape[0]) > 0]
+    if not parts:
+        return parts[0] if parts else {}
+    if len(parts) == 1:
+        return parts[0]
+    keys = parts[0].keys()
+    out: dict[str, np.ndarray] = {}
+    for key in keys:
+        arrs = [p[key] for p in parts]
+        if arrs[0].ndim == 1:
+            out[key] = np.concatenate(arrs)
+        else:
+            out[key] = np.concatenate(arrs, axis=0)
+    return out
 
 
 def load_ssrf_shard(path: Path) -> dict:
