@@ -114,8 +114,9 @@ SSRF_TRAIN_DIR = DATA_DIR / "ssrf_train"
 AFP_SHARD_DIR = DATA_DIR / "afp_shards"
 AFP_TRAIN_DIR = DATA_DIR / "afp_train"
 UNMANIP_TRAIN_DIR = DATA_DIR / "unmanip_train"
-SPECTRUM_SSRF_SHARD_DIR = DATA_DIR / "spectrum_ssrf_shards"
-SPECTRUM_AFP_SHARD_DIR = DATA_DIR / "spectrum_afp_shards"
+# Full-spectrum shards (ssrf_spectrum_bin_*.npz) live alongside trajectory shards.
+SPECTRUM_SSRF_SHARD_DIR = SSRF_SHARD_DIR
+SPECTRUM_AFP_SHARD_DIR = AFP_SHARD_DIR
 SPECTRUM_TRAIN_DIR = DATA_DIR / "spectrum_train"
 SPECTRUM_TRAIN_NPZ = SPECTRUM_TRAIN_DIR / "spectrum_train.npz"
 # Unified per-bin train files (source 0=ssrf, 1=afp, 2=unmanipulated).

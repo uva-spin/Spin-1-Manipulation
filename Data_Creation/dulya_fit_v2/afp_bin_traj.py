@@ -439,7 +439,7 @@ def main(argv: list[str] | None = None) -> None:
         )
         return
 
-    bin_idx = resolve_bin_idx(args.bin_idx)
+    bin_idx = resolve_bin_idx(args.bin_idx, num_bins=int(args.num_bins))
     if bin_idx is None:
         raise SystemExit(
             "Provide --bin-idx <int>, or set SLURM_ARRAY_TASK_ID, or pass --organize"

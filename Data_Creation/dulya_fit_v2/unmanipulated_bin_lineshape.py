@@ -237,7 +237,7 @@ def main(argv: list[str] | None = None) -> None:
     print_shape_banner(shape, num_bins=int(args.num_bins))
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
-    bin_idx = resolve_bin_idx(args.bin_idx)
+    bin_idx = resolve_bin_idx(args.bin_idx, num_bins=int(args.num_bins))
 
     if bin_idx is not None:
         run_one_bin(

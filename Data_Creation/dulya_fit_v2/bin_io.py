@@ -9,7 +9,93 @@ from pathlib import Path
 import numpy as np
 
 import _bootstrap  # noqa: F401
-from common import NUM_BINS, PHYSICS_MODEL, RF_MODE, SOURCE_AFP, SOURCE_SSRF, SOURCE_UNMANIP
+from common import NUM_BINS, PHYSICS_MODEL, RF_MODE, SOURCE_AFP, SOURCE_SSRF
+
+
+def bin_index_range(num_bins: int) -> range:
+    """Zero-indexed bin indices 0 .. num_bins-1."""
+    nb = int(num_bins)
+    if nb < 1:
+        raise ValueError(f"num_bins must be >= 1, got {nb}")
+    return range(nb)
+
+
+def _traj_shard_mismatch_hint(
+    shard_dir: Path,
+    *,
+    spectrum_path_fn,
+    traj_path_fn,
+) -> str:
+    """Explain when trajectory shards exist but spectrum shards were requested."""
+    spec0 = spectrum_path_fn(shard_dir, 0)
+    traj0 = traj_path_fn(shard_dir, 0)
+    if spec0.is_file() or not traj0.is_file():
+        return ""
+    return (
+        f" Found {traj0.name} (per-bin trajectory shard) but not {spec0.name}. "
+        "combine_spectrum_train needs full-spectrum shards from "
+        f"{traj_path_fn(shard_dir, 0).parent}/ with --spectrum-mode, e.g. "
+        f"{spec0.name}. For trajectory shards use combine_all_train.py instead."
+    )
+
+
+def format_missing_bins_error(
+    label: str,
+    shard_dir: Path,
+    missing: list[int],
+    *,
+    num_bins: int,
+    path_fn,
+    traj_path_fn=None,
+) -> str:
+    """Human-readable strict-mode error for missing per-bin NPZ shards."""
+    if not missing:
+        return f"No missing {label} bins"
+    nb = int(num_bins)
+    last = nb - 1
+    first = int(missing[0])
+    example_lo = path_fn(shard_dir, 0).name
+    example_hi = path_fn(shard_dir, last).name
+    msg = (
+        f"Missing {len(missing)} {label} file(s) under {shard_dir}; "
+        f"expected {nb} zero-indexed bin_idx values 0..{last} "
+        f"(e.g. {example_lo} .. {example_hi}); first missing bin_idx={first}"
+    )
+    if traj_path_fn is not None:
+        msg += _traj_shard_mismatch_hint(
+            shard_dir,
+            spectrum_path_fn=path_fn,
+            traj_path_fn=traj_path_fn,
+        )
+    if first == nb:
+        msg += (
+            f". bin_idx={nb} is invalid for num_bins={nb}; "
+            f"use --num-bins {nb} for bins 0..{last} "
+            f"(check SLURM --array=0-{last}, not 0-{nb})."
+        )
+    elif (
+        len(missing) == 1
+        and first == last
+        and first > 0
+        and path_fn(shard_dir, first - 1).is_file()
+        and not path_fn(shard_dir, first).is_file()
+    ):
+        msg += (
+            f". Found bins 0..{first - 1} only ({first} files); "
+            f"use --num-bins {first} (zero-indexed 0..{first - 1}), not {nb}."
+        )
+    elif first == 0 and path_fn(shard_dir, nb).is_file():
+        msg += (
+            f". Found {path_fn(shard_dir, nb).name} but not {example_lo}; "
+            "filenames look 1-based — regenerate with zero-indexed bin_idx 0.."
+            f"{last} (SLURM --array=0-{last})."
+        )
+    elif first == 0 and path_fn(shard_dir, 1).is_file() and not path_fn(shard_dir, 0).is_file():
+        msg += (
+            f". Found {path_fn(shard_dir, 1).name} but not {example_lo}; "
+            "expected zero-indexed filenames starting at 0000."
+        )
+    return msg
 
 
 def ssrf_spectrum_shard_path(output_dir: Path, bin_idx: int) -> Path:
@@ -210,6 +296,7 @@ def _flatten_spectrum_shard(
     source: int,
     center_bin: int,
     step_subsample: int = 1,
+    exclude_trailing_samples: int = 0,
 ) -> dict[str, np.ndarray]:
     """Flatten (sample, timestep) trajectories into spectrum-level rows."""
     p_values = np.asarray(shard["p_values"], dtype=float)
@@ -221,6 +308,8 @@ def _flatten_spectrum_shard(
     n_samp = int(p_values.size)
     num_bins = int(ps_full.shape[-1])
     sub = max(1, int(step_subsample))
+    n_exclude = max(0, min(int(exclude_trailing_samples), n_samp))
+    n_keep = n_samp - n_exclude
 
     gamma_rf = np.full(n_samp, np.nan, dtype=float)
     if "gamma_rf" in shard:
@@ -229,8 +318,8 @@ def _flatten_spectrum_shard(
     if "burn_steps" in shard:
         burn_steps = np.asarray(shard["burn_steps"], dtype=np.int32)
 
-    rows: list[int] = []
-    for j in range(n_samp):
+    rows: list[tuple[int, int]] = []
+    for j in range(n_keep):
         if bool(skipped[j]):
             continue
         n = int(n_steps[j])
@@ -256,8 +345,8 @@ def _flatten_spectrum_shard(
     out = {
         "p0": np.empty(total, dtype=float),
         "step": np.empty(total, dtype=np.int32),
-        "center_bin": np.full(total, int(center_bin), dtype=np.int32),
-        "source": np.full(total, int(source), dtype=np.uint8),
+        "center_bin": np.empty(total, dtype=np.int32),
+        "source": np.empty(total, dtype=np.uint8),
         "gamma_rf": np.empty(total, dtype=float),
         "burn_steps": np.empty(total, dtype=np.int32),
         "ps": np.empty((total, num_bins), dtype=float),
@@ -267,6 +356,8 @@ def _flatten_spectrum_shard(
     for idx, (j, step) in enumerate(rows):
         out["p0"][idx] = float(p_values[j])
         out["step"][idx] = int(step)
+        out["center_bin"][idx] = int(center_bin)
+        out["source"][idx] = np.uint8(int(source))
         out["gamma_rf"][idx] = float(gamma_rf[j])
         out["burn_steps"][idx] = int(burn_steps[j])
         out["ps"][idx] = ps_full[j, step]
@@ -553,7 +644,7 @@ def _missing_shards(
     shard_path_fn,
 ) -> list[int]:
     missing: list[int] = []
-    for bin_idx in range(int(num_bins)):
+    for bin_idx in bin_index_range(num_bins):
         if not shard_path_fn(shard_dir, bin_idx).is_file():
             missing.append(bin_idx)
     return missing
@@ -639,14 +730,19 @@ def organize_ssrf_shards(
 
     if missing and strict:
         raise FileNotFoundError(
-            f"Missing {len(missing)} shard(s) under {shard_dir}; "
-            f"first missing bin_idx={missing[0]}"
+            format_missing_bins_error(
+                "ssRF shard",
+                shard_dir,
+                missing,
+                num_bins=int(num_bins),
+                path_fn=ssrf_shard_path,
+            )
         )
     if missing:
         print(f"WARNING: missing {len(missing)} shards; continuing", flush=True)
 
     samples_per_bin = np.zeros(int(num_bins), dtype=np.int64)
-    for bin_idx in range(int(num_bins)):
+    for bin_idx in bin_index_range(num_bins):
         arrays = _organize_one_bin(
             bin_idx,
             num_bins=int(num_bins),
@@ -701,14 +797,19 @@ def organize_afp_shards(
 
     if missing and strict:
         raise FileNotFoundError(
-            f"Missing {len(missing)} shard(s) under {shard_dir}; "
-            f"first missing bin_idx={missing[0]}"
+            format_missing_bins_error(
+                "AFP shard",
+                shard_dir,
+                missing,
+                num_bins=int(num_bins),
+                path_fn=afp_shard_path,
+            )
         )
     if missing:
         print(f"WARNING: missing {len(missing)} shards; continuing", flush=True)
 
     samples_per_bin = np.zeros(int(num_bins), dtype=np.int64)
-    for bin_idx in range(int(num_bins)):
+    for bin_idx in bin_index_range(num_bins):
         arrays = _organize_one_bin(
             bin_idx,
             num_bins=int(num_bins),

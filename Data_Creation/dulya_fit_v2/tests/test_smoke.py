@@ -14,8 +14,10 @@ if str(_V2) not in sys.path:
     sys.path.insert(0, str(_V2))
 
 from afp_bin_traj import run_one_bin as run_afp_bin
+from afp_bin_traj import run_one_bin_spectrum as run_afp_spectrum_bin
 from afp_bin_traj import run_one_polarization as run_afp_one
 from bin_io import (
+    afp_shard_path,
     load_ssrf_shard,
     organize_ssrf_shards,
     save_afp_spectrum_shard,
@@ -24,10 +26,9 @@ from bin_io import (
     ssrf_shard_path,
     ssrf_spectrum_shard_path,
     ssrf_train_bin_path,
-    afp_spectrum_shard_path,
 )
 from combine_spectrum_train import combine_spectrum_shards
-from bin_setup import equilibrium_lineshape, get_shape_params
+from bin_setup import equilibrium_lineshape, generate_unmanipulated_cube, get_shape_params
 from common import (
     DEMO_BURN_BIN,
     DEMO_P,
@@ -39,14 +40,17 @@ from common import (
     RF_MODE,
     RF_MODE_PHYSICAL_VOIGT,
     RF_MODE_SINGLE_BIN,
+    SOURCE_UNMANIP,
 )
 from model_bridge import build_spin1_model, configure_ssrf_burn
 from ssrf_bin_traj import run_one_bin as run_ssrf_bin
+from ssrf_bin_traj import run_one_bin_spectrum as run_ssrf_spectrum_bin
 from ssrf_bin_traj import run_one_polarization as run_ssrf_one
 from ssrf_realtime_v2.rate_equations_realtime import (
     voigt_burn_recovery_param_snapshot,
 )
 from unmanipulated_bin_lineshape import run_one_bin as run_unmanip_bin
+from unmanipulated_bin_lineshape import save_unmanip_bin, unmanip_bin_path
 
 SMOKE_BIN = 208
 SMOKE_P = np.array([-0.3, 0.0, 0.3], dtype=float)
@@ -266,41 +270,76 @@ def test_afp_full_spectrum_capture() -> None:
 
 
 def test_combine_spectrum_train_smoke(tmp_path: Path) -> None:
+    n_bins = 8
+    smoke_bin = 3
     ssrf_dir = tmp_path / "ssrf_spec"
     afp_dir = tmp_path / "afp_spec"
+    unmanip_dir = tmp_path / "unmanip"
     ssrf_dir.mkdir()
     afp_dir.mkdir()
+    unmanip_dir.mkdir()
 
-    ssrf_res = run_ssrf_bin(
-        SMOKE_BIN,
+    ssrf_res = run_ssrf_spectrum_bin(
+        smoke_bin,
         p_values=SMOKE_P[:1],
         gamma_values=np.array([1.0], dtype=float),
         steps_values=np.array([10], dtype=np.int32),
-        num_bins=NUM_BINS,
-        capture_spectrum=True,
+        num_bins=n_bins,
+        unmanip_fraction=0.0,
     )
-    save_ssrf_spectrum_shard(ssrf_res, ssrf_spectrum_shard_path(ssrf_dir, SMOKE_BIN))
+    save_ssrf_spectrum_shard(ssrf_res, ssrf_shard_path(ssrf_dir, smoke_bin))
 
-    afp_res = run_afp_bin(
-        SMOKE_BIN,
+    afp_res = run_afp_spectrum_bin(
+        smoke_bin,
         p_values=SMOKE_P[:1],
-        num_bins=NUM_BINS,
+        num_bins=n_bins,
         n_relax=20,
-        capture_spectrum=True,
+        unmanip_fraction=0.0,
     )
-    save_afp_spectrum_shard(afp_res, afp_spectrum_shard_path(afp_dir, SMOKE_BIN))
+    save_afp_spectrum_shard(afp_res, afp_shard_path(afp_dir, smoke_bin))
+
+    shape = get_shape_params()
+    cube = generate_unmanipulated_cube(
+        num_bins=n_bins,
+        p_min=float(SMOKE_P.min()),
+        p_max=float(SMOKE_P.max()),
+        p_step=0.3,
+        shape_params=shape,
+    )
+    for bin_idx in range(n_bins):
+        save_unmanip_bin(
+            bin_idx,
+            p_values=cube["p_values"],
+            ps=cube["ps"][:, bin_idx],
+            iplus=cube["iplus"][:, bin_idx],
+            iminus=cube["iminus"][:, bin_idx],
+            amp=cube["amp"][:, bin_idx],
+            R=float(cube["R"][bin_idx]),
+            path=unmanip_bin_path(unmanip_dir, bin_idx),
+            p_min=float(SMOKE_P.min()),
+            p_max=float(SMOKE_P.max()),
+            p_step=0.3,
+            num_bins=n_bins,
+            shape_params=shape,
+        )
 
     out = tmp_path / "spectrum_train.npz"
     result = combine_spectrum_shards(
         ssrf_dir,
         afp_dir,
         out,
-        num_bins=NUM_BINS,
+        unmanip_dir=unmanip_dir,
+        num_bins=n_bins,
         strict=False,
-        unmanip_fraction=0.0,
     )
     assert result["n_samples"] > 0
+    assert result["n_unmanip"] > 0
     assert Path(out).is_file()
+    with np.load(out, allow_pickle=False) as data:
+        source = np.asarray(data["source"], dtype=np.uint8)
+        ps = np.asarray(data["ps"], dtype=float)
+        assert np.any(source == SOURCE_UNMANIP)
+        assert ps.shape[1] == n_bins
 
 
 def test_plot_physics_demo_writes_pngs(smoke_dirs: dict[str, Path]) -> None:

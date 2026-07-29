@@ -17,6 +17,7 @@ from common import (
     F_MAX,
     F_MIN,
     FIT_PARAMS_PATH,
+    NUM_BINS,
     PHYSICS_MODEL,
     RF_GAUSSIAN_FWHM_R,
     RF_LORENTZIAN_FWHM_R,
@@ -135,13 +136,27 @@ def shape_meta(
     }
 
 
-def resolve_bin_idx(cli_bin_idx: int | None) -> int | None:
+def resolve_bin_idx(
+    cli_bin_idx: int | None,
+    *,
+    num_bins: int = NUM_BINS,
+) -> int | None:
+    """Resolve a zero-indexed spectral bin (0 .. num_bins-1) from CLI or SLURM."""
     if cli_bin_idx is not None:
-        return int(cli_bin_idx)
-    env_idx = os.environ.get("SLURM_ARRAY_TASK_ID")
-    if env_idx is not None and str(env_idx).strip() != "":
-        return int(env_idx)
-    return None
+        bin_idx = int(cli_bin_idx)
+    else:
+        env_idx = os.environ.get("SLURM_ARRAY_TASK_ID")
+        if env_idx is None or str(env_idx).strip() == "":
+            return None
+        bin_idx = int(env_idx)
+
+    nb = int(num_bins)
+    if bin_idx < 0 or bin_idx >= nb:
+        raise ValueError(
+            f"bin_idx={bin_idx} out of range for num_bins={nb} "
+            f"(zero-indexed valid range 0..{nb - 1})"
+        )
+    return bin_idx
 
 
 def polarization_grid(p_min: float, p_max: float, p_step: float) -> np.ndarray:
