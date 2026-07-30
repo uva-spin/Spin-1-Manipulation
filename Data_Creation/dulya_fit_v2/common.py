@@ -119,6 +119,9 @@ SPECTRUM_SSRF_SHARD_DIR = SSRF_SHARD_DIR
 SPECTRUM_AFP_SHARD_DIR = AFP_SHARD_DIR
 SPECTRUM_TRAIN_DIR = DATA_DIR / "spectrum_train"
 SPECTRUM_TRAIN_NPZ = SPECTRUM_TRAIN_DIR / "spectrum_train.npz"
+SSRF_SPECTRUM_ROWS_DIR = DATA_DIR / "ssrf_spectrum_rows"
+AFP_SPECTRUM_ROWS_DIR = DATA_DIR / "afp_spectrum_rows"
+UNMANIP_SPECTRUM_ROWS_DIR = DATA_DIR / "unmanip_spectrum_rows"
 # Unified per-bin train files (source 0=ssrf, 1=afp, 2=unmanipulated).
 COMBINED_TRAIN_ALL_DIR = DATA_DIR / "combined_train_all"
 # Full-spectrum training coverage defaults.
@@ -127,6 +130,12 @@ MULTI_BURN_MAX = 5
 AFP_STEP_SUBSAMPLE = 50
 UNMANIP_TRAIN_FRACTION = 0.10
 DEFAULT_RANDOM_SSRF_SAMPLES = 0
+# Process P×gamma×steps combos in batches during spectrum generation (peak RAM control).
+# Spectrum mode allocates a full (t_max, num_bins) cube per combo, so it needs a small
+# batch. Plain trajectory mode only allocates 6 center-bin (t_max,) arrays per combo
+# (no num_bins factor), so it tolerates a much larger batch for the same RAM budget.
+DEFAULT_SSRF_COMBO_BATCH_SIZE = 64
+DEFAULT_SSRF_TRAJ_COMBO_BATCH_SIZE = 2048
 SOURCE_SSRF = 0
 SOURCE_AFP = 1
 SOURCE_UNMANIP = 2

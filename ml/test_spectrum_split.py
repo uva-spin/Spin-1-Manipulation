@@ -38,9 +38,13 @@ from spectrum_split_model import (
     DEFAULT_OUTPUT,
     DEVICE,
     SpectrumSplitModel,
+    discover_spectrum_shards,
+    is_sharded_source,
     load_spectrum_npz,
     load_trained_model,
     polarization_train_holdout_split,
+    read_light_columns,
+    row_mask_by_shard,
 )
 
 DEFAULT_OUT = ML_DIR / "results" / "test_spectrum_split"
@@ -131,6 +135,70 @@ def evaluate_holdout(
     }
 
 
+def evaluate_holdout_sharded(
+    model: SpectrumSplitModel,
+    shard_paths: list[Path],
+    holdout_masks: dict[int, np.ndarray],
+    *,
+    batch_size: int = 32,
+) -> dict[str, Any]:
+    ps_parts: list[np.ndarray] = []
+    ip_true_parts: list[np.ndarray] = []
+    im_true_parts: list[np.ndarray] = []
+    ip_pred_parts: list[np.ndarray] = []
+    im_pred_parts: list[np.ndarray] = []
+    source_parts: list[np.ndarray] = []
+
+    for shard_id, mask in holdout_masks.items():
+        with np.load(shard_paths[shard_id], allow_pickle=False) as npz:
+            ps = np.asarray(npz["ps"], dtype=np.float32)[mask]
+            ip_true = np.asarray(npz["iplus"], dtype=np.float32)[mask]
+            im_true = np.asarray(npz["iminus"], dtype=np.float32)[mask]
+            p0 = np.asarray(npz["p0"], dtype=np.float32)[mask]
+            source = (
+                np.asarray(npz["source"], dtype=np.uint8)[mask]
+                if "source" in npz.files
+                else np.zeros(ps.shape[0], dtype=np.uint8)
+            )
+
+        ip_pred = np.zeros_like(ip_true)
+        im_pred = np.zeros_like(im_true)
+        for start in range(0, ps.shape[0], batch_size):
+            sl = slice(start, start + batch_size)
+            ip_b, im_b = model.predict_batch(ps[sl], p0_batch=p0[sl], device=DEVICE)
+            ip_pred[sl] = ip_b
+            im_pred[sl] = im_b
+
+        ps_parts.append(ps)
+        ip_true_parts.append(ip_true)
+        im_true_parts.append(im_true)
+        ip_pred_parts.append(ip_pred)
+        im_pred_parts.append(im_pred)
+        source_parts.append(source)
+
+    if not ps_parts:
+        return {"n_samples": 0}
+
+    ps_cat = np.concatenate(ps_parts)
+    ip_true_cat = np.concatenate(ip_true_parts)
+    im_true_cat = np.concatenate(im_true_parts)
+    ip_pred_cat = np.concatenate(ip_pred_parts)
+    im_pred_cat = np.concatenate(im_pred_parts)
+    source_cat = np.concatenate(source_parts)
+
+    overall = compute_metrics(ps_cat, ip_pred_cat, im_pred_cat, ip_true_cat, im_true_cat)
+    by_source: dict[str, dict[str, float]] = {}
+    for code, name in ((0, "ssrf"), (1, "afp"), (2, "unmanip")):
+        m = source_cat == code
+        if not np.any(m):
+            continue
+        by_source[name] = compute_metrics(
+            ps_cat[m], ip_pred_cat[m], im_pred_cat[m], ip_true_cat[m], im_true_cat[m]
+        )
+
+    return {"n_samples": int(ps_cat.shape[0]), "overall": overall, "by_source": by_source}
+
+
 def evaluate_pickle_events(model: SpectrumSplitModel, pickle_path: Path) -> dict[str, Any] | None:
     try:
         from test_binning import load_test_events
@@ -165,7 +233,12 @@ def evaluate_pickle_events(model: SpectrumSplitModel, pickle_path: Path) -> dict
 def build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Evaluate SpectrumSplitNet on holdout / test pickle")
     p.add_argument("--model", type=Path, default=DEFAULT_OUTPUT)
-    p.add_argument("--data", type=Path, default=DEFAULT_DATA)
+    p.add_argument(
+        "--data",
+        type=Path,
+        default=DEFAULT_DATA,
+        help="Single spectrum_train.npz, or a sharded output directory/manifest",
+    )
     p.add_argument("--output-dir", type=Path, default=DEFAULT_OUT)
     p.add_argument(
         "--test-pickle",
@@ -183,13 +256,25 @@ def main(argv: list[str] | None = None) -> None:
 
     print(f"Device: {DEVICE}", flush=True)
     model = load_trained_model(args.model, DEVICE)
-    arrays = load_spectrum_npz(args.data)
-    _, holdout_idx = polarization_train_holdout_split(arrays["p0"])
+
+    if is_sharded_source(args.data):
+        shard_paths = discover_spectrum_shards(args.data)
+        light = read_light_columns(shard_paths)
+        shard_row_counts = np.bincount(light["shard_id"], minlength=len(shard_paths)).tolist()
+        _, holdout_sel = polarization_train_holdout_split(light["p0"])
+        holdout_masks = row_mask_by_shard(light["shard_id"], light["local_idx"], shard_row_counts, holdout_sel)
+        holdout_result = evaluate_holdout_sharded(
+            model, shard_paths, holdout_masks, batch_size=int(args.batch_size)
+        )
+    else:
+        arrays = load_spectrum_npz(args.data)
+        _, holdout_idx = polarization_train_holdout_split(arrays["p0"])
+        holdout_result = evaluate_holdout(model, arrays, holdout_idx, batch_size=int(args.batch_size))
 
     results: dict[str, Any] = {
         "model": str(args.model),
         "data": str(args.data),
-        "holdout": evaluate_holdout(model, arrays, holdout_idx, batch_size=int(args.batch_size)),
+        "holdout": holdout_result,
     }
 
     if args.test_pickle is not None:

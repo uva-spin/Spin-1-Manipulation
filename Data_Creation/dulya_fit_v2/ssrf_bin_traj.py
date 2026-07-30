@@ -15,6 +15,7 @@ Run from this directory (self-contained; no parent-repo imports):
 from __future__ import annotations
 
 import argparse
+import json
 import random
 from pathlib import Path
 
@@ -25,7 +26,13 @@ from bin_io import (
     organize_ssrf_shards,
     save_ssrf_shard,
     save_ssrf_spectrum_shard,
+    ssrf_shard_complete,
+    ssrf_shard_part_path,
+    ssrf_shard_parts_manifest_path,
     ssrf_shard_path,
+    ssrf_spectrum_shard_complete,
+    ssrf_spectrum_shard_part_path,
+    ssrf_spectrum_shard_parts_manifest_path,
     ssrf_spectrum_shard_path,
 )
 from bin_setup import (
@@ -41,6 +48,8 @@ from common import (
     BURN_BIN_CHOICES,
     BURN_STEPS_STEP,
     DEFAULT_RANDOM_SSRF_SAMPLES,
+    DEFAULT_SSRF_COMBO_BATCH_SIZE,
+    DEFAULT_SSRF_TRAJ_COMBO_BATCH_SIZE,
     DIFFUSION_SCALE,
     DT,
     F_MAX,
@@ -64,6 +73,7 @@ from common import (
     RF_MODE_SINGLE_BIN,
     SEED,
     SPECTRUM_SSRF_SHARD_DIR,
+    STORE_DTYPE,
     SSRF_SHARD_DIR,
     SSRF_TRAIN_DIR,
     UNMANIP_TRAIN_FRACTION,
@@ -455,69 +465,92 @@ def run_unmanipulated_polarization(
     }
 
 
-def run_one_bin(
+def _build_combos(
+    p_values: np.ndarray,
+    gamma_values: np.ndarray,
+    steps_values: np.ndarray,
+) -> list[tuple[float, float, int]]:
+    combos: list[tuple[float, float, int]] = []
+    for p0 in np.asarray(p_values, dtype=float):
+        for g in np.asarray(gamma_values, dtype=float):
+            for n_burn in np.asarray(steps_values, dtype=np.int32):
+                combos.append((float(p0), float(g), int(n_burn)))
+    return combos
+
+
+def _estimate_spectrum_batch_gib(
+    n_samples: int,
+    t_max: int,
+    num_bins: int,
+    *,
+    spectrum_only: bool,
+    capture_spectrum: bool = True,
+) -> float:
+    """Rough peak-RAM estimate (GiB) for one combo batch."""
+    itemsize = np.dtype(STORE_DTYPE).itemsize
+    full_bytes = n_samples * t_max * int(num_bins) * 3 * itemsize if capture_spectrum else 0
+    center_bytes = 0 if (capture_spectrum and spectrum_only) else n_samples * t_max * 6 * itemsize
+    return (full_bytes + center_bytes) / (1024**3)
+
+
+def _run_one_bin_combos(
+    combos: list[tuple[float, float, int]],
     bin_idx: int,
     *,
-    p_values: np.ndarray,
-    gamma_values: np.ndarray | None = None,
-    steps_values: np.ndarray | None = None,
-    num_bins: int = NUM_BINS,
-    dt: float = DT,
-    rf_mode: str = RF_MODE,
-    gaussian_fwhm_R: float = RF_GAUSSIAN_FWHM_R,
-    lorentzian_fwhm_R: float = RF_LORENTZIAN_FWHM_R,
-    diffusion_scale: float = DIFFUSION_SCALE,
-    capture_spectrum: bool = False,
+    t_max: int,
+    num_bins: int,
+    dt: float,
+    rf_mode: str,
+    gaussian_fwhm_R: float,
+    lorentzian_fwhm_R: float,
+    diffusion_scale: float,
+    capture_spectrum: bool,
+    spectrum_only: bool = False,
+    combo_offset: int = 0,
+    combo_total: int | None = None,
 ) -> dict:
-    """Cartesian product over P × gamma_rf × burn_steps for one burn bin."""
+    """Run ssRF for an explicit combo list (one bin)."""
     bin_idx = int(bin_idx)
-    if bin_idx < 0 or bin_idx >= int(num_bins):
-        raise ValueError(f"bin_idx={bin_idx} out of range for num_bins={num_bins}")
-
     mirror_idx = mirror_bin_idx(int(num_bins), bin_idx)
-    p_values = np.asarray(p_values, dtype=float)
-    gamma_values = (
-        gamma_rf_grid()
-        if gamma_values is None
-        else np.asarray(gamma_values, dtype=float)
-    )
-    steps_values = (
-        burn_steps_grid()
-        if steps_values is None
-        else np.asarray(steps_values, dtype=np.int32)
-    )
-    if gamma_values.size == 0 or steps_values.size == 0 or p_values.size == 0:
-        raise ValueError("p_values, gamma_values, and steps_values must be non-empty")
-
-    combos: list[tuple[float, float, int]] = []
-    for p0 in p_values:
-        for g in gamma_values:
-            for n_burn in steps_values:
-                combos.append((float(p0), float(g), int(n_burn)))
-
     n_samples = len(combos)
-    t_max = int(np.max(steps_values)) + 1
+    total = int(combo_total) if combo_total is not None else n_samples
 
     p_out = np.empty(n_samples, dtype=float)
     gamma_out = np.empty(n_samples, dtype=float)
     burn_steps_out = np.empty(n_samples, dtype=np.int32)
     n_steps = np.zeros(n_samples, dtype=np.int32)
     skipped = np.zeros(n_samples, dtype=bool)
-    ps = np.full((n_samples, t_max), np.nan, dtype=float)
-    iplus = np.full((n_samples, t_max), np.nan, dtype=float)
-    iminus = np.full((n_samples, t_max), np.nan, dtype=float)
-    ps_m = np.full((n_samples, t_max), np.nan, dtype=float)
-    iplus_m = np.full((n_samples, t_max), np.nan, dtype=float)
-    iminus_m = np.full((n_samples, t_max), np.nan, dtype=float)
+
+    # STORE_DTYPE (float32): the default grid can reach (n_samples, t_max) in
+    # the tens of thousands each way, so these six arrays dominate peak RAM --
+    # float64 here is what pushed plain trajectory-mode generation to ~60 GiB
+    # and OOM-killed the SLURM task even without --spectrum-mode.
+    ps = iplus = iminus = ps_m = iplus_m = iminus_m = None
+    if capture_spectrum and not spectrum_only:
+        ps = np.full((n_samples, t_max), np.nan, dtype=STORE_DTYPE)
+        iplus = np.full((n_samples, t_max), np.nan, dtype=STORE_DTYPE)
+        iminus = np.full((n_samples, t_max), np.nan, dtype=STORE_DTYPE)
+        ps_m = np.full((n_samples, t_max), np.nan, dtype=STORE_DTYPE)
+        iplus_m = np.full((n_samples, t_max), np.nan, dtype=STORE_DTYPE)
+        iminus_m = np.full((n_samples, t_max), np.nan, dtype=STORE_DTYPE)
+    elif not capture_spectrum:
+        ps = np.full((n_samples, t_max), np.nan, dtype=STORE_DTYPE)
+        iplus = np.full((n_samples, t_max), np.nan, dtype=STORE_DTYPE)
+        iminus = np.full((n_samples, t_max), np.nan, dtype=STORE_DTYPE)
+        ps_m = np.full((n_samples, t_max), np.nan, dtype=STORE_DTYPE)
+        iplus_m = np.full((n_samples, t_max), np.nan, dtype=STORE_DTYPE)
+        iminus_m = np.full((n_samples, t_max), np.nan, dtype=STORE_DTYPE)
+
     ps_full = iplus_full = iminus_full = None
     if capture_spectrum:
-        ps_full = np.full((n_samples, t_max, int(num_bins)), np.nan, dtype=float)
-        iplus_full = np.full((n_samples, t_max, int(num_bins)), np.nan, dtype=float)
-        iminus_full = np.full((n_samples, t_max, int(num_bins)), np.nan, dtype=float)
+        ps_full = np.full((n_samples, t_max, int(num_bins)), np.nan, dtype=STORE_DTYPE)
+        iplus_full = np.full((n_samples, t_max, int(num_bins)), np.nan, dtype=STORE_DTYPE)
+        iminus_full = np.full((n_samples, t_max, int(num_bins)), np.nan, dtype=STORE_DTYPE)
 
     for j, (p0, g, n_burn) in enumerate(combos):
+        global_j = int(combo_offset) + j
         print(
-            f"  [{j + 1}/{n_samples}] P={p0:+.3f}  gamma={g:.3f}  n_steps={n_burn}",
+            f"  [{global_j + 1}/{total}] P={p0:+.3f}  gamma={g:.3f}  n_steps={n_burn}",
             flush=True,
         )
         traj = run_one_polarization(
@@ -541,50 +574,282 @@ def run_one_bin(
         n_steps[j] = n
         if n <= 0:
             continue
-        ps[j, :n] = traj["ps"]
-        iplus[j, :n] = traj["iplus"]
-        iminus[j, :n] = traj["iminus"]
-        ps_m[j, :n] = traj["ps_m"]
-        iplus_m[j, :n] = traj["iplus_m"]
-        iminus_m[j, :n] = traj["iminus_m"]
+        if ps is not None:
+            ps[j, :n] = traj["ps"]
+            iplus[j, :n] = traj["iplus"]
+            iminus[j, :n] = traj["iminus"]
+            ps_m[j, :n] = traj["ps_m"]
+            iplus_m[j, :n] = traj["iplus_m"]
+            iminus_m[j, :n] = traj["iminus_m"]
         if capture_spectrum and ps_full is not None:
             pf = traj.get("ps_full")
             if pf is not None:
-                pf_arr = np.asarray(pf, dtype=float)
-                ps_full[j, :n] = pf_arr[:n]
-                iplus_full[j, :n] = np.asarray(traj["iplus_full"], dtype=float)[:n]
-                iminus_full[j, :n] = np.asarray(traj["iminus_full"], dtype=float)[:n]
+                ps_full[j, :n] = np.asarray(pf, dtype=STORE_DTYPE)[:n]
+                iplus_full[j, :n] = np.asarray(traj["iplus_full"], dtype=STORE_DTYPE)[:n]
+                iminus_full[j, :n] = np.asarray(traj["iminus_full"], dtype=STORE_DTYPE)[:n]
 
     f = np.linspace(R_MIN, R_MAX, int(num_bins))
-    out = {
+    out: dict = {
         "bin_idx": bin_idx,
         "mirror_idx": mirror_idx,
         "R": float(f[bin_idx]),
         "num_bins": int(num_bins),
         "dt": float(dt),
-        "gamma_values": np.asarray(gamma_values, dtype=float),
-        "steps_values": np.asarray(steps_values, dtype=np.int32),
-        "max_burn_steps": int(np.max(steps_values)),
-        "rf_mode": str(rf_mode),
-        "gaussian_fwhm_R": float(gaussian_fwhm_R),
-        "lorentzian_fwhm_R": float(lorentzian_fwhm_R),
-        "diffusion_scale": float(diffusion_scale),
         "p_values": p_out,
         "gamma_rf": gamma_out,
         "burn_steps": burn_steps_out,
         "n_steps": n_steps,
         "skipped": skipped,
-        "ps": ps,
-        "iplus": iplus,
-        "iminus": iminus,
-        "ps_m": ps_m,
-        "iplus_m": iplus_m,
-        "iminus_m": iminus_m,
     }
+    if ps is not None:
+        out.update(
+            {
+                "ps": ps,
+                "iplus": iplus,
+                "iminus": iminus,
+                "ps_m": ps_m,
+                "iplus_m": iplus_m,
+                "iminus_m": iminus_m,
+            }
+        )
     if capture_spectrum:
         out["ps_full"] = ps_full
         out["iplus_full"] = iplus_full
         out["iminus_full"] = iminus_full
+    return out
+
+
+def save_ssrf_spectrum_in_batches(
+    bin_idx: int,
+    *,
+    combos: list[tuple[float, float, int]],
+    shard_dir: Path,
+    combo_batch_size: int,
+    num_bins: int,
+    dt: float,
+    rf_mode: str,
+    gaussian_fwhm_R: float,
+    lorentzian_fwhm_R: float,
+    diffusion_scale: float,
+    gamma_values: np.ndarray,
+    steps_values: np.ndarray,
+    extra_meta: dict,
+) -> dict:
+    """Generate spectrum shards in bounded-memory batches; write part NPZs + manifest."""
+    shard_dir = Path(shard_dir)
+    t_max = int(np.max(steps_values)) + 1
+    batch_size = max(1, int(combo_batch_size))
+    n_combos = len(combos)
+    n_batches = (n_combos + batch_size - 1) // batch_size
+    est_gib = _estimate_spectrum_batch_gib(
+        min(batch_size, n_combos), t_max, num_bins, spectrum_only=True
+    )
+    print(
+        f"  batching {n_combos} combos into {n_batches} part(s) "
+        f"(batch_size={batch_size}, est_peak~{est_gib:.2f} GiB ps_full)",
+        flush=True,
+    )
+
+    part_files: list[str] = []
+    for part_idx, start in enumerate(range(0, n_combos, batch_size)):
+        end = min(start + batch_size, n_combos)
+        batch = combos[start:end]
+        part_result = _run_one_bin_combos(
+            batch,
+            bin_idx,
+            t_max=t_max,
+            num_bins=num_bins,
+            dt=dt,
+            rf_mode=rf_mode,
+            gaussian_fwhm_R=gaussian_fwhm_R,
+            lorentzian_fwhm_R=lorentzian_fwhm_R,
+            diffusion_scale=diffusion_scale,
+            capture_spectrum=True,
+            spectrum_only=True,
+            combo_offset=start,
+            combo_total=n_combos,
+        )
+        part_result["gamma_values"] = np.asarray(gamma_values, dtype=float)
+        part_result["steps_values"] = np.asarray(steps_values, dtype=np.int32)
+        part_result["max_burn_steps"] = int(np.max(steps_values))
+        part_result["rf_mode"] = str(rf_mode)
+        part_result["gaussian_fwhm_R"] = float(gaussian_fwhm_R)
+        part_result["lorentzian_fwhm_R"] = float(lorentzian_fwhm_R)
+        part_result["diffusion_scale"] = float(diffusion_scale)
+        part_result["dataset"] = "ssrf_spectrum_bin_v2"
+        part_result["part_index"] = int(part_idx)
+        part_result["part_count"] = int(n_batches)
+
+        part_path = ssrf_spectrum_shard_part_path(shard_dir, bin_idx, part_idx)
+        save_ssrf_spectrum_shard(part_result, part_path, extra_meta=extra_meta)
+        part_files.append(part_path.name)
+        print(f"  wrote part {part_idx + 1}/{n_batches} -> {part_path.name}", flush=True)
+
+    manifest_path = ssrf_spectrum_shard_parts_manifest_path(shard_dir, bin_idx)
+    manifest = {
+        "bin_idx": int(bin_idx),
+        "n_samples": int(n_combos),
+        "n_parts": int(n_batches),
+        "part_files": part_files,
+        "combo_batch_size": int(batch_size),
+        "max_burn_steps": int(t_max - 1),
+    }
+    manifest_path.write_text(json.dumps(manifest, indent=2))
+    return {
+        "bin_idx": int(bin_idx),
+        "mirror_idx": mirror_bin_idx(int(num_bins), bin_idx),
+        "n_samples": int(n_combos),
+        "n_parts": int(n_batches),
+        "manifest": str(manifest_path),
+        "p_values": np.array([c[0] for c in combos], dtype=float),
+        "n_steps": np.zeros(n_combos, dtype=np.int32),
+    }
+
+
+def save_ssrf_traj_in_batches(
+    bin_idx: int,
+    *,
+    combos: list[tuple[float, float, int]],
+    shard_dir: Path,
+    combo_batch_size: int,
+    num_bins: int,
+    dt: float,
+    rf_mode: str,
+    gaussian_fwhm_R: float,
+    lorentzian_fwhm_R: float,
+    diffusion_scale: float,
+    gamma_values: np.ndarray,
+    steps_values: np.ndarray,
+    extra_meta: dict,
+) -> dict:
+    """Generate plain (non-spectrum) trajectory shards in bounded-memory
+    batches; write part NPZs + manifest. Mirrors ``save_ssrf_spectrum_in_batches``
+    but for the ps/iplus/iminus (+ mirror) center-bin arrays only -- these are
+    what blow up peak RAM once ``steps_values`` reaches into the tens of
+    thousands, even without --spectrum-mode.
+    """
+    shard_dir = Path(shard_dir)
+    t_max = int(np.max(steps_values)) + 1
+    batch_size = max(1, int(combo_batch_size))
+    n_combos = len(combos)
+    n_batches = (n_combos + batch_size - 1) // batch_size
+    est_gib = _estimate_spectrum_batch_gib(
+        min(batch_size, n_combos), t_max, num_bins, spectrum_only=False, capture_spectrum=False
+    )
+    print(
+        f"  batching {n_combos} combos into {n_batches} part(s) "
+        f"(batch_size={batch_size}, est_peak~{est_gib:.2f} GiB trajectories)",
+        flush=True,
+    )
+
+    part_files: list[str] = []
+    for part_idx, start in enumerate(range(0, n_combos, batch_size)):
+        end = min(start + batch_size, n_combos)
+        batch = combos[start:end]
+        part_result = _run_one_bin_combos(
+            batch,
+            bin_idx,
+            t_max=t_max,
+            num_bins=num_bins,
+            dt=dt,
+            rf_mode=rf_mode,
+            gaussian_fwhm_R=gaussian_fwhm_R,
+            lorentzian_fwhm_R=lorentzian_fwhm_R,
+            diffusion_scale=diffusion_scale,
+            capture_spectrum=False,
+            spectrum_only=False,
+            combo_offset=start,
+            combo_total=n_combos,
+        )
+        part_result["gamma_values"] = np.asarray(gamma_values, dtype=float)
+        part_result["steps_values"] = np.asarray(steps_values, dtype=np.int32)
+        part_result["max_burn_steps"] = int(np.max(steps_values))
+        part_result["rf_mode"] = str(rf_mode)
+        part_result["gaussian_fwhm_R"] = float(gaussian_fwhm_R)
+        part_result["lorentzian_fwhm_R"] = float(lorentzian_fwhm_R)
+        part_result["diffusion_scale"] = float(diffusion_scale)
+
+        part_path = ssrf_shard_part_path(shard_dir, bin_idx, part_idx)
+        save_ssrf_shard(part_result, part_path, extra_meta=extra_meta)
+        part_files.append(part_path.name)
+        print(f"  wrote part {part_idx + 1}/{n_batches} -> {part_path.name}", flush=True)
+
+    manifest_path = ssrf_shard_parts_manifest_path(shard_dir, bin_idx)
+    manifest = {
+        "bin_idx": int(bin_idx),
+        "n_samples": int(n_combos),
+        "n_parts": int(n_batches),
+        "part_files": part_files,
+        "combo_batch_size": int(batch_size),
+        "max_burn_steps": int(t_max - 1),
+    }
+    manifest_path.write_text(json.dumps(manifest, indent=2))
+    return {
+        "bin_idx": int(bin_idx),
+        "mirror_idx": mirror_bin_idx(int(num_bins), bin_idx),
+        "n_samples": int(n_combos),
+        "n_parts": int(n_batches),
+        "manifest": str(manifest_path),
+        "p_values": np.array([c[0] for c in combos], dtype=float),
+        "n_steps": np.zeros(n_combos, dtype=np.int32),
+    }
+
+
+def run_one_bin(
+    bin_idx: int,
+    *,
+    p_values: np.ndarray,
+    gamma_values: np.ndarray | None = None,
+    steps_values: np.ndarray | None = None,
+    num_bins: int = NUM_BINS,
+    dt: float = DT,
+    rf_mode: str = RF_MODE,
+    gaussian_fwhm_R: float = RF_GAUSSIAN_FWHM_R,
+    lorentzian_fwhm_R: float = RF_LORENTZIAN_FWHM_R,
+    diffusion_scale: float = DIFFUSION_SCALE,
+    capture_spectrum: bool = False,
+) -> dict:
+    """Cartesian product over P × gamma_rf × burn_steps for one burn bin."""
+    bin_idx = int(bin_idx)
+    if bin_idx < 0 or bin_idx >= int(num_bins):
+        raise ValueError(f"bin_idx={bin_idx} out of range for num_bins={num_bins}")
+
+    p_values = np.asarray(p_values, dtype=float)
+    gamma_values = (
+        gamma_rf_grid()
+        if gamma_values is None
+        else np.asarray(gamma_values, dtype=float)
+    )
+    steps_values = (
+        burn_steps_grid()
+        if steps_values is None
+        else np.asarray(steps_values, dtype=np.int32)
+    )
+    if gamma_values.size == 0 or steps_values.size == 0 or p_values.size == 0:
+        raise ValueError("p_values, gamma_values, and steps_values must be non-empty")
+
+    combos = _build_combos(p_values, gamma_values, steps_values)
+    t_max = int(np.max(steps_values)) + 1
+    out = _run_one_bin_combos(
+        combos,
+        bin_idx,
+        t_max=t_max,
+        num_bins=num_bins,
+        dt=dt,
+        rf_mode=rf_mode,
+        gaussian_fwhm_R=gaussian_fwhm_R,
+        lorentzian_fwhm_R=lorentzian_fwhm_R,
+        diffusion_scale=diffusion_scale,
+        capture_spectrum=capture_spectrum,
+        spectrum_only=False,
+    )
+    out["gamma_values"] = np.asarray(gamma_values, dtype=float)
+    out["steps_values"] = np.asarray(steps_values, dtype=np.int32)
+    out["max_burn_steps"] = int(np.max(steps_values))
+    out["rf_mode"] = str(rf_mode)
+    out["gaussian_fwhm_R"] = float(gaussian_fwhm_R)
+    out["lorentzian_fwhm_R"] = float(lorentzian_fwhm_R)
+    out["diffusion_scale"] = float(diffusion_scale)
     return out
 
 
@@ -798,6 +1063,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=UNMANIP_TRAIN_FRACTION,
         help="Fraction of unmanipulated equilibrium samples (spectrum mode)",
     )
+    p.add_argument(
+        "--combo-batch-size",
+        type=int,
+        default=None,
+        help=(
+            "Max P×gamma×steps combos per in-memory batch (writes part NPZs "
+            "when the grid is larger). Defaults to "
+            f"{DEFAULT_SSRF_COMBO_BATCH_SIZE} in --spectrum-mode (full cube per "
+            f"combo) or {DEFAULT_SSRF_TRAJ_COMBO_BATCH_SIZE} otherwise "
+            "(center-bin arrays only per combo)"
+        ),
+    )
     p.add_argument("--seed", type=int, default=SEED)
     p.add_argument("--skip-if-exists", action="store_true")
     p.add_argument("--strict", action="store_true")
@@ -833,9 +1110,13 @@ def main(argv: list[str] | None = None) -> None:
         if args.spectrum_mode
         else ssrf_shard_path(args.shard_dir, bin_idx)
     )
-    if args.skip_if_exists and out.is_file():
-        print(f"Skipping existing shard {out}", flush=True)
-        return
+    if args.skip_if_exists:
+        if args.spectrum_mode and ssrf_spectrum_shard_complete(args.shard_dir, bin_idx):
+            print(f"Skipping existing spectrum shard(s) for bin {bin_idx}", flush=True)
+            return
+        if not args.spectrum_mode and ssrf_shard_complete(args.shard_dir, bin_idx):
+            print(f"Skipping existing shard(s) for bin {bin_idx}", flush=True)
+            return
 
     shape = get_shape_params()
     print_shape_banner(shape, num_bins=int(args.num_bins))
@@ -844,10 +1125,28 @@ def main(argv: list[str] | None = None) -> None:
     g_values = gamma_rf_grid(args.gamma_min, args.gamma_max, args.gamma_step)
     s_values = burn_steps_grid(args.steps_min, args.steps_max, args.steps_step)
     n_combos = int(p_values.size * g_values.size * s_values.size)
+    if args.combo_batch_size is None:
+        default_batch = (
+            DEFAULT_SSRF_COMBO_BATCH_SIZE
+            if args.spectrum_mode
+            else DEFAULT_SSRF_TRAJ_COMBO_BATCH_SIZE
+        )
+    else:
+        default_batch = int(args.combo_batch_size)
+    combo_batch_size = max(1, default_batch)
+    t_max = int(np.max(s_values)) + 1 if s_values.size else 1
+    est_full_gib = _estimate_spectrum_batch_gib(
+        n_combos,
+        t_max,
+        args.num_bins,
+        spectrum_only=bool(args.spectrum_mode),
+        capture_spectrum=bool(args.spectrum_mode),
+    )
     print(
         f"bin_idx={bin_idx}  n_P={p_values.size}  n_gamma={g_values.size}  "
         f"n_steps_grid={s_values.size}  n_combos={n_combos}  "
-        f"spectrum_mode={bool(args.spectrum_mode)}  "
+        f"spectrum_mode={bool(args.spectrum_mode)}  combo_batch_size={combo_batch_size}  "
+        f"est_monolithic~{est_full_gib:.1f} GiB  "
         f"random_samples={int(args.random_samples)}  multi_burn={bool(args.multi_burn)}  "
         f"unmanip_fraction={float(args.unmanip_fraction):.3f}  "
         f"P=[{args.p_min},{args.p_max}] step={args.p_step}  "
@@ -858,7 +1157,48 @@ def main(argv: list[str] | None = None) -> None:
         f"diffusion={args.diffusion_scale}",
         flush=True,
     )
+    extra_meta = shape_meta(
+        shape,
+        rf_mode=str(args.rf_mode),
+        gaussian_fwhm_R=float(args.gauss_fwhm),
+        lorentzian_fwhm_R=float(args.lorentz_fwhm),
+        diffusion_scale=float(args.diffusion_scale),
+    )
     if args.spectrum_mode:
+        use_batches = n_combos > combo_batch_size
+        if use_batches and (
+            int(args.random_samples) > 0 or bool(args.multi_burn) or float(args.unmanip_fraction) > 0
+        ):
+            print(
+                "WARNING: batched spectrum generation supports the base grid only; "
+                "random/multi-burn/unmanip extras are skipped. "
+                "Lower combo count or increase --combo-batch-size to use run_one_bin_spectrum.",
+                flush=True,
+            )
+        if use_batches:
+            combos = _build_combos(p_values, g_values, s_values)
+            result = save_ssrf_spectrum_in_batches(
+                bin_idx,
+                combos=combos,
+                shard_dir=args.shard_dir,
+                combo_batch_size=combo_batch_size,
+                num_bins=args.num_bins,
+                dt=args.dt,
+                rf_mode=str(args.rf_mode),
+                gaussian_fwhm_R=float(args.gauss_fwhm),
+                lorentzian_fwhm_R=float(args.lorentz_fwhm),
+                diffusion_scale=float(args.diffusion_scale),
+                gamma_values=g_values,
+                steps_values=s_values,
+                extra_meta=extra_meta,
+            )
+            print(
+                f"Wrote {result['n_parts']} part shard(s) + manifest for bin {bin_idx}  "
+                f"n_samples={result['n_samples']}",
+                flush=True,
+            )
+            return
+
         result = run_one_bin_spectrum(
             bin_idx,
             p_values=p_values,
@@ -882,15 +1222,33 @@ def main(argv: list[str] | None = None) -> None:
         save_ssrf_spectrum_shard(
             result,
             out,
-            extra_meta=shape_meta(
-                shape,
+            extra_meta=extra_meta,
+        )
+    else:
+        if n_combos > combo_batch_size:
+            combos = _build_combos(p_values, g_values, s_values)
+            result = save_ssrf_traj_in_batches(
+                bin_idx,
+                combos=combos,
+                shard_dir=args.shard_dir,
+                combo_batch_size=combo_batch_size,
+                num_bins=args.num_bins,
+                dt=args.dt,
                 rf_mode=str(args.rf_mode),
                 gaussian_fwhm_R=float(args.gauss_fwhm),
                 lorentzian_fwhm_R=float(args.lorentz_fwhm),
                 diffusion_scale=float(args.diffusion_scale),
-            ),
-        )
-    else:
+                gamma_values=g_values,
+                steps_values=s_values,
+                extra_meta=extra_meta,
+            )
+            print(
+                f"Wrote {result['n_parts']} part shard(s) + manifest for bin {bin_idx}  "
+                f"n_samples={result['n_samples']}",
+                flush=True,
+            )
+            return
+
         result = run_one_bin(
             bin_idx,
             p_values=p_values,

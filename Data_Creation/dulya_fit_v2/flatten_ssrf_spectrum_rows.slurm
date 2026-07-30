@@ -1,32 +1,31 @@
 #!/bin/bash
-# Dulya-fit v2 unmanipulated lineshape array — one spectral bin per task.
+# Flatten one ssRF spectrum shard per array task into row-oriented NPZs.
+#
+# Run after ssrf_spectrum_array.slurm (or ssrf_traj_array.slurm --spectrum-mode):
+#   SSRF_ID=$(sbatch --parsable ssrf_spectrum_array.slurm)
+#   sbatch --dependency=afterok:${SSRF_ID} flatten_ssrf_spectrum_rows.slurm
 #
 # Submit from THIS directory (dulya_fit_v2/):
-#   sbatch unmanipulated_bin_array.slurm
-#
-# Then flatten to row NPZ for combine_spectrum_rows.slurm:
-#   sbatch --dependency=afterok:${ARRAY_JOB_ID} flatten_unmanip_spectrum_rows.slurm
+#   sbatch flatten_ssrf_spectrum_rows.slurm
 
-#SBATCH --job-name=dulya-v2-unmanip-bin
+#SBATCH --job-name=dulya-v2-flatten-ssrf-rows
 #SBATCH --array=0-499
 #SBATCH --partition=standard
 #SBATCH -A spinquest_standard
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --output=slurm_logs/unmanip_bin_%A_%a.out
-#SBATCH --error=slurm_logs/unmanip_bin_%A_%a.err
-#SBATCH --time=00:30:00
+#SBATCH --output=slurm_logs/flatten_ssrf_rows_%A_%a.out
+#SBATCH --error=slurm_logs/flatten_ssrf_rows_%A_%a.err
+#SBATCH --time=04:00:00
 #SBATCH --cpus-per-task=2
-#SBATCH --mem=2G
+#SBATCH --mem=16G
 
 set -euo pipefail
 
 PKG_DIR="${SLURM_SUBMIT_DIR:-$(cd "$(dirname "$0")" && pwd)}"
-OUTPUT_DIR="${OUTPUT_DIR:-data/unmanip_train}"
+SHARD_DIR="${SHARD_DIR:-data/ssrf_shards}"
+OUTPUT_DIR="${OUTPUT_DIR:-data/ssrf_spectrum_rows}"
 NUM_BINS="${NUM_BINS:-500}"
-P_MIN="${P_MIN:--0.9}"
-P_MAX="${P_MAX:-0.9}"
-P_STEP="${P_STEP:-0.05}"
 
 cd "${PKG_DIR}"
 
@@ -51,17 +50,15 @@ if [[ -z "${SLURM_ARRAY_TASK_ID:-}" ]]; then
   exit 1
 fi
 
-echo "Dulya v2 unmanipulated bin ${SLURM_ARRAY_TASK_ID} on $(hostname)"
-echo "Pkg dir: ${PKG_DIR}"
+echo "Flatten ssRF spectrum rows bin ${SLURM_ARRAY_TASK_ID} shard=${SHARD_DIR} -> ${OUTPUT_DIR}"
 
 apptainer run --bind "${PKG_DIR}:${PKG_DIR}" --pwd "${PKG_DIR}" \
   "${CONTAINERDIR}/pytorch-2.9.0.sif" \
-  unmanipulated_bin_lineshape.py \
+  flatten_spectrum_rows.py \
+  --source ssrf \
   --bin-idx "${SLURM_ARRAY_TASK_ID}" \
+  --shard-dir "${SHARD_DIR}" \
   --output-dir "${OUTPUT_DIR}" \
   --num-bins "${NUM_BINS}" \
-  --p-min "${P_MIN}" \
-  --p-max "${P_MAX}" \
-  --p-step "${P_STEP}" \
   --skip-if-exists \
   "$@"

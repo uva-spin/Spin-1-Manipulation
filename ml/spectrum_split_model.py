@@ -41,6 +41,7 @@ if str(DULYA_V2) not in sys.path:
     sys.path.insert(0, str(DULYA_V2))
 
 import _bootstrap  # noqa: F401
+from bin_io import SPECTRUM_TRAIN_MANIFEST_NAME
 from bin_setup import equilibrium_lineshape, get_shape_params, spin1_scale_factors
 from common import F_MAX, F_MIN, NUM_BINS
 from lineshape import GenerateDulyaLineshape
@@ -339,6 +340,164 @@ class SpectrumSplitModel:
         return iplus, iminus
 
 
+def _build_sample(
+    ps: np.ndarray,
+    iplus: np.ndarray,
+    iminus: np.ndarray,
+    p0: float,
+    *,
+    use_residual: bool,
+    normalize_mode: str,
+    shape_params: dict[str, float],
+) -> dict[str, torch.Tensor]:
+    ps_norm, scale = normalize_ps(ps, mode=normalize_mode)
+    alpha = alpha_from_intensities(ps, iplus, iminus).astype(np.float32)
+    x_np = build_input_channels(
+        ps_norm.reshape(1, -1),
+        use_residual=use_residual,
+        p0_batch=np.asarray([p0], dtype=np.float32),
+        shape_params=shape_params,
+    )[0]
+    return {
+        "x": torch.from_numpy(x_np).float(),
+        "ps": torch.from_numpy(ps_norm).float(),
+        "alpha": torch.from_numpy(alpha).float(),
+        "iplus": torch.from_numpy(np.asarray(iplus, dtype=np.float32) / max(scale, 1e-30)).float(),
+        "iminus": torch.from_numpy(np.asarray(iminus, dtype=np.float32) / max(scale, 1e-30)).float(),
+        "scale": torch.tensor(float(scale), dtype=torch.float32),
+    }
+
+
+def is_sharded_source(path: Path) -> bool:
+    path = Path(path)
+    return path.is_dir() or path.name == SPECTRUM_TRAIN_MANIFEST_NAME
+
+
+def discover_spectrum_shards(path: Path) -> list[Path]:
+    """Resolve --data into shard NPZ paths (single file, manifest, or glob)."""
+    path = Path(path)
+    if path.is_file() and path.name != SPECTRUM_TRAIN_MANIFEST_NAME:
+        return [path]
+
+    manifest_path = path / SPECTRUM_TRAIN_MANIFEST_NAME if path.is_dir() else path
+    if manifest_path.is_file():
+        manifest = json.loads(manifest_path.read_text())
+        shard_dir = manifest_path.parent
+        return [shard_dir / name for name in manifest["shard_files"]]
+
+    if path.is_dir():
+        shards = sorted(path.glob("spectrum_train_*.npz"))
+        if shards:
+            return shards
+
+    raise FileNotFoundError(f"No spectrum shards found at {path}")
+
+
+def read_light_columns(shard_paths: list[Path]) -> dict[str, np.ndarray]:
+    """Load p0/source (and shard row indices) without reading ps/iplus/iminus."""
+    p0_parts: list[np.ndarray] = []
+    source_parts: list[np.ndarray] = []
+    shard_id_parts: list[np.ndarray] = []
+    local_idx_parts: list[np.ndarray] = []
+    for shard_id, path in enumerate(shard_paths):
+        with np.load(path, allow_pickle=False) as npz:
+            p0 = np.asarray(npz["p0"], dtype=np.float32)
+            source = (
+                np.asarray(npz["source"], dtype=np.uint8)
+                if "source" in npz.files
+                else np.zeros(p0.shape[0], dtype=np.uint8)
+            )
+        n = int(p0.shape[0])
+        p0_parts.append(p0)
+        source_parts.append(source)
+        shard_id_parts.append(np.full(n, shard_id, dtype=np.int32))
+        local_idx_parts.append(np.arange(n, dtype=np.int64))
+    return {
+        "p0": np.concatenate(p0_parts),
+        "source": np.concatenate(source_parts),
+        "shard_id": np.concatenate(shard_id_parts),
+        "local_idx": np.concatenate(local_idx_parts),
+    }
+
+
+def row_mask_by_shard(
+    shard_id: np.ndarray,
+    local_idx: np.ndarray,
+    shard_row_counts: list[int],
+    selected: np.ndarray,
+) -> dict[int, np.ndarray]:
+    sel_shard_id = shard_id[selected]
+    sel_local_idx = local_idx[selected]
+    masks: dict[int, np.ndarray] = {}
+    for sid, count in enumerate(shard_row_counts):
+        rows = sel_local_idx[sel_shard_id == sid]
+        if rows.size == 0:
+            continue
+        mask = np.zeros(int(count), dtype=bool)
+        mask[rows] = True
+        masks[sid] = mask
+    return masks
+
+
+class ShardedSpectrumDataset(data.IterableDataset):
+    """Iterable dataset over sharded spectrum_train NPZs."""
+
+    def __init__(
+        self,
+        shard_paths: list[Path],
+        row_mask_by_shard: dict[int, np.ndarray],
+        *,
+        use_residual: bool,
+        normalize_mode: str = "max",
+        shape_params: dict[str, float] | None = None,
+        shuffle: bool = True,
+        seed: int = SEED,
+    ):
+        self.shard_paths = list(shard_paths)
+        self.row_mask_by_shard = row_mask_by_shard
+        self.use_residual = bool(use_residual)
+        self.normalize_mode = str(normalize_mode)
+        self.shape_params = shape_params if shape_params is not None else get_shape_params()
+        self.shuffle = bool(shuffle)
+        self.seed = int(seed)
+        self._epoch = 0
+
+    def __len__(self) -> int:
+        return int(sum(int(mask.sum()) for mask in self.row_mask_by_shard.values()))
+
+    def __iter__(self):
+        worker = data.get_worker_info()
+        shard_ids = list(self.row_mask_by_shard.keys())
+        self._epoch += 1
+        if self.shuffle:
+            np.random.default_rng(self.seed + self._epoch).shuffle(shard_ids)
+        if worker is not None:
+            shard_ids = shard_ids[worker.id :: worker.num_workers]
+
+        for shard_id in shard_ids:
+            mask = self.row_mask_by_shard[shard_id]
+            with np.load(self.shard_paths[shard_id], allow_pickle=False) as npz:
+                ps = np.asarray(npz["ps"], dtype=np.float32)[mask]
+                iplus = np.asarray(npz["iplus"], dtype=np.float32)[mask]
+                iminus = np.asarray(npz["iminus"], dtype=np.float32)[mask]
+                p0 = np.asarray(npz["p0"], dtype=np.float32)[mask]
+
+            order = np.arange(ps.shape[0])
+            if self.shuffle:
+                np.random.default_rng(self.seed + self._epoch + shard_id).shuffle(order)
+
+            for j in order:
+                yield _build_sample(
+                    ps[j],
+                    iplus[j],
+                    iminus[j],
+                    float(p0[j]),
+                    use_residual=self.use_residual,
+                    normalize_mode=self.normalize_mode,
+                    shape_params=self.shape_params,
+                )
+
+
 def load_spectrum_npz(path: Path) -> dict[str, np.ndarray]:
     path = Path(path)
     with np.load(path, allow_pickle=False) as data:
@@ -375,23 +534,15 @@ class SpectrumDataset(data.Dataset):
 
     def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
         j = int(self.indices[idx])
-        ps = self.ps[j]
-        ps_norm, scale = normalize_ps(ps, mode=self.normalize_mode)
-        alpha = alpha_from_intensities(ps, self.iplus[j], self.iminus[j]).astype(np.float32)
-        x_np = build_input_channels(
-            ps_norm.reshape(1, -1),
+        return _build_sample(
+            self.ps[j],
+            self.iplus[j],
+            self.iminus[j],
+            float(self.p0[j]),
             use_residual=self.use_residual,
-            p0_batch=np.asarray([self.p0[j]], dtype=np.float32),
+            normalize_mode=self.normalize_mode,
             shape_params=self.shape_params,
-        )[0]
-        return {
-            "x": torch.from_numpy(x_np).float(),
-            "ps": torch.from_numpy(ps_norm).float(),
-            "alpha": torch.from_numpy(alpha).float(),
-            "iplus": torch.from_numpy(self.iplus[j] / max(scale, 1e-30)).float(),
-            "iminus": torch.from_numpy(self.iminus[j] / max(scale, 1e-30)).float(),
-            "scale": torch.tensor(float(scale), dtype=torch.float32),
-        }
+        )
 
 
 def polarization_train_holdout_split(p0: np.ndarray, fraction: float = TRAIN_POLARIZATION_FRACTION) -> tuple[np.ndarray, np.ndarray]:
@@ -415,17 +566,45 @@ def train_model(
     batch_size: int = BATCH_SIZE,
     learning_rate: float = LEARNING_RATE,
 ) -> dict[str, Any]:
-    arrays = load_spectrum_npz(data_path)
-    train_idx, holdout_idx = polarization_train_holdout_split(arrays["p0"])
+    data_path = Path(data_path)
     in_channels = 2 if use_residual else 1
-    net = SpectrumSplitNet(in_channels=in_channels, num_bins=int(arrays["ps"].shape[1])).to(DEVICE)
 
-    train_ds = SpectrumDataset(arrays, train_idx, use_residual=use_residual)
-    holdout_ds = SpectrumDataset(arrays, holdout_idx, use_residual=use_residual) if holdout_idx.size else None
-    train_loader = data.DataLoader(train_ds, batch_size=batch_size, shuffle=True)
-    holdout_loader = (
-        data.DataLoader(holdout_ds, batch_size=batch_size, shuffle=False) if holdout_ds else None
-    )
+    if is_sharded_source(data_path):
+        shard_paths = discover_spectrum_shards(data_path)
+        light = read_light_columns(shard_paths)
+        shard_row_counts = np.bincount(light["shard_id"], minlength=len(shard_paths)).tolist()
+        train_sel, holdout_sel = polarization_train_holdout_split(light["p0"])
+        train_masks = row_mask_by_shard(light["shard_id"], light["local_idx"], shard_row_counts, train_sel)
+        holdout_masks = row_mask_by_shard(light["shard_id"], light["local_idx"], shard_row_counts, holdout_sel)
+
+        with np.load(shard_paths[0], allow_pickle=False) as npz:
+            num_bins = int(npz["ps"].shape[1])
+        net = SpectrumSplitNet(in_channels=in_channels, num_bins=num_bins).to(DEVICE)
+
+        train_ds = ShardedSpectrumDataset(shard_paths, train_masks, use_residual=use_residual, shuffle=True)
+        holdout_ds = (
+            ShardedSpectrumDataset(shard_paths, holdout_masks, use_residual=use_residual, shuffle=False)
+            if holdout_masks
+            else None
+        )
+        train_loader = data.DataLoader(train_ds, batch_size=batch_size)
+        holdout_loader = data.DataLoader(holdout_ds, batch_size=batch_size) if holdout_ds is not None else None
+        n_train, n_holdout = len(train_ds), (len(holdout_ds) if holdout_ds is not None else 0)
+        train_idx, holdout_idx = None, None
+    else:
+        arrays = load_spectrum_npz(data_path)
+        train_sel, holdout_sel = polarization_train_holdout_split(arrays["p0"])
+        num_bins = int(arrays["ps"].shape[1])
+        net = SpectrumSplitNet(in_channels=in_channels, num_bins=num_bins).to(DEVICE)
+
+        train_ds = SpectrumDataset(arrays, train_sel, use_residual=use_residual)
+        holdout_ds = SpectrumDataset(arrays, holdout_sel, use_residual=use_residual) if holdout_sel.size else None
+        train_loader = data.DataLoader(train_ds, batch_size=batch_size, shuffle=True)
+        holdout_loader = (
+            data.DataLoader(holdout_ds, batch_size=batch_size, shuffle=False) if holdout_ds else None
+        )
+        n_train, n_holdout = int(train_sel.size), int(holdout_sel.size)
+        train_idx, holdout_idx = train_sel, holdout_sel
 
     optimizer = optim.Adam(net.parameters(), lr=learning_rate, weight_decay=WEIGHT_DECAY)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=5, factor=0.5)
@@ -500,7 +679,7 @@ def train_model(
         "state_dict": net.state_dict(),
         "in_channels": in_channels,
         "use_residual": use_residual,
-        "num_bins": int(arrays["ps"].shape[1]),
+        "num_bins": num_bins,
         "normalize_mode": "max",
         "shape_params": get_shape_params(),
         "train_indices": train_idx,
@@ -508,7 +687,7 @@ def train_model(
         "best_val_loss": best_loss,
     }
     torch.save(payload, output_path)
-    return {"output": str(output_path), "best_val_loss": best_loss, "n_train": int(train_idx.size), "n_holdout": int(holdout_idx.size)}
+    return {"output": str(output_path), "best_val_loss": best_loss, "n_train": n_train, "n_holdout": n_holdout}
 
 
 def load_trained_model(path: Path, device: torch.device | None = None) -> SpectrumSplitModel:
@@ -535,7 +714,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     sub = p.add_subparsers(dest="command", required=True)
 
     train_p = sub.add_parser("train", help="Train SpectrumSplitNet")
-    train_p.add_argument("--data", type=Path, default=DEFAULT_DATA)
+    train_p.add_argument(
+        "--data",
+        type=Path,
+        default=DEFAULT_DATA,
+        help="Single spectrum_train.npz, or a sharded output directory/manifest",
+    )
     train_p.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
     train_p.add_argument("--no-residual", action="store_true", help="Disable delta_Ps channel")
     train_p.add_argument("--epochs", type=int, default=NUM_EPOCHS)

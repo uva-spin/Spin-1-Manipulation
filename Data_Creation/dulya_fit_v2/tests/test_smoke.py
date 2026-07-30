@@ -18,16 +18,22 @@ from afp_bin_traj import run_one_bin_spectrum as run_afp_spectrum_bin
 from afp_bin_traj import run_one_polarization as run_afp_one
 from bin_io import (
     afp_shard_path,
+    afp_spectrum_shard_path,
     load_ssrf_shard,
     organize_ssrf_shards,
+    save_afp_shard,
     save_afp_spectrum_shard,
     save_ssrf_shard,
     save_ssrf_spectrum_shard,
     ssrf_shard_path,
     ssrf_spectrum_shard_path,
     ssrf_train_bin_path,
+    validate_ps_iplus_iminus,
 )
+from combine_bin_events_simple import combine_bin_events
+from combine_spectrum_rows import combine_spectrum_row_dirs
 from combine_spectrum_train import combine_spectrum_shards
+from flatten_spectrum_rows import flatten_one_bin, flatten_unmanipulated_rows
 from bin_setup import equilibrium_lineshape, generate_unmanipulated_cube, get_shape_params
 from common import (
     DEMO_BURN_BIN,
@@ -40,6 +46,8 @@ from common import (
     RF_MODE,
     RF_MODE_PHYSICAL_VOIGT,
     RF_MODE_SINGLE_BIN,
+    SOURCE_AFP,
+    SOURCE_SSRF,
     SOURCE_UNMANIP,
 )
 from model_bridge import build_spin1_model, configure_ssrf_burn
@@ -340,6 +348,339 @@ def test_combine_spectrum_train_smoke(tmp_path: Path) -> None:
         ps = np.asarray(data["ps"], dtype=float)
         assert np.any(source == SOURCE_UNMANIP)
         assert ps.shape[1] == n_bins
+
+
+def test_combine_spectrum_train_streaming_matches_single_file(tmp_path: Path) -> None:
+    n_bins = 8
+    smoke_bin = 3
+    ssrf_dir = tmp_path / "ssrf_spec"
+    afp_dir = tmp_path / "afp_spec"
+    unmanip_dir = tmp_path / "unmanip"
+    ssrf_dir.mkdir()
+    afp_dir.mkdir()
+    unmanip_dir.mkdir()
+
+    ssrf_res = run_ssrf_spectrum_bin(
+        smoke_bin,
+        p_values=SMOKE_P[:1],
+        gamma_values=np.array([1.0], dtype=float),
+        steps_values=np.array([10], dtype=np.int32),
+        num_bins=n_bins,
+        unmanip_fraction=0.0,
+    )
+    save_ssrf_spectrum_shard(ssrf_res, ssrf_shard_path(ssrf_dir, smoke_bin))
+
+    afp_res = run_afp_spectrum_bin(
+        smoke_bin,
+        p_values=SMOKE_P[:1],
+        num_bins=n_bins,
+        n_relax=20,
+        unmanip_fraction=0.0,
+    )
+    save_afp_spectrum_shard(afp_res, afp_shard_path(afp_dir, smoke_bin))
+
+    shape = get_shape_params()
+    cube = generate_unmanipulated_cube(
+        num_bins=n_bins,
+        p_min=float(SMOKE_P.min()),
+        p_max=float(SMOKE_P.max()),
+        p_step=0.3,
+        shape_params=shape,
+    )
+    for bin_idx in range(n_bins):
+        save_unmanip_bin(
+            bin_idx,
+            p_values=cube["p_values"],
+            ps=cube["ps"][:, bin_idx],
+            iplus=cube["iplus"][:, bin_idx],
+            iminus=cube["iminus"][:, bin_idx],
+            amp=cube["amp"][:, bin_idx],
+            R=float(cube["R"][bin_idx]),
+            path=unmanip_bin_path(unmanip_dir, bin_idx),
+            p_min=float(SMOKE_P.min()),
+            p_max=float(SMOKE_P.max()),
+            p_step=0.3,
+            num_bins=n_bins,
+            shape_params=shape,
+        )
+
+    single_out = tmp_path / "single" / "spectrum_train.npz"
+    single_result = combine_spectrum_shards(
+        ssrf_dir,
+        afp_dir,
+        single_out,
+        unmanip_dir=unmanip_dir,
+        num_bins=n_bins,
+        strict=False,
+        shard_size=0,
+    )
+
+    shard_out_dir = tmp_path / "sharded"
+    shard_out_dir.mkdir()
+    shard_result = combine_spectrum_shards(
+        ssrf_dir,
+        afp_dir,
+        shard_out_dir / "spectrum_train.npz",
+        unmanip_dir=unmanip_dir,
+        num_bins=n_bins,
+        strict=False,
+        shard_size=3,
+    )
+
+    assert shard_result["n_samples"] == single_result["n_samples"]
+    assert shard_result["n_ssrf"] == single_result["n_ssrf"]
+    assert shard_result["n_afp"] == single_result["n_afp"]
+    assert shard_result["n_unmanip"] == single_result["n_unmanip"]
+    assert shard_result["n_filtered_empty"] == single_result["n_filtered_empty"]
+
+    manifest_path = shard_out_dir / "spectrum_train_manifest.json"
+    assert manifest_path.is_file()
+    manifest = json.loads(manifest_path.read_text())
+    assert manifest["n_samples"] == single_result["n_samples"]
+    assert sum(manifest["shard_row_counts"]) == manifest["n_samples"]
+    assert len(manifest["shard_files"]) == manifest["n_shards"]
+    for shard_file, count in zip(manifest["shard_files"], manifest["shard_row_counts"]):
+        assert (shard_out_dir / shard_file).is_file()
+        assert count <= 3
+
+    with np.load(single_out, allow_pickle=False) as data:
+        single_ps = np.asarray(data["ps"], dtype=float)
+        single_source = np.asarray(data["source"], dtype=np.uint8)
+
+    sharded_ps_parts = []
+    sharded_source_parts = []
+    for shard_file in manifest["shard_files"]:
+        with np.load(shard_out_dir / shard_file, allow_pickle=False) as data:
+            sharded_ps_parts.append(np.asarray(data["ps"], dtype=float))
+            sharded_source_parts.append(np.asarray(data["source"], dtype=np.uint8))
+    sharded_ps = np.concatenate(sharded_ps_parts, axis=0)
+    sharded_source = np.concatenate(sharded_source_parts, axis=0)
+
+    assert sharded_ps.shape == single_ps.shape
+    np.testing.assert_allclose(np.sort(single_ps.sum(axis=1)), np.sort(sharded_ps.sum(axis=1)))
+    assert sorted(single_source.tolist()) == sorted(sharded_source.tolist())
+
+
+def test_combine_spectrum_rows_smoke(tmp_path: Path) -> None:
+    n_bins = 8
+    smoke_bin = 3
+    ssrf_dir = tmp_path / "ssrf_spec"
+    afp_dir = tmp_path / "afp_spec"
+    ssrf_rows_dir = tmp_path / "ssrf_rows"
+    afp_rows_dir = tmp_path / "afp_rows"
+    unmanip_rows_dir = tmp_path / "unmanip_rows"
+    unmanip_dir = tmp_path / "unmanip"
+    for d in (ssrf_dir, afp_dir, ssrf_rows_dir, afp_rows_dir, unmanip_rows_dir, unmanip_dir):
+        d.mkdir()
+
+    ssrf_res = run_ssrf_spectrum_bin(
+        smoke_bin,
+        p_values=SMOKE_P[:1],
+        gamma_values=np.array([1.0], dtype=float),
+        steps_values=np.array([10], dtype=np.int32),
+        num_bins=n_bins,
+        unmanip_fraction=0.0,
+    )
+    save_ssrf_spectrum_shard(ssrf_res, ssrf_spectrum_shard_path(ssrf_dir, smoke_bin))
+
+    afp_res = run_afp_spectrum_bin(
+        smoke_bin,
+        p_values=SMOKE_P[:1],
+        num_bins=n_bins,
+        n_relax=20,
+        unmanip_fraction=0.0,
+    )
+    save_afp_spectrum_shard(afp_res, afp_spectrum_shard_path(afp_dir, smoke_bin))
+
+    shape = get_shape_params()
+    cube = generate_unmanipulated_cube(
+        num_bins=n_bins,
+        p_min=float(SMOKE_P.min()),
+        p_max=float(SMOKE_P.max()),
+        p_step=0.3,
+        shape_params=shape,
+    )
+    for bin_idx in range(n_bins):
+        save_unmanip_bin(
+            bin_idx,
+            p_values=cube["p_values"],
+            ps=cube["ps"][:, bin_idx],
+            iplus=cube["iplus"][:, bin_idx],
+            iminus=cube["iminus"][:, bin_idx],
+            amp=cube["amp"][:, bin_idx],
+            R=float(cube["R"][bin_idx]),
+            path=unmanip_bin_path(unmanip_dir, bin_idx),
+            p_min=float(SMOKE_P.min()),
+            p_max=float(SMOKE_P.max()),
+            p_step=0.3,
+            num_bins=n_bins,
+            shape_params=shape,
+        )
+
+    flatten_one_bin("ssrf", smoke_bin, shard_dir=ssrf_dir, output_dir=ssrf_rows_dir)
+    flatten_one_bin("afp", smoke_bin, shard_dir=afp_dir, output_dir=afp_rows_dir)
+    flatten_unmanipulated_rows(
+        unmanip_dir=unmanip_dir,
+        output_dir=unmanip_rows_dir,
+        num_bins=n_bins,
+        strict=False,
+    )
+
+    direct_out = tmp_path / "direct" / "spectrum_train.npz"
+    direct_result = combine_spectrum_shards(
+        ssrf_dir,
+        afp_dir,
+        direct_out,
+        unmanip_dir=unmanip_dir,
+        num_bins=n_bins,
+        strict=False,
+    )
+
+    rows_out = tmp_path / "rows" / "spectrum_train.npz"
+    rows_result = combine_spectrum_row_dirs(
+        ssrf_rows_dir,
+        afp_rows_dir,
+        rows_out,
+        unmanip_rows_dir=unmanip_rows_dir,
+        num_bins=n_bins,
+        strict=False,
+    )
+
+    assert rows_result["n_ssrf"] == direct_result["n_ssrf"]
+    assert rows_result["n_afp"] == direct_result["n_afp"]
+    assert rows_result["n_unmanip"] == direct_result["n_unmanip"]
+    assert rows_result["n_samples"] == direct_result["n_samples"]
+    assert Path(rows_out).is_file()
+
+
+def test_combine_bin_events_simple_smoke(tmp_path: Path) -> None:
+    """Per-bin trajectory shards sharing one combo grid -> stacked into dense num_bins-wide rows."""
+    n_bins = 8
+    bin_a, bin_b = 2, 3
+    other_bins = [b for b in range(n_bins) if b not in (bin_a, bin_b)]
+    ssrf_dir = tmp_path / "ssrf_shards"
+    afp_dir = tmp_path / "afp_shards"
+    unmanip_dir = tmp_path / "unmanip"
+    for d in (ssrf_dir, afp_dir, unmanip_dir):
+        d.mkdir()
+
+    ssrf_shards = {}
+    afp_shards = {}
+    for b in (bin_a, bin_b):
+        ssrf_res = run_ssrf_bin(
+            b,
+            p_values=SMOKE_P,
+            gamma_values=np.array([1.0], dtype=float),
+            steps_values=np.array([5], dtype=np.int32),
+            num_bins=n_bins,
+            rf_mode=RF_MODE_PHYSICAL_VOIGT,
+        )
+        save_ssrf_shard(ssrf_res, ssrf_shard_path(ssrf_dir, b))
+        ssrf_shards[b] = ssrf_res
+
+        afp_res = run_afp_bin(
+            b,
+            p_values=SMOKE_P,
+            num_bins=n_bins,
+            n_relax=5,
+        )
+        save_afp_shard(afp_res, afp_shard_path(afp_dir, b))
+        afp_shards[b] = afp_res
+
+    shape = get_shape_params()
+    cube = generate_unmanipulated_cube(
+        num_bins=n_bins,
+        p_min=float(SMOKE_P.min()),
+        p_max=float(SMOKE_P.max()),
+        p_step=0.3,
+        shape_params=shape,
+    )
+    for bin_idx in range(n_bins):
+        save_unmanip_bin(
+            bin_idx,
+            p_values=cube["p_values"],
+            ps=cube["ps"][:, bin_idx],
+            iplus=cube["iplus"][:, bin_idx],
+            iminus=cube["iminus"][:, bin_idx],
+            amp=cube["amp"][:, bin_idx],
+            R=float(cube["R"][bin_idx]),
+            path=unmanip_bin_path(unmanip_dir, bin_idx),
+            p_min=float(SMOKE_P.min()),
+            p_max=float(SMOKE_P.max()),
+            p_step=0.3,
+            num_bins=n_bins,
+            shape_params=shape,
+        )
+
+    out = tmp_path / "combined" / "spectrum_train.npz"
+    result = combine_bin_events(
+        ssrf_dir,
+        afp_dir,
+        out,
+        unmanip_dir=unmanip_dir,
+        num_bins=n_bins,
+        strict=False,
+    )
+    assert Path(result["output"]).is_file()
+    assert result["n_samples"] > 0
+    assert result["n_ssrf"] > 0
+    assert result["n_afp"] > 0
+    assert result["n_unmanip"] == cube["p_values"].size
+    # bin_a and bin_b have shards; the other 6 bins are missing (non-strict).
+    assert result["n_missing_ssrf"] == len(other_bins)
+    assert result["n_missing_afp"] == len(other_bins)
+    assert result["n_missing_unmanip"] == 0
+
+    with np.load(result["output"], allow_pickle=False) as data:
+        ps = np.asarray(data["ps"])
+        iplus = np.asarray(data["iplus"])
+        iminus = np.asarray(data["iminus"])
+        source = np.asarray(data["source"])
+        center_bin = np.asarray(data["center_bin"])
+
+    assert ps.shape == (result["n_samples"], n_bins)
+    # Stacking, not per-event embedding: center_bin is a sentinel (-1) since a
+    # reconstructed spectrum row isn't tied to one physical burn location.
+    assert np.all(center_bin[source != SOURCE_UNMANIP] == -1)
+
+    # Missing bins (no shard at all) must be exactly 0 for every ssRF/AFP row.
+    ssrf_mask = source == SOURCE_SSRF
+    afp_mask = source == SOURCE_AFP
+    assert np.all(ps[np.ix_(ssrf_mask, other_bins)] == 0.0)
+    assert np.all(ps[np.ix_(afp_mask, other_bins)] == 0.0)
+
+    # bin_a's own column should reproduce bin_a's directly-computed ssRF trajectory values.
+    direct_ps = ssrf_shards[bin_a]["ps"][~ssrf_shards[bin_a]["skipped"]]
+    direct_vals = sorted(v for row in direct_ps for v in row.tolist())
+    got_vals = sorted(v for v in ps[ssrf_mask, bin_a].tolist() if v != 0.0)
+    assert got_vals == pytest.approx(direct_vals, rel=1e-4)
+
+    # Every stored ps/iplus/iminus triple must stay physically consistent
+    # (ps == iplus + iminus), proving the three arrays never got misaligned
+    # while stacking bins / concatenating sources -- combine_bin_events()
+    # already asserts this internally (validate=True by default).
+    np.testing.assert_allclose(ps, iplus + iminus, atol=1e-3, rtol=1e-3)
+    # bin_a's own iplus/iminus columns must also reproduce the source shard exactly.
+    direct_iplus = sorted(
+        v for row in ssrf_shards[bin_a]["iplus"][~ssrf_shards[bin_a]["skipped"]] for v in row.tolist()
+    )
+    got_iplus = sorted(v for v in iplus[ssrf_mask, bin_a].tolist() if v != 0.0)
+    assert got_iplus == pytest.approx(direct_iplus, rel=1e-4)
+
+
+def test_validate_ps_iplus_iminus_catches_misalignment() -> None:
+    """validate_ps_iplus_iminus must pass on consistent rows and fail loudly on scrambled ones."""
+    n, nb = 5, 4
+    rng = np.random.default_rng(0)
+    iplus = rng.normal(size=(n, nb))
+    iminus = rng.normal(size=(n, nb))
+    ps = iplus + iminus
+    rows = {"ps": ps, "iplus": iplus, "iminus": iminus}
+    validate_ps_iplus_iminus(rows, label="consistent")
+
+    scrambled = {"ps": np.roll(ps, shift=1, axis=0), "iplus": iplus, "iminus": iminus}
+    with pytest.raises(ValueError, match="ps != iplus \\+ iminus"):
+        validate_ps_iplus_iminus(scrambled, label="scrambled")
 
 
 def test_plot_physics_demo_writes_pngs(smoke_dirs: dict[str, Path]) -> None:

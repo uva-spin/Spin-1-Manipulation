@@ -2,6 +2,13 @@
 # Dulya-fit v2 ssRF per-bin burn array (500 independent burn bins).
 # Each task sweeps P × gamma_rf × n_steps on discrete grids (fixed-length burns).
 #
+# Large P×gamma×burn_steps grids are processed in COMBO_BATCH_SIZE chunks to
+# bound peak RAM (see ssrf_bin_traj.py --combo-batch-size). This writes
+# ssrf_bin_XXXX_partNNNN.npz + ssrf_bin_XXXX_parts.json instead of a single
+# ssrf_bin_XXXX.npz when the combo grid exceeds the batch size; downstream
+# readers (load_ssrf_shard_any, combine_bin_events_simple.py) merge these
+# transparently.
+#
 # Submit from THIS directory (dulya_fit_v2/):
 #   sbatch ssrf_traj_array.slurm
 #
@@ -39,6 +46,9 @@ STEPS_MIN="${STEPS_MIN:-200}"
 STEPS_MAX="${STEPS_MAX:-20000}"
 STEPS_STEP="${STEPS_STEP:-200}"
 RF_MODE="${RF_MODE:-physical_voigt}"
+# Leave unset to use ssrf_bin_traj.py's mode-aware default (2048 combos/batch
+# in plain trajectory mode); override here if 4G is still too tight.
+COMBO_BATCH_SIZE="${COMBO_BATCH_SIZE:-}"
 
 cd "${PKG_DIR}"
 
@@ -69,7 +79,12 @@ echo "Shard dir: ${SHARD_DIR}"
 echo "P: [${P_MIN}, ${P_MAX}] step=${P_STEP}"
 echo "gamma: [${GAMMA_MIN}, ${GAMMA_MAX}] step=${GAMMA_STEP}"
 echo "burn_steps: [${STEPS_MIN}, ${STEPS_MAX}] step=${STEPS_STEP}"
-echo "dt=${DT}  rf_mode=${RF_MODE}"
+echo "dt=${DT}  rf_mode=${RF_MODE}  combo_batch_size=${COMBO_BATCH_SIZE:-<default>}"
+
+EXTRA_ARGS=()
+if [[ -n "${COMBO_BATCH_SIZE}" ]]; then
+  EXTRA_ARGS+=(--combo-batch-size "${COMBO_BATCH_SIZE}")
+fi
 
 apptainer run --bind "${PKG_DIR}:${PKG_DIR}" --pwd "${PKG_DIR}" \
   "${CONTAINERDIR}/pytorch-2.9.0.sif" \
@@ -87,6 +102,7 @@ apptainer run --bind "${PKG_DIR}:${PKG_DIR}" --pwd "${PKG_DIR}" \
   --steps-min "${STEPS_MIN}" \
   --steps-max "${STEPS_MAX}" \
   --steps-step "${STEPS_STEP}" \
+  "${EXTRA_ARGS[@]}" \
   --rf-mode "${RF_MODE}" \
   --skip-if-exists \
   "$@"

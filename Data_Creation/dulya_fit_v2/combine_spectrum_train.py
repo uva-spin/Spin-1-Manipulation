@@ -2,13 +2,21 @@
 Merge ssRF + AFP spectrum shards + unmanipulated bin NPZs into a unified full-spectrum
 training dataset.
 
-Writes ``spectrum_train.npz`` (default) or sharded ``spectrum_train_XXXX.npz`` files
-with rows:
+Writes ``spectrum_train.npz`` (default, ``--shard-size 0``) or, when ``--shard-size``
+is set, a shard directory of ``spectrum_train_XXXX.npz`` files plus a
+``spectrum_train_manifest.json`` index. Each row has:
   ps[500], iplus[500], iminus[500], p0, step, center_bin, source, gamma_rf, burn_steps
 
 Unmanipulated rows come from ``unmanip_bin_XXXX.npz`` files (``unmanipulated_bin_array``),
 stacked into full 500-bin equilibrium spectra (one row per polarization). All available
 unmanip rows are included (no subsampling).
+
+Memory: prefer ``--shard-size N`` (N > 0). Rows are flattened and written in
+bounded chunks (default chunk size matches ``N``, or 100k when ``N=0``), using
+float32 spectra and memmap reads of ``ps_full`` cubes so peak RAM stays roughly
+O(chunk) rather than O(full dataset). With ``--shard-size 0`` the merged output
+is still held in memory before writing a single NPZ — fine for smoke tests, but
+full-scale combines will OOM; use sharded output for production.
 
 Usage (from this directory):
   python combine_spectrum_train.py --strict
@@ -16,7 +24,8 @@ Usage (from this directory):
       --ssrf-shard-dir data/ssrf_shards \\
       --afp-shard-dir data/afp_shards \\
       --unmanip-dir data/unmanip_train \\
-      --output data/spectrum_train/spectrum_train.npz
+      --output data/spectrum_train/spectrum_train.npz \\
+      --shard-size 200000
 """
 
 from __future__ import annotations
@@ -30,15 +39,29 @@ import numpy as np
 
 import _bootstrap  # noqa: F401
 from bin_io import (
+    DEFAULT_SPECTRUM_ROW_CHUNK,
+    SPECTRUM_ROW_KEYS,
+    SPECTRUM_TRAIN_MANIFEST_NAME,
+    SpectrumShardWriter,
+    _build_flatten_row_indices,
     _concat_spectrum_rows,
-    _flatten_spectrum_shard,
+    _filter_spectrum_rows,
+    _iter_flatten_spectrum_shard_file,
+    _iter_row_index_chunks,
+    _nonempty_spectrum_mask,
     afp_shard_path,
+    afp_spectrum_shard_path,
     bin_index_range,
     format_missing_bins_error,
     load_afp_shard,
-    load_spectrum_shard,
     load_ssrf_shard,
+    list_ssrf_spectrum_shard_paths,
+    resolve_afp_spectrum_shard_path,
+    resolve_ssrf_spectrum_shard_path,
+    shard_has_ps_full,
+    ssrf_spectrum_shard_complete,
     ssrf_shard_path,
+    ssrf_spectrum_shard_path,
 )
 from common import (
     AFP_SHARD_DIR,
@@ -50,49 +73,45 @@ from common import (
     SOURCE_UNMANIP,
     SPECTRUM_TRAIN_NPZ,
     SSRF_SHARD_DIR,
+    STORE_DTYPE,
     UNMANIP_TRAIN_DIR,
 )
 from unmanipulated_bin_lineshape import unmanip_bin_path
 
-SPECTRUM_KEYS = (
-    "p0",
-    "step",
-    "center_bin",
-    "source",
-    "gamma_rf",
-    "burn_steps",
-    "ps",
-    "iplus",
-    "iminus",
-)
+SPECTRUM_KEYS = SPECTRUM_ROW_KEYS
 
 
-def _validate_conservation(ps: np.ndarray, ip: np.ndarray, im: np.ndarray) -> float:
-    """Return max |I+ + I- - Ps| over rows."""
-    residual = np.abs(ip + im - ps)
-    return float(np.max(residual)) if residual.size else 0.0
+def _validate_conservation(
+    ps: np.ndarray,
+    ip: np.ndarray,
+    im: np.ndarray,
+    *,
+    chunk_rows: int = 65536,
+) -> float:
+    """Return max |I+ + I- - Ps| over rows (chunked)."""
+    if ps.size == 0:
+        return 0.0
+    n = int(ps.shape[0])
+    step = max(1, int(chunk_rows))
+    max_res = 0.0
+    for start in range(0, n, step):
+        end = min(start + step, n)
+        chunk = np.add(ip[start:end], im[start:end])
+        np.subtract(chunk, ps[start:end], out=chunk)
+        np.abs(chunk, out=chunk)
+        max_res = max(max_res, float(np.max(chunk)))
+    return max_res
 
 
-def _empty_spectrum_rows(num_bins: int) -> dict[str, np.ndarray]:
-    nb = int(num_bins)
-    return {
-        "p0": np.zeros(0, dtype=float),
-        "step": np.zeros(0, dtype=np.int32),
-        "center_bin": np.zeros(0, dtype=np.int32),
-        "source": np.zeros(0, dtype=np.uint8),
-        "gamma_rf": np.zeros(0, dtype=float),
-        "burn_steps": np.zeros(0, dtype=np.int32),
-        "ps": np.zeros((0, nb), dtype=float),
-        "iplus": np.zeros((0, nb), dtype=float),
-        "iminus": np.zeros((0, nb), dtype=float),
-    }
-
-
-def _p_row_index(p_values: np.ndarray, p0: float) -> int:
-    grid = np.asarray(p_values, dtype=float)
-    idx = int(np.argmin(np.abs(grid - float(p0))))
-    if abs(float(grid[idx]) - float(p0)) > 1e-5:
-        raise ValueError(f"p0={p0} not on equilibrium grid (closest {grid[idx]})")
+def _p_row_indices(eq_p: np.ndarray, p_values: np.ndarray) -> np.ndarray:
+    grid = np.asarray(eq_p, dtype=float)
+    p_values = np.asarray(p_values, dtype=float)
+    idx = np.argmin(np.abs(grid[:, None] - p_values[None, :]), axis=0).astype(np.intp)
+    if np.any(np.abs(grid[idx] - p_values) > 1e-5):
+        bad = int(np.where(np.abs(grid[idx] - p_values) > 1e-5)[0][0])
+        raise ValueError(
+            f"p0={p_values[bad]} not on equilibrium grid (closest {grid[idx[bad]]})"
+        )
     return idx
 
 
@@ -134,7 +153,7 @@ def _load_equilibrium_cube(
     return p_values, ps_cube, ip_cube, im_cube, missing
 
 
-def _flatten_traj_shard_to_spectrum(
+def _iter_flatten_traj_shard_to_spectrum(
     shard: dict,
     *,
     source: int,
@@ -145,15 +164,15 @@ def _flatten_traj_shard_to_spectrum(
     eq_im: np.ndarray,
     step_subsample: int = 1,
     with_burn_params: bool = True,
-) -> dict[str, np.ndarray]:
-    """Embed ssrf_bin/afp_bin trajectory shards into full-spectrum rows."""
+    chunk_rows: int = DEFAULT_SPECTRUM_ROW_CHUNK,
+):
+    """Yield full-spectrum row batches from a per-bin trajectory shard."""
     p_values = np.asarray(shard["p_values"], dtype=float)
     n_steps = np.asarray(shard["n_steps"], dtype=np.int32)
     skipped = np.asarray(shard.get("skipped", np.zeros_like(p_values, dtype=bool)), dtype=bool)
-    ps = np.asarray(shard["ps"], dtype=float)
-    ip = np.asarray(shard["iplus"], dtype=float)
-    im = np.asarray(shard["iminus"], dtype=float)
-    num_bins = int(eq_ps.shape[1])
+    ps = np.asarray(shard["ps"])
+    ip = np.asarray(shard["iplus"])
+    im = np.asarray(shard["iminus"])
     sub = max(1, int(step_subsample))
     c = int(center_bin)
 
@@ -164,54 +183,39 @@ def _flatten_traj_shard_to_spectrum(
     if with_burn_params and "burn_steps" in shard:
         burn_steps = np.asarray(shard["burn_steps"], dtype=np.int32)
 
-    rows: list[tuple[int, int]] = []
-    for j in range(int(p_values.size)):
-        if bool(skipped[j]):
-            continue
-        n = int(n_steps[j])
-        if n <= 0:
-            continue
-        for step in range(0, n, sub):
-            rows.append((j, step))
+    j_rep, step_rep = _build_flatten_row_indices(
+        n_steps,
+        skipped,
+        step_subsample=sub,
+    )
+    if j_rep.size <= 0:
+        return
 
-    total = len(rows)
-    if total <= 0:
-        return _empty_spectrum_rows(num_bins)
-
-    out = {
-        "p0": np.empty(total, dtype=float),
-        "step": np.empty(total, dtype=np.int32),
-        "center_bin": np.empty(total, dtype=np.int32),
-        "source": np.empty(total, dtype=np.uint8),
-        "gamma_rf": np.empty(total, dtype=float),
-        "burn_steps": np.empty(total, dtype=np.int32),
-        "ps": np.empty((total, num_bins), dtype=float),
-        "iplus": np.empty((total, num_bins), dtype=float),
-        "iminus": np.empty((total, num_bins), dtype=float),
-    }
-    for idx, (j, step) in enumerate(rows):
-        pi = _p_row_index(eq_p, float(p_values[j]))
-        out["p0"][idx] = float(p_values[j])
-        out["step"][idx] = int(step)
-        out["center_bin"][idx] = c
-        out["source"][idx] = np.uint8(int(source))
-        out["gamma_rf"][idx] = float(gamma_rf[j])
-        out["burn_steps"][idx] = int(burn_steps[j])
-        out["ps"][idx] = eq_ps[pi]
-        out["iplus"][idx] = eq_ip[pi]
-        out["iminus"][idx] = eq_im[pi]
-        out["ps"][idx, c] = float(ps[j, step])
-        out["iplus"][idx, c] = float(ip[j, step])
-        out["iminus"][idx, c] = float(im[j, step])
-    return out
+    p_row = _p_row_indices(eq_p, p_values)
+    for js, ss in _iter_row_index_chunks(j_rep, step_rep, chunk_rows=chunk_rows):
+        n = int(js.size)
+        pr = p_row[js]
+        ps_out = np.asarray(eq_ps[pr], dtype=STORE_DTYPE)
+        ip_out = np.asarray(eq_ip[pr], dtype=STORE_DTYPE)
+        im_out = np.asarray(eq_im[pr], dtype=STORE_DTYPE)
+        row_idx = np.arange(n, dtype=np.intp)
+        ps_out[row_idx, c] = np.asarray(ps[js, ss], dtype=STORE_DTYPE)
+        ip_out[row_idx, c] = np.asarray(ip[js, ss], dtype=STORE_DTYPE)
+        im_out[row_idx, c] = np.asarray(im[js, ss], dtype=STORE_DTYPE)
+        yield {
+            "p0": p_values[js],
+            "step": ss,
+            "center_bin": np.full(n, c, dtype=np.int32),
+            "source": np.full(n, np.uint8(source), dtype=np.uint8),
+            "gamma_rf": gamma_rf[js],
+            "burn_steps": burn_steps[js],
+            "ps": ps_out,
+            "iplus": ip_out,
+            "iminus": im_out,
+        }
 
 
-def _shard_has_ps_full(path: Path) -> bool:
-    with np.load(path, allow_pickle=False) as data:
-        return "ps_full" in data.files
-
-
-def _flatten_ssrf_shard(
+def _iter_flatten_ssrf_shard(
     path: Path,
     *,
     center_bin: int,
@@ -219,18 +223,51 @@ def _flatten_ssrf_shard(
     eq_ps: np.ndarray,
     eq_ip: np.ndarray,
     eq_im: np.ndarray,
-) -> dict[str, np.ndarray]:
-    if _shard_has_ps_full(path):
-        shard = load_spectrum_shard(path)
-        return _flatten_spectrum_shard(
-            shard,
-            source=SOURCE_SSRF,
-            center_bin=center_bin,
-            step_subsample=1,
-            exclude_trailing_samples=int(shard.get("n_unmanip_samples", 0)),
-        )
+    chunk_rows: int,
+):
+    yield from _iter_flatten_spectrum_shard_file(
+        path,
+        source=SOURCE_SSRF,
+        center_bin=center_bin,
+        step_subsample=1,
+        prefer_file_step_subsample=False,
+        chunk_rows=chunk_rows,
+    )
+
+
+def _iter_flatten_afp_shard(
+    path: Path,
+    *,
+    center_bin: int,
+    eq_p: np.ndarray,
+    eq_ps: np.ndarray,
+    eq_ip: np.ndarray,
+    eq_im: np.ndarray,
+    afp_step_subsample: int,
+    chunk_rows: int,
+):
+    yield from _iter_flatten_spectrum_shard_file(
+        path,
+        source=SOURCE_AFP,
+        center_bin=center_bin,
+        step_subsample=int(afp_step_subsample),
+        prefer_file_step_subsample=True,
+        chunk_rows=chunk_rows,
+    )
+
+
+def _iter_flatten_ssrf_shard_legacy(
+    path: Path,
+    *,
+    center_bin: int,
+    eq_p: np.ndarray,
+    eq_ps: np.ndarray,
+    eq_ip: np.ndarray,
+    eq_im: np.ndarray,
+    chunk_rows: int,
+):
     shard = load_ssrf_shard(path)
-    return _flatten_traj_shard_to_spectrum(
+    yield from _iter_flatten_traj_shard_to_spectrum(
         shard,
         source=SOURCE_SSRF,
         center_bin=center_bin,
@@ -240,10 +277,11 @@ def _flatten_ssrf_shard(
         eq_im=eq_im,
         step_subsample=1,
         with_burn_params=True,
+        chunk_rows=chunk_rows,
     )
 
 
-def _flatten_afp_shard(
+def _iter_flatten_afp_shard_legacy(
     path: Path,
     *,
     center_bin: int,
@@ -252,19 +290,10 @@ def _flatten_afp_shard(
     eq_ip: np.ndarray,
     eq_im: np.ndarray,
     afp_step_subsample: int,
-) -> dict[str, np.ndarray]:
-    if _shard_has_ps_full(path):
-        shard = load_spectrum_shard(path)
-        sub = int(shard.get("step_subsample", afp_step_subsample))
-        return _flatten_spectrum_shard(
-            shard,
-            source=SOURCE_AFP,
-            center_bin=center_bin,
-            step_subsample=sub,
-            exclude_trailing_samples=int(shard.get("n_unmanip_samples", 0)),
-        )
+    chunk_rows: int,
+):
     shard = load_afp_shard(path)
-    return _flatten_traj_shard_to_spectrum(
+    yield from _iter_flatten_traj_shard_to_spectrum(
         shard,
         source=SOURCE_AFP,
         center_bin=center_bin,
@@ -274,36 +303,112 @@ def _flatten_afp_shard(
         eq_im=eq_im,
         step_subsample=int(afp_step_subsample),
         with_burn_params=False,
+        chunk_rows=chunk_rows,
     )
 
 
-def _load_unmanip_spectrum_rows(
-    unmanip_dir: Path,
+def _iter_ssrf_batches(
+    path: Path,
+    *,
+    center_bin: int,
+    eq_p: np.ndarray,
+    eq_ps: np.ndarray,
+    eq_ip: np.ndarray,
+    eq_im: np.ndarray,
+    chunk_rows: int,
+):
+    if shard_has_ps_full(path):
+        yield from _iter_flatten_ssrf_shard(
+            path,
+            center_bin=center_bin,
+            eq_p=eq_p,
+            eq_ps=eq_ps,
+            eq_ip=eq_ip,
+            eq_im=eq_im,
+            chunk_rows=chunk_rows,
+        )
+        return
+    yield from _iter_flatten_ssrf_shard_legacy(
+        path,
+        center_bin=center_bin,
+        eq_p=eq_p,
+        eq_ps=eq_ps,
+        eq_ip=eq_ip,
+        eq_im=eq_im,
+        chunk_rows=chunk_rows,
+    )
+
+
+def _iter_afp_batches(
+    path: Path,
+    *,
+    center_bin: int,
+    eq_p: np.ndarray,
+    eq_ps: np.ndarray,
+    eq_ip: np.ndarray,
+    eq_im: np.ndarray,
+    afp_step_subsample: int,
+    chunk_rows: int,
+):
+    if shard_has_ps_full(path):
+        yield from _iter_flatten_afp_shard(
+            path,
+            center_bin=center_bin,
+            eq_p=eq_p,
+            eq_ps=eq_ps,
+            eq_ip=eq_ip,
+            eq_im=eq_im,
+            afp_step_subsample=int(afp_step_subsample),
+            chunk_rows=chunk_rows,
+        )
+        return
+    yield from _iter_flatten_afp_shard_legacy(
+        path,
+        center_bin=center_bin,
+        eq_p=eq_p,
+        eq_ps=eq_ps,
+        eq_ip=eq_ip,
+        eq_im=eq_im,
+        afp_step_subsample=int(afp_step_subsample),
+        chunk_rows=chunk_rows,
+    )
+
+
+def _unmanip_rows_from_eq(
+    eq_p: np.ndarray,
+    eq_ps: np.ndarray,
+    eq_ip: np.ndarray,
+    eq_im: np.ndarray,
     *,
     num_bins: int,
-) -> tuple[dict[str, np.ndarray], list[int]]:
-    """Stack per-bin ``unmanip_bin_XXXX.npz`` files into full-spectrum rows."""
-    p_values, ps_cube, ip_cube, im_cube, missing = _load_equilibrium_cube(
-        unmanip_dir,
-        num_bins=int(num_bins),
-    )
-    if int(p_values.size) == 0:
-        return {}, missing
-
-    n_p = int(p_values.size)
+) -> dict[str, np.ndarray]:
+    """Build unmanip spectrum rows from the already-loaded equilibrium cube."""
+    n_p = int(eq_p.size)
     unmanip_center = int(num_bins // 2)
-    rows = {
-        "p0": p_values,
+    return {
+        "p0": np.asarray(eq_p, dtype=float),
         "step": np.zeros(n_p, dtype=np.int32),
         "center_bin": np.full(n_p, unmanip_center, dtype=np.int32),
         "source": np.full(n_p, SOURCE_UNMANIP, dtype=np.uint8),
         "gamma_rf": np.zeros(n_p, dtype=float),
         "burn_steps": np.zeros(n_p, dtype=np.int32),
-        "ps": ps_cube,
-        "iplus": ip_cube,
-        "iminus": im_cube,
+        "ps": np.asarray(eq_ps, dtype=STORE_DTYPE),
+        "iplus": np.asarray(eq_ip, dtype=STORE_DTYPE),
+        "iminus": np.asarray(eq_im, dtype=STORE_DTYPE),
     }
-    return rows, missing
+
+def _filtered_rows_and_drop_count(
+    rows: dict[str, np.ndarray],
+) -> tuple[dict[str, np.ndarray], int]:
+    """Drop empty/invalid rows from one flattened batch; return (rows, n_dropped)."""
+    n_total = int(rows["ps"].shape[0])
+    if n_total == 0:
+        return rows, 0
+    keep = _nonempty_spectrum_mask(rows["ps"], rows["iplus"], rows["iminus"])
+    n_dropped = int(np.count_nonzero(~keep))
+    if n_dropped == 0:
+        return rows, 0
+    return _filter_spectrum_rows(rows, keep), n_dropped
 
 
 def combine_spectrum_shards(
@@ -341,40 +446,110 @@ def combine_spectrum_shards(
             f"No unmanip equilibrium data under {unmanip_dir}; "
             "trajectory shards need unmanip_bin_XXXX.npz to fill full spectra"
         )
+    # Keep equilibrium spectra in store dtype for the rest of the combine.
+    eq_ps = np.asarray(eq_ps, dtype=STORE_DTYPE)
+    eq_ip = np.asarray(eq_ip, dtype=STORE_DTYPE)
+    eq_im = np.asarray(eq_im, dtype=STORE_DTYPE)
 
-    parts: list[dict[str, np.ndarray]] = []
+    streaming = int(shard_size) > 0
+    chunk_rows = int(shard_size) if streaming else DEFAULT_SPECTRUM_ROW_CHUNK
+    if not streaming:
+        print(
+            "WARNING: --shard-size 0 keeps the full merged dataset in RAM. "
+            f"Flattening still uses {chunk_rows}-row chunks, but full-scale "
+            "combines should pass --shard-size N (e.g. 200000).",
+            flush=True,
+        )
+    stats = {
+        "n_ssrf": 0,
+        "n_afp": 0,
+        "n_unmanip": 0,
+        "n_filtered_empty": 0,
+        "max_conservation_residual": 0.0,
+    }
     missing_ssrf: list[int] = []
     missing_afp: list[int] = []
+    parts: list[dict[str, np.ndarray]] = []
+
+    base_meta = {
+        "num_bins": int(num_bins),
+        "source_codes": {"ssrf": SOURCE_SSRF, "afp": SOURCE_AFP, "unmanipulated": SOURCE_UNMANIP},
+        "physics_model": PHYSICS_MODEL,
+        "dataset": "spectrum_train_v2",
+        "fields": "ps,iplus,iminus shape (n_samples, num_bins)",
+        "store_dtype": str(np.dtype(STORE_DTYPE)),
+        "unmanip_dir": str(unmanip_dir),
+    }
+    writer = (
+        SpectrumShardWriter(
+            output_path if output_path.is_dir() else output_path.parent,
+            int(shard_size),
+            base_meta,
+        )
+        if streaming
+        else None
+    )
+
+    def _ingest(rows: dict[str, np.ndarray], source_key: str) -> None:
+        filtered, n_dropped = _filtered_rows_and_drop_count(rows)
+        stats["n_filtered_empty"] += n_dropped
+        n = int(filtered["ps"].shape[0])
+        if n <= 0:
+            return
+        stats[source_key] += n
+        res = _validate_conservation(filtered["ps"], filtered["iplus"], filtered["iminus"])
+        stats["max_conservation_residual"] = max(stats["max_conservation_residual"], res)
+        if writer is not None:
+            writer.add(filtered)
+        else:
+            parts.append(filtered)
 
     for bin_idx in bin_index_range(int(num_bins)):
-        ssrf_path = ssrf_shard_path(ssrf_shard_dir, bin_idx)
-        if ssrf_path.is_file():
-            parts.append(
-                _flatten_ssrf_shard(
-                    ssrf_path,
+        ssrf_paths = list_ssrf_spectrum_shard_paths(ssrf_shard_dir, bin_idx)
+        if ssrf_paths:
+            for spath in ssrf_paths:
+                for batch in _iter_ssrf_batches(
+                    spath,
                     center_bin=bin_idx,
                     eq_p=eq_p,
                     eq_ps=eq_ps,
                     eq_ip=eq_ip,
                     eq_im=eq_im,
-                )
-            )
+                    chunk_rows=chunk_rows,
+                ):
+                    _ingest(batch, "n_ssrf")
         else:
-            missing_ssrf.append(bin_idx)
-
-        afp_path = afp_shard_path(afp_shard_dir, bin_idx)
-        if afp_path.is_file():
-            parts.append(
-                _flatten_afp_shard(
-                    afp_path,
+            legacy = ssrf_shard_path(ssrf_shard_dir, bin_idx)
+            if legacy.is_file():
+                for batch in _iter_ssrf_batches(
+                    legacy,
                     center_bin=bin_idx,
                     eq_p=eq_p,
                     eq_ps=eq_ps,
                     eq_ip=eq_ip,
                     eq_im=eq_im,
-                    afp_step_subsample=int(afp_step_subsample),
-                )
-            )
+                    chunk_rows=chunk_rows,
+                ):
+                    _ingest(batch, "n_ssrf")
+            else:
+                missing_ssrf.append(bin_idx)
+
+        afp_path = resolve_afp_spectrum_shard_path(afp_shard_dir, bin_idx)
+        if afp_path is None:
+            legacy = afp_shard_path(afp_shard_dir, bin_idx)
+            afp_path = legacy if legacy.is_file() else None
+        if afp_path is not None:
+            for batch in _iter_afp_batches(
+                afp_path,
+                center_bin=bin_idx,
+                eq_p=eq_p,
+                eq_ps=eq_ps,
+                eq_ip=eq_ip,
+                eq_im=eq_im,
+                afp_step_subsample=int(afp_step_subsample),
+                chunk_rows=chunk_rows,
+            ):
+                _ingest(batch, "n_afp")
         else:
             missing_afp.append(bin_idx)
 
@@ -390,7 +565,8 @@ def combine_spectrum_shards(
                     ssrf_shard_dir,
                     missing_ssrf,
                     num_bins=int(num_bins),
-                    path_fn=ssrf_shard_path,
+                    path_fn=ssrf_spectrum_shard_path,
+                    traj_path_fn=ssrf_shard_path,
                 )
             )
         if missing_afp:
@@ -400,66 +576,52 @@ def combine_spectrum_shards(
                     afp_shard_dir,
                     missing_afp,
                     num_bins=int(num_bins),
-                    path_fn=afp_shard_path,
+                    path_fn=afp_spectrum_shard_path,
+                    traj_path_fn=afp_shard_path,
                 )
             )
         raise FileNotFoundError("\n".join(parts_err))
 
-    merged = _concat_spectrum_rows(parts) if parts else {}
-
-    unmanip_rows, _ = _load_unmanip_spectrum_rows(
-        unmanip_dir,
-        num_bins=int(num_bins),
-    )
     if missing_unmanip and not strict:
         print(
             f"WARNING: missing unmanip bins for {len(missing_unmanip)} bins "
             f"under {unmanip_dir}",
             flush=True,
         )
-    if unmanip_rows:
-        merged = _concat_spectrum_rows([merged, unmanip_rows]) if merged else unmanip_rows
+    unmanip_rows = _unmanip_rows_from_eq(
+        eq_p, eq_ps, eq_ip, eq_im, num_bins=int(num_bins)
+    )
+    if int(unmanip_rows["ps"].shape[0]) > 0:
+        _ingest(unmanip_rows, "n_unmanip")
 
-    if not merged:
-        raise ValueError("No spectrum rows found in input shards or unmanip bins")
-
-    max_res = _validate_conservation(merged["ps"], merged["iplus"], merged["iminus"])
-    n_samples = int(merged["ps"].shape[0])
-    source = merged["source"]
-    meta = {
-        "n_samples": n_samples,
-        "num_bins": int(num_bins),
-        "max_conservation_residual": max_res,
-        "n_ssrf": int(np.count_nonzero(source == SOURCE_SSRF)),
-        "n_afp": int(np.count_nonzero(source == SOURCE_AFP)),
-        "n_unmanip": int(np.count_nonzero(source == SOURCE_UNMANIP)),
-        "source_codes": {"ssrf": SOURCE_SSRF, "afp": SOURCE_AFP, "unmanipulated": SOURCE_UNMANIP},
-        "physics_model": PHYSICS_MODEL,
-        "dataset": "spectrum_train_v2",
-        "fields": "ps,iplus,iminus shape (n_samples, num_bins)",
-        "unmanip_dir": str(unmanip_dir),
-    }
-
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    if int(shard_size) > 0:
-        n_shards = int(np.ceil(n_samples / int(shard_size)))
-        shard_dir = output_path if output_path.is_dir() else output_path.parent
-        shard_dir.mkdir(parents=True, exist_ok=True)
-        for si in range(n_shards):
-            sl = slice(si * int(shard_size), (si + 1) * int(shard_size))
-            shard_path = shard_dir / f"spectrum_train_{si:04d}.npz"
-            payload = {k: merged[k][sl] for k in SPECTRUM_KEYS}
-            shard_meta = dict(meta)
-            shard_meta["shard_index"] = si
-            shard_meta["n_shards"] = n_shards
-            tmp = shard_path.with_name(f".{shard_path.stem}.{os.getpid()}.tmp.npz")
-            np.savez_compressed(tmp, meta_json=np.asarray(json.dumps(shard_meta)), **payload)
-            tmp.replace(shard_path)
-        out_desc = str(shard_dir)
+    if writer is not None:
+        writer.close()
+        n_samples = writer.n_written
+        if n_samples <= 0:
+            raise ValueError("No spectrum rows found in input shards or unmanip bins")
+        manifest = {
+            "n_samples": n_samples,
+            "n_shards": writer.shard_index,
+            "shard_files": writer.shard_files,
+            "shard_row_counts": writer.shard_row_counts,
+            **stats,
+            **base_meta,
+        }
+        (writer.output_dir / SPECTRUM_TRAIN_MANIFEST_NAME).write_text(json.dumps(manifest, indent=2))
+        out_desc = str(writer.output_dir)
     else:
+        if not parts:
+            raise ValueError("No spectrum rows found in input shards or unmanip bins")
+        merged = _concat_spectrum_rows(parts)
+        n_samples = int(merged["ps"].shape[0])
+        if n_samples <= 0:
+            raise ValueError("All spectrum rows were empty or invalid after filtering")
+        meta = {"n_samples": n_samples, **stats, **base_meta}
+
         out_file = output_path
         if output_path.is_dir():
             out_file = output_path / "spectrum_train.npz"
+        out_file.parent.mkdir(parents=True, exist_ok=True)
         tmp = out_file.with_name(f".{out_file.stem}.{os.getpid()}.tmp.npz")
         np.savez_compressed(
             tmp,
@@ -472,11 +634,14 @@ def combine_spectrum_shards(
     return {
         "output": out_desc,
         "n_samples": n_samples,
-        "max_conservation_residual": max_res,
+        "max_conservation_residual": stats["max_conservation_residual"],
         "n_missing_ssrf": len(missing_ssrf),
         "n_missing_afp": len(missing_afp),
         "n_missing_unmanip": len(missing_unmanip),
-        **{k: meta[k] for k in ("n_ssrf", "n_afp", "n_unmanip")},
+        "n_ssrf": stats["n_ssrf"],
+        "n_afp": stats["n_afp"],
+        "n_unmanip": stats["n_unmanip"],
+        "n_filtered_empty": stats["n_filtered_empty"],
     }
 
 
@@ -512,7 +677,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Spectral bin count N; files use zero-indexed bin_idx 0..N-1 (default: 500 -> bins 0..499)",
     )
     p.add_argument("--afp-step-subsample", type=int, default=AFP_STEP_SUBSAMPLE)
-    p.add_argument("--shard-size", type=int, default=0, help="If >0, write sharded NPZs of this many rows")
+    p.add_argument(
+        "--shard-size",
+        type=int,
+        default=0,
+        help=(
+            "If >0, stream rows to sharded NPZs of this many rows each "
+            "(bounded memory; writes spectrum_train_manifest.json). "
+            "Required for full-scale combines. If 0, build the full dataset "
+            "in memory and write a single NPZ (smoke tests / small data only)."
+        ),
+    )
     p.add_argument("--strict", action="store_true")
     return p
 

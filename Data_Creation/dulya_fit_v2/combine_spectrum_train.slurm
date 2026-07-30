@@ -27,7 +27,7 @@ UNMANIP_DIR="${UNMANIP_DIR:-data/unmanip_train}"
 OUTPUT="${OUTPUT:-data/spectrum_train/spectrum_train.npz}"
 NUM_BINS="${NUM_BINS:-500}"
 AFP_STEP_SUBSAMPLE="${AFP_STEP_SUBSAMPLE:-50}"
-SHARD_SIZE="${SHARD_SIZE:-0}"
+SHARD_SIZE="${SHARD_SIZE:-200000}"
 
 cd "${PKG_DIR}"
 
@@ -57,6 +57,7 @@ echo "ssRF: ${SSRF_SHARD_DIR} (${n_ssrf} ssrf_bin_*.npz)"
 echo "AFP:  ${AFP_SHARD_DIR} (${n_afp} afp_bin_*.npz)"
 echo "Unmanip: ${UNMANIP_DIR} (${n_unmanip})"
 echo "AFP step subsample: ${AFP_STEP_SUBSAMPLE}"
+echo "Output shard size: ${SHARD_SIZE}"
 
 COMBINE_ARGS=(
   --ssrf-shard-dir "${SSRF_SHARD_DIR}"

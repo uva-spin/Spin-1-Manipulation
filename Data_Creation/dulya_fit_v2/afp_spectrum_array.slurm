@@ -5,8 +5,7 @@
 # Submit from THIS directory (dulya_fit_v2/):
 #   sbatch afp_spectrum_array.slurm
 #
-# Then merge for SpectrumSplitNet training:
-#   sbatch combine_spectrum_train.slurm
+# See ssrf_spectrum_array.slurm header for full pre-flattened row pipeline.
 
 #SBATCH --job-name=dulya-v2-afp-spectrum
 #SBATCH --array=0-499
@@ -28,7 +27,7 @@ NUM_BINS="${NUM_BINS:-500}"
 P_MIN="${P_MIN:--0.9}"
 P_MAX="${P_MAX:-0.9}"
 P_STEP="${P_STEP:-0.05}"
-DT="${DT:-0.0015}"
+DT="${DT:-0.015}"
 N_RELAX="${N_RELAX:-5000}"
 AFP_WINDOW="${AFP_WINDOW:-8}"
 AFP_EFFICIENCY="${AFP_EFFICIENCY:-1.0}"
