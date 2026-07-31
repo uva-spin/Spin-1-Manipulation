@@ -1,6 +1,10 @@
 #!/bin/bash
-# Dulya-fit v2 AFP full-spectrum array (500 bins, ps_full at each timestep).
-# Writes afp_spectrum_bin_XXXX.npz into data/afp_shards/ (same dir as traj shards).
+# Dulya-fit v2 AFP full-spectrum array (burn-window bins only).
+# Writes afp_spectrum_bin_XXXX.npz into data/afp_shards/.
+#
+# Default: instantaneous AFP flip (N_RELAX=0). step-subsample is forced to 1
+# when n_relax=0 so the post-flip spectrum is retained. Raise N_RELAX later
+# and restore AFP_STEP_SUBSAMPLE=50 for long relaxation trajectories.
 #
 # Submit from THIS directory (dulya_fit_v2/):
 #   sbatch afp_spectrum_array.slurm
@@ -8,7 +12,7 @@
 # See ssrf_spectrum_array.slurm header for full pre-flattened row pipeline.
 
 #SBATCH --job-name=dulya-v2-afp-spectrum
-#SBATCH --array=0-499
+#SBATCH --array=125-374
 #SBATCH --partition=standard
 #SBATCH -A spinquest_standard
 #SBATCH --nodes=1
@@ -28,10 +32,11 @@ P_MIN="${P_MIN:--0.9}"
 P_MAX="${P_MAX:-0.9}"
 P_STEP="${P_STEP:-0.05}"
 DT="${DT:-0.015}"
-N_RELAX="${N_RELAX:-5000}"
+N_RELAX="${N_RELAX:-0}"
 AFP_WINDOW="${AFP_WINDOW:-8}"
 AFP_EFFICIENCY="${AFP_EFFICIENCY:-1.0}"
 AFP_STEP_SUBSAMPLE="${AFP_STEP_SUBSAMPLE:-50}"
+UNMANIP_FRACTION="${UNMANIP_FRACTION:-0.0}"
 
 cd "${PKG_DIR}"
 
@@ -57,7 +62,7 @@ if [[ -z "${SLURM_ARRAY_TASK_ID:-}" ]]; then
 fi
 
 echo "Dulya v2 AFP spectrum bin ${SLURM_ARRAY_TASK_ID} on $(hostname)"
-echo "Shard dir: ${SHARD_DIR}"
+echo "Shard dir: ${SHARD_DIR}  n_relax=${N_RELAX}  step_subsample=${AFP_STEP_SUBSAMPLE}"
 
 apptainer run --bind "${PKG_DIR}:${PKG_DIR}" --pwd "${PKG_DIR}" \
   "${CONTAINERDIR}/pytorch-2.9.0.sif" \
@@ -74,5 +79,6 @@ apptainer run --bind "${PKG_DIR}:${PKG_DIR}" --pwd "${PKG_DIR}" \
   --afp-window "${AFP_WINDOW}" \
   --afp-efficiency "${AFP_EFFICIENCY}" \
   --step-subsample "${AFP_STEP_SUBSAMPLE}" \
+  --unmanip-fraction "${UNMANIP_FRACTION}" \
   --skip-if-exists \
   "$@"

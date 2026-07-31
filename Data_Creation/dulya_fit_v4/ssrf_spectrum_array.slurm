@@ -1,9 +1,12 @@
 #!/bin/bash
-# Dulya-fit v2 ssRF full-spectrum array (500 bins, ps_full at each timestep).
+# Dulya-fit v2 ssRF full-spectrum array (burn-window bins only).
 # Writes ssrf_spectrum_bin_XXXX.npz (or batched _partYYYY.npz) into data/ssrf_shards/.
 #
-# Large P×gamma×burn_steps grids are processed in COMBO_BATCH_SIZE chunks to
-# avoid OOM (see ssrf_bin_traj.py --combo-batch-size).
+# Hybrid sampling (see common.py / ssrf_bin_traj.py):
+#   - every SPECTRUM_DENSE_BIN_STRIDE-th burn bin: full Cartesian P x gamma x steps
+#   - remaining burn bins: P x SPECTRUM_MC_DRAWS_PER_BIN on-grid (gamma, steps) draws
+#
+# Defaults: R burn in (-3,3) -> bins 125-374; gamma 5.0-10.0/2.5; steps 20-100/20.
 #
 # Submit from THIS directory (dulya_fit_v2/):
 #   sbatch ssrf_spectrum_array.slurm
@@ -16,9 +19,10 @@
 #   SSRF_FLAT=$(sbatch --parsable --dependency=afterok:${SSRF_ID} flatten_ssrf_spectrum_rows.slurm)
 #   AFP_FLAT=$(sbatch --parsable --dependency=afterok:${AFP_ID} flatten_afp_spectrum_rows.slurm)
 #   sbatch --dependency=afterok:${UNMANIP_FLAT}:${SSRF_FLAT}:${AFP_FLAT} combine_spectrum_rows.slurm
+#   # or: combine_spectrum_train.slurm (shards + unmanip_dir -> sharded spectrum_train)
 
 #SBATCH --job-name=dulya-v2-ssrf-spectrum
-#SBATCH --array=0-499
+#SBATCH --array=125-374
 #SBATCH --partition=standard
 #SBATCH -A spinquest_standard
 #SBATCH --nodes=1
@@ -38,16 +42,17 @@ P_MIN="${P_MIN:--0.9}"
 P_MAX="${P_MAX:-0.9}"
 P_STEP="${P_STEP:-0.05}"
 DT="${DT:-0.0015}"
-# Defaults match common.py (20–100 burn steps). Override for larger grids + batching.
-GAMMA_MIN="${GAMMA_MIN:-1.0}"
-GAMMA_MAX="${GAMMA_MAX:-2.0}"
-GAMMA_STEP="${GAMMA_STEP:-0.25}"
+GAMMA_MIN="${GAMMA_MIN:-5.0}"
+GAMMA_MAX="${GAMMA_MAX:-10.0}"
+GAMMA_STEP="${GAMMA_STEP:-2.5}"
 STEPS_MIN="${STEPS_MIN:-20}"
 STEPS_MAX="${STEPS_MAX:-100}"
 STEPS_STEP="${STEPS_STEP:-20}"
 RF_MODE="${RF_MODE:-physical_voigt}"
-# Combos per in-memory batch when n_combos exceeds this (peak RAM ~ batch×steps×500×3×4B).
 COMBO_BATCH_SIZE="${COMBO_BATCH_SIZE:-64}"
+DENSE_BIN_STRIDE="${DENSE_BIN_STRIDE:-5}"
+MC_DRAWS_PER_BIN="${MC_DRAWS_PER_BIN:-2}"
+UNMANIP_FRACTION="${UNMANIP_FRACTION:-0.0}"
 
 cd "${PKG_DIR}"
 
@@ -74,6 +79,8 @@ fi
 
 echo "Dulya v2 ssRF spectrum bin ${SLURM_ARRAY_TASK_ID} on $(hostname)"
 echo "Shard dir: ${SHARD_DIR}  combo_batch_size=${COMBO_BATCH_SIZE}"
+echo "gamma=[${GAMMA_MIN},${GAMMA_MAX}]/${GAMMA_STEP}  steps=[${STEPS_MIN},${STEPS_MAX}]/${STEPS_STEP}"
+echo "dense_stride=${DENSE_BIN_STRIDE}  mc_draws=${MC_DRAWS_PER_BIN}  unmanip_fraction=${UNMANIP_FRACTION}"
 
 apptainer run --bind "${PKG_DIR}:${PKG_DIR}" --pwd "${PKG_DIR}" \
   "${CONTAINERDIR}/pytorch-2.9.0.sif" \
@@ -94,5 +101,8 @@ apptainer run --bind "${PKG_DIR}:${PKG_DIR}" --pwd "${PKG_DIR}" \
   --steps-step "${STEPS_STEP}" \
   --rf-mode "${RF_MODE}" \
   --combo-batch-size "${COMBO_BATCH_SIZE}" \
+  --dense-bin-stride "${DENSE_BIN_STRIDE}" \
+  --mc-draws-per-bin "${MC_DRAWS_PER_BIN}" \
+  --unmanip-fraction "${UNMANIP_FRACTION}" \
   --skip-if-exists \
   "$@"

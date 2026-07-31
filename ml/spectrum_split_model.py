@@ -9,13 +9,13 @@ Inference path (Ps-only):
 
 Training:
   python ml/spectrum_split_model.py train \\
-      --data Data_Creation/dulya_fit_v2/data/spectrum_train/spectrum_train.npz \\
+      --data Data_Creation/dulya_fit_v2/data/spectrum_train \\
       --output ml/models/spectrum_split_model.pth
 
 Evaluation:
   python ml/test_spectrum_split.py \\
       --model ml/models/spectrum_split_model.pth \\
-      --data Data_Creation/dulya_fit_v2/data/spectrum_train/spectrum_train.npz
+      --data Data_Creation/dulya_fit_v2/data/spectrum_train
 """
 
 from __future__ import annotations
@@ -33,14 +33,41 @@ import torch.nn as nn
 import torch.optim as optim
 import torch.utils.data as data
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
-DULYA_V2 = REPO_ROOT / "Data_Creation" / "dulya_fit_v2"
-if str(REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(REPO_ROOT))
-if str(DULYA_V2) not in sys.path:
-    sys.path.insert(0, str(DULYA_V2))
+_SCRIPT_DIR = Path(__file__).resolve().parent
+# Local layout: ml/spectrum_split_model.py → repo root is parents[1].
+# Cluster layout: script often lives next to dulya_fit_v4/ (e.g. RF/).
+_REPO_CANDIDATES = (
+    _SCRIPT_DIR.parent,  # .../Spin-1-Manipulation
+    _SCRIPT_DIR,  # .../RF or similar
+)
+REPO_ROOT = next(
+    (
+        root
+        for root in _REPO_CANDIDATES
+        if (root / "Data_Creation" / "dulya_fit_v4").is_dir()
+        or (root / "dulya_fit_v4").is_dir()
+        or (root / "Data_Creation" / "dulya_fit_v2").is_dir()
+        or (root / "dulya_fit_v2").is_dir()
+    ),
+    _SCRIPT_DIR.parent,
+)
 
-import _bootstrap  # noqa: F401
+def _resolve_dulya_pkg() -> Path:
+    for root in (REPO_ROOT, _SCRIPT_DIR):
+        for name in ("dulya_fit_v4", "dulya_fit_v2"):
+            for candidate in (root / "Data_Creation" / name, root / name):
+                if candidate.is_dir():
+                    return candidate
+    raise ModuleNotFoundError(
+        "Could not locate dulya_fit_v4/v2 (need bin_io.py). "
+        f"Looked under {REPO_ROOT} and {_SCRIPT_DIR}."
+    )
+
+
+DULYA = _resolve_dulya_pkg()
+if str(DULYA) not in sys.path:
+    sys.path.insert(0, str(DULYA))
+
 from bin_io import SPECTRUM_TRAIN_MANIFEST_NAME
 from bin_setup import equilibrium_lineshape, get_shape_params, spin1_scale_factors
 from common import F_MAX, F_MIN, NUM_BINS
@@ -49,8 +76,8 @@ from lineshape import GenerateDulyaLineshape
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 SEED = 42
 
-DEFAULT_DATA = DULYA_V2 / "data" / "spectrum_train" / "spectrum_train.npz"
-DEFAULT_OUTPUT = REPO_ROOT / "ml" / "models" / "spectrum_split_model.pth"
+DEFAULT_DATA = "spectrum_train.npz"
+DEFAULT_OUTPUT = "models/spectrum_split_model.pth"
 
 TRAIN_POLARIZATION_FRACTION = 0.8
 NUM_EPOCHS = 200
@@ -61,6 +88,113 @@ PATIENCE = 25
 MIN_DELTA = 1e-6
 ALPHA_BOUND_WEIGHT = 0.01
 SMOOTHNESS_WEIGHT = 0.001
+MASKED_ALPHA_LOSS_WEIGHT = 0.01
+Q_LOSS_WEIGHT = 0.01
+ALPHA_MASK_REL_THRESHOLD = 1e-3
+
+_AMP_CALIBRATION_CACHE: dict[tuple, dict[str, np.ndarray | float | int]] = {}
+
+
+def build_amp_integration_calibration(
+    *,
+    num_bins: int = NUM_BINS,
+    shape_params: dict[str, float] | None = None,
+    p_min: float = -0.9,
+    p_max: float = 0.9,
+    p_step: float = 0.05,
+) -> dict[str, np.ndarray | float | int]:
+    """Equilibrium map from naive amp integration ``sum/(amp*n)`` to true ``P``."""
+    shape = shape_params if shape_params is not None else get_shape_params()
+    amp = float(shape["amp"])
+    n_bins = int(num_bins)
+    f = np.linspace(float(F_MIN), float(F_MAX), n_bins)
+    p_input: list[float] = []
+    p_amp_naive: list[float] = []
+    for p0 in np.arange(float(p_min), float(p_max) + 1e-12, float(p_step)):
+        if abs(float(p0)) < 1e-12:
+            continue
+        _, ip, im = GenerateDulyaLineshape(float(p0), f, shape)
+        p_sum = float(np.sum(ip + im))
+        q_sum = float(np.sum(ip - im))
+        denom = amp * float(n_bins)
+        if abs(denom) < 1e-30:
+            continue
+        p_amp = p_sum / denom
+        p_input.append(float(p0))
+        p_amp_naive.append(float(p_amp))
+    return {
+        "p_input": np.asarray(p_input, dtype=float),
+        "p_amp_naive": np.asarray(p_amp_naive, dtype=float),
+        "amp": amp,
+        "n_bins": n_bins,
+    }
+
+
+def _get_amp_integration_calibration(
+    *,
+    num_bins: int,
+    shape_params: dict[str, float] | None,
+) -> dict[str, np.ndarray | float | int]:
+    shape = shape_params if shape_params is not None else get_shape_params()
+    key = (int(num_bins), round(float(shape["amp"]), 12))
+    cached = _AMP_CALIBRATION_CACHE.get(key)
+    if cached is not None:
+        return cached
+    cal = build_amp_integration_calibration(num_bins=int(num_bins), shape_params=shape)
+    _AMP_CALIBRATION_CACHE[key] = cal
+    return cal
+
+
+def integrated_polarizations_calibrated(
+    iplus: np.ndarray,
+    iminus: np.ndarray,
+    *,
+    num_bins: int | None = None,
+    shape_params: dict[str, float] | None = None,
+    post_correct: bool = True,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Lineshape-integrated vector P and tensor Q with Dulya ``amp`` normalization.
+
+    Fit-scale stored spectra integrate as ``sum(I±) / (amp * n_bins)``; optional
+    equilibrium post-correction inverts the nonlinear amp map for ``P`` and scales
+    ``Q`` by the same factor (see ``Data_Creation/dulya_fit/polarization.py``).
+    """
+    ip = np.asarray(iplus, dtype=float)
+    im = np.asarray(iminus, dtype=float)
+    if ip.ndim == 1:
+        ip = ip.reshape(1, -1)
+        im = im.reshape(1, -1)
+        squeeze = True
+    else:
+        squeeze = False
+
+    n_bins = int(num_bins if num_bins is not None else ip.shape[1])
+    shape = shape_params if shape_params is not None else get_shape_params()
+    amp = float(shape["amp"])
+    denom = amp * float(n_bins)
+    if abs(denom) < 1e-30:
+        raise ValueError("amp * num_bins normalization factor is zero")
+
+    p_sum = np.sum(ip + im, axis=1)
+    q_sum = np.sum(ip - im, axis=1)
+    p_naive = p_sum / denom
+    q_naive = q_sum / denom
+
+    if post_correct:
+        cal = _get_amp_integration_calibration(num_bins=n_bins, shape_params=shape)
+        p_axis = np.asarray(cal["p_input"], dtype=float)
+        p_amp_axis = np.asarray(cal["p_amp_naive"], dtype=float)
+        p_corr = np.interp(p_naive, p_amp_axis, p_axis)
+        ratio = np.where(np.abs(p_naive) > 1e-30, p_corr / p_naive, 1.0)
+        q_corr = q_naive * ratio
+        p_out, q_out = p_corr, q_corr
+    else:
+        p_out, q_out = p_naive, q_naive
+
+    if squeeze:
+        return np.asarray(p_out[0], dtype=float), np.asarray(q_out[0], dtype=float)
+    return np.asarray(p_out, dtype=float), np.asarray(q_out, dtype=float)
 
 
 @dataclass
@@ -212,10 +346,9 @@ def build_input_channels(
     ps_batch: np.ndarray,
     *,
     use_residual: bool,
-    p0_batch: np.ndarray | None = None,
     shape_params: dict[str, float] | None = None,
 ) -> np.ndarray:
-    """Build (B, C, L) network input from Ps spectra."""
+    """Build (B, C, L) network input from Ps spectra without true-P hints."""
     ps_batch = np.asarray(ps_batch, dtype=np.float32)
     b, length = ps_batch.shape
     channels = [ps_batch]
@@ -223,8 +356,7 @@ def build_input_channels(
         delta = np.zeros_like(ps_batch, dtype=np.float32)
         shape = shape_params if shape_params is not None else get_shape_params()
         for i in range(b):
-            p_hint = None if p0_batch is None else float(p0_batch[i])
-            p_est = estimate_P_from_area(ps_batch[i], p_hint, num_bins=length, shape_params=shape)
+            p_est = estimate_P_from_area(ps_batch[i], None, num_bins=length, shape_params=shape)
             ps_eq, _, _ = compute_ps_eq(p_est, num_bins=length, shape_params=shape)
             ps_norm, _ = normalize_ps(ps_batch[i])
             eq_norm, _ = normalize_ps(ps_eq)
@@ -240,20 +372,54 @@ def physics_loss(
     iplus_true: torch.Tensor,
     iminus_true: torch.Tensor,
     *,
+    alpha_true: torch.Tensor | None = None,
     alpha_bound_weight: float = ALPHA_BOUND_WEIGHT,
     smoothness_weight: float = SMOOTHNESS_WEIGHT,
+    masked_alpha_weight: float = MASKED_ALPHA_LOSS_WEIGHT,
+    q_loss_weight: float = Q_LOSS_WEIGHT,
+    alpha_mask_rel_threshold: float = ALPHA_MASK_REL_THRESHOLD,
 ) -> torch.Tensor:
+    """Optimize per-bin intensities, signal-region alpha, and integrated Q."""
     iplus_pred = alpha * ps
     iminus_pred = (1.0 - alpha) * ps
     l1 = torch.mean(torch.abs(iplus_pred - iplus_true)) + torch.mean(
         torch.abs(iminus_pred - iminus_true)
     )
+
+    if alpha_true is None:
+        alpha_true = torch.where(
+            torch.abs(ps) > 1e-12,
+            iplus_true / torch.clamp(torch.abs(ps), min=1e-12),
+            torch.zeros_like(ps),
+        )
+    peak = torch.amax(torch.abs(ps), dim=1, keepdim=True)
+    alpha_mask = torch.abs(ps) >= float(alpha_mask_rel_threshold) * torch.clamp(
+        peak, min=1e-12
+    )
+    alpha_mask_f = alpha_mask.to(dtype=alpha.dtype)
+    masked_alpha = torch.sum(torch.abs(alpha - alpha_true) * alpha_mask_f) / torch.clamp(
+        torch.sum(alpha_mask_f), min=1.0
+    )
+
+    q_pred = torch.sum(iplus_pred - iminus_pred, dim=1)
+    q_true = torch.sum(iplus_true - iminus_true, dim=1)
+    signal_area = torch.sum(torch.abs(ps), dim=1)
+    q_loss = torch.mean(
+        torch.abs(q_pred - q_true) / torch.clamp(signal_area, min=1e-12)
+    )
+
     bound = torch.mean(torch.relu(-alpha) + torch.relu(alpha - 1.0))
     if alpha.shape[1] > 1:
         smooth = torch.mean(torch.abs(alpha[:, 1:] - alpha[:, :-1]))
     else:
         smooth = torch.zeros((), device=alpha.device)
-    return l1 + float(alpha_bound_weight) * bound + float(smoothness_weight) * smooth
+    return (
+        l1
+        + float(masked_alpha_weight) * masked_alpha
+        + float(q_loss_weight) * q_loss
+        + float(alpha_bound_weight) * bound
+        + float(smoothness_weight) * smooth
+    )
 
 
 @dataclass
@@ -290,20 +456,19 @@ class SpectrumSplitModel:
         p0_hint: float | None = None,
         device: torch.device | None = None,
     ) -> InferenceResult:
+        """Split one Ps spectrum; ``p0_hint`` is retained for API compatibility only."""
         dev = device or next(self.net.parameters()).device
         ps_arr = np.asarray(ps, dtype=np.float32).reshape(1, -1)
-        ps_norm, scale = normalize_ps(ps_arr[0], mode=self.normalize_mode)
+        ps_norm, _ = normalize_ps(ps_arr[0], mode=self.normalize_mode)
         p_est = estimate_P_from_area(
-            ps_arr[0] * scale,
-            p0_hint,
+            ps_arr[0],
+            None,
             num_bins=self.num_bins,
             shape_params=self.shape_params,
         )
-        p0_arr = np.asarray([p_est if p0_hint is None else p0_hint], dtype=np.float32)
         x_np = build_input_channels(
             ps_norm.reshape(1, -1),
             use_residual=self.use_residual,
-            p0_batch=p0_arr,
             shape_params=self.shape_params,
         )
         x = torch.from_numpy(x_np).float().to(dev)
@@ -321,6 +486,7 @@ class SpectrumSplitModel:
         p0_batch: np.ndarray | None = None,
         device: torch.device | None = None,
     ) -> tuple[np.ndarray, np.ndarray]:
+        """Split Ps spectra; ``p0_batch`` is retained for API compatibility only."""
         dev = device or next(self.net.parameters()).device
         ps_batch = np.asarray(ps_batch, dtype=np.float32)
         b = ps_batch.shape[0]
@@ -330,7 +496,6 @@ class SpectrumSplitModel:
         x_np = build_input_channels(
             ps_norm,
             use_residual=self.use_residual,
-            p0_batch=p0_batch,
             shape_params=self.shape_params,
         )
         x = torch.from_numpy(x_np).float().to(dev)
@@ -344,7 +509,6 @@ def _build_sample(
     ps: np.ndarray,
     iplus: np.ndarray,
     iminus: np.ndarray,
-    p0: float,
     *,
     use_residual: bool,
     normalize_mode: str,
@@ -355,7 +519,6 @@ def _build_sample(
     x_np = build_input_channels(
         ps_norm.reshape(1, -1),
         use_residual=use_residual,
-        p0_batch=np.asarray([p0], dtype=np.float32),
         shape_params=shape_params,
     )[0]
     return {
@@ -480,7 +643,6 @@ class ShardedSpectrumDataset(data.IterableDataset):
                 ps = np.asarray(npz["ps"], dtype=np.float32)[mask]
                 iplus = np.asarray(npz["iplus"], dtype=np.float32)[mask]
                 iminus = np.asarray(npz["iminus"], dtype=np.float32)[mask]
-                p0 = np.asarray(npz["p0"], dtype=np.float32)[mask]
 
             order = np.arange(ps.shape[0])
             if self.shuffle:
@@ -491,7 +653,6 @@ class ShardedSpectrumDataset(data.IterableDataset):
                     ps[j],
                     iplus[j],
                     iminus[j],
-                    float(p0[j]),
                     use_residual=self.use_residual,
                     normalize_mode=self.normalize_mode,
                     shape_params=self.shape_params,
@@ -523,7 +684,6 @@ class SpectrumDataset(data.Dataset):
         self.ps = np.asarray(arrays["ps"], dtype=np.float32)
         self.iplus = np.asarray(arrays["iplus"], dtype=np.float32)
         self.iminus = np.asarray(arrays["iminus"], dtype=np.float32)
-        self.p0 = np.asarray(arrays["p0"], dtype=np.float32)
         self.indices = np.asarray(indices, dtype=np.int64)
         self.use_residual = bool(use_residual)
         self.normalize_mode = str(normalize_mode)
@@ -538,7 +698,6 @@ class SpectrumDataset(data.Dataset):
             self.ps[j],
             self.iplus[j],
             self.iminus[j],
-            float(self.p0[j]),
             use_residual=self.use_residual,
             normalize_mode=self.normalize_mode,
             shape_params=self.shape_params,
@@ -565,6 +724,9 @@ def train_model(
     num_epochs: int = NUM_EPOCHS,
     batch_size: int = BATCH_SIZE,
     learning_rate: float = LEARNING_RATE,
+    masked_alpha_weight: float = MASKED_ALPHA_LOSS_WEIGHT,
+    q_loss_weight: float = Q_LOSS_WEIGHT,
+    alpha_mask_rel_threshold: float = ALPHA_MASK_REL_THRESHOLD,
 ) -> dict[str, Any]:
     data_path = Path(data_path)
     in_channels = 2 if use_residual else 1
@@ -627,6 +789,10 @@ def train_model(
                 ps,
                 alpha_true * ps,
                 (1.0 - alpha_true) * ps,
+                alpha_true=alpha_true,
+                masked_alpha_weight=masked_alpha_weight,
+                q_loss_weight=q_loss_weight,
+                alpha_mask_rel_threshold=alpha_mask_rel_threshold,
             )
             optimizer.zero_grad()
             loss.backward()
@@ -648,7 +814,16 @@ def train_model(
                     alpha_true = batch["alpha"].to(DEVICE)
                     alpha_pred = net(x)
                     val_acc += float(
-                        physics_loss(alpha_pred, ps, alpha_true * ps, (1.0 - alpha_true) * ps).item()
+                        physics_loss(
+                            alpha_pred,
+                            ps,
+                            alpha_true * ps,
+                            (1.0 - alpha_true) * ps,
+                            alpha_true=alpha_true,
+                            masked_alpha_weight=masked_alpha_weight,
+                            q_loss_weight=q_loss_weight,
+                            alpha_mask_rel_threshold=alpha_mask_rel_threshold,
+                        ).item()
                     )
                     val_n += 1
             val_loss = val_acc / max(val_n, 1)
@@ -682,6 +857,9 @@ def train_model(
         "num_bins": num_bins,
         "normalize_mode": "max",
         "shape_params": get_shape_params(),
+        "masked_alpha_loss_weight": float(masked_alpha_weight),
+        "q_loss_weight": float(q_loss_weight),
+        "alpha_mask_rel_threshold": float(alpha_mask_rel_threshold),
         "train_indices": train_idx,
         "holdout_indices": holdout_idx,
         "best_val_loss": best_loss,
@@ -725,6 +903,24 @@ def build_arg_parser() -> argparse.ArgumentParser:
     train_p.add_argument("--epochs", type=int, default=NUM_EPOCHS)
     train_p.add_argument("--batch-size", type=int, default=BATCH_SIZE)
     train_p.add_argument("--lr", type=float, default=LEARNING_RATE)
+    train_p.add_argument(
+        "--masked-alpha-weight",
+        type=float,
+        default=MASKED_ALPHA_LOSS_WEIGHT,
+        help="Weight for alpha L1 over bins with appreciable Ps",
+    )
+    train_p.add_argument(
+        "--q-loss-weight",
+        type=float,
+        default=Q_LOSS_WEIGHT,
+        help="Weight for area-normalized integrated-Q absolute error",
+    )
+    train_p.add_argument(
+        "--alpha-mask-threshold",
+        type=float,
+        default=ALPHA_MASK_REL_THRESHOLD,
+        help="Include bins where |Ps| >= threshold * max(|Ps|)",
+    )
 
     infer_p = sub.add_parser("infer", help="Run Ps-only inference on one NPZ row")
     infer_p.add_argument("--model", type=Path, default=DEFAULT_OUTPUT)
@@ -743,6 +939,9 @@ def main(argv: list[str] | None = None) -> None:
             num_epochs=int(args.epochs),
             batch_size=int(args.batch_size),
             learning_rate=float(args.lr),
+            masked_alpha_weight=float(args.masked_alpha_weight),
+            q_loss_weight=float(args.q_loss_weight),
+            alpha_mask_rel_threshold=float(args.alpha_mask_threshold),
         )
         print(json.dumps(result, indent=2), flush=True)
         return
@@ -751,7 +950,7 @@ def main(argv: list[str] | None = None) -> None:
         model = load_trained_model(args.model, DEVICE)
         arrays = load_spectrum_npz(args.data)
         idx = int(args.index)
-        res = model.predict_ps(arrays["ps"][idx], p0_hint=float(arrays["p0"][idx]), device=DEVICE)
+        res = model.predict_ps(arrays["ps"][idx], device=DEVICE)
         true_ip = arrays["iplus"][idx]
         true_im = arrays["iminus"][idx]
         l1_ip = float(np.mean(np.abs(res.iplus - true_ip)))

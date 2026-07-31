@@ -9,7 +9,6 @@ from pathlib import Path
 
 import numpy as np
 
-import _bootstrap  # noqa: F401
 from common import (
     NUM_BINS,
     PHYSICS_MODEL,
@@ -1102,6 +1101,9 @@ def _iter_flatten_spectrum_shard_file(
             sub = max(1, int(meta["step_subsample"]))
         else:
             sub = max(1, int(step_subsample))
+        # Instant AFP flip (n_relax=0) must keep the single post-flip spectrum.
+        if int(meta.get("n_relax", -1)) <= 0 and "n_relax" in meta:
+            sub = 1
 
         j_rep, step_rep = _build_flatten_row_indices(
             n_steps,

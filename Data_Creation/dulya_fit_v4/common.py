@@ -24,20 +24,21 @@ P_MAX = 0.9
 P_STEP = 0.05
 P_ABS_MIN = 0.02
 
-BURN_R_MIN = -2.0
-BURN_R_MAX = 2.0
+BURN_R_MIN = -3.0
+BURN_R_MAX = 3.0
 # Discrete ssRF burn parameter grids (no continuous burn-to-turnover).
-GAMMA_RF_MIN = 1.0
-GAMMA_RF_MAX = 2.0
-GAMMA_RF_STEP = 0.25
+GAMMA_RF_MIN = 5.0
+GAMMA_RF_MAX = 10.0
+GAMMA_RF_STEP = 2.5
 MIN_BURN_STEPS = 20
 MAX_BURN_STEPS = 100
 BURN_STEPS_STEP = 20
 DT = 0.0015
 
-SSRF_GAMMA_RF = 1.0  # demo / single-shot default
+SSRF_GAMMA_RF = 5.0  # demo / single-shot default
 SSRF_MAX_STEPS = 100  # alias of MAX_BURN_STEPS for CLI compatibility
-AFP_N_RELAX = 5000
+# Instantaneous AFP flip by default; raise for post-flip relaxation trajectories.
+AFP_N_RELAX = 0
 AFP_WINDOW = 8
 AFP_EFFICIENCY = 1.0
 AFP_CENTER_MARGIN = 0
@@ -128,8 +129,24 @@ COMBINED_TRAIN_ALL_DIR = DATA_DIR / "combined_train_all"
 MULTI_BURN_MIN = 2
 MULTI_BURN_MAX = 5
 AFP_STEP_SUBSAMPLE = 50
-UNMANIP_TRAIN_FRACTION = 0.10
+# Authoritative unmanip rows come from unmanip_bin_XXXX.npz at combine time.
+UNMANIP_TRAIN_FRACTION = 0.0
 DEFAULT_RANDOM_SSRF_SAMPLES = 0
+# Hybrid spectrum sampling: dense Cartesian on every Nth burn bin; MC elsewhere.
+SPECTRUM_DENSE_BIN_STRIDE = 5
+SPECTRUM_MC_DRAWS_PER_BIN = 2
+SPECTRUM_MAX_TRAIN_ROWS = 5_000_000
+SPECTRUM_MIN_BURN_BIN_COVERAGE = 0.95
+
+
+def effective_afp_step_subsample(
+    n_relax: int,
+    step_subsample: int = AFP_STEP_SUBSAMPLE,
+) -> int:
+    """Keep every relax step when there is no relaxation trajectory to thin."""
+    if int(n_relax) <= 0:
+        return 1
+    return max(1, int(step_subsample))
 # Process P×gamma×steps combos in batches during spectrum generation (peak RAM control).
 # Spectrum mode allocates a full (t_max, num_bins) cube per combo, so it needs a small
 # batch. Plain trajectory mode only allocates 6 center-bin (t_max,) arrays per combo
@@ -145,3 +162,33 @@ SLURM_LOG_DIR = _HERE / "slurm_logs"
 BURN_BIN_CHOICES = np.flatnonzero(
     (FREQUENCY > BURN_R_MIN) & (FREQUENCY < BURN_R_MAX)
 ).astype(int)
+# Inclusive SLURM array bounds for burn-window spectrum jobs (R in (BURN_R_MIN, BURN_R_MAX)).
+BURN_BIN_ARRAY_START = int(BURN_BIN_CHOICES[0]) if BURN_BIN_CHOICES.size else 0
+BURN_BIN_ARRAY_END = int(BURN_BIN_CHOICES[-1]) if BURN_BIN_CHOICES.size else -1
+
+
+def burn_bin_position(bin_idx: int) -> int | None:
+    """Index of ``bin_idx`` within ``BURN_BIN_CHOICES``, or None if outside the burn window."""
+    choices = np.asarray(BURN_BIN_CHOICES, dtype=int)
+    if choices.size == 0:
+        return None
+    pos = int(np.searchsorted(choices, int(bin_idx)))
+    if pos >= int(choices.size) or int(choices[pos]) != int(bin_idx):
+        return None
+    return pos
+
+
+def is_burn_bin(bin_idx: int) -> bool:
+    return burn_bin_position(bin_idx) is not None
+
+
+def is_dense_spectrum_bin(
+    bin_idx: int,
+    *,
+    stride: int = SPECTRUM_DENSE_BIN_STRIDE,
+) -> bool:
+    """True for every ``stride``-th burn-window bin (Cartesian γ×steps coverage)."""
+    pos = burn_bin_position(bin_idx)
+    if pos is None:
+        return False
+    return (int(pos) % max(1, int(stride))) == 0

@@ -28,7 +28,6 @@ from bin_io import (
     afp_spectrum_rows_path,
     afp_spectrum_shard_path,
     afp_shard_path,
-    bin_index_range,
     flatten_spectrum_shard_file_to_rows,
     flatten_spectrum_shard_files_to_rows,
     format_missing_bins_error,
@@ -47,6 +46,7 @@ from common import (
     AFP_SHARD_DIR,
     AFP_SPECTRUM_ROWS_DIR,
     AFP_STEP_SUBSAMPLE,
+    BURN_BIN_CHOICES,
     NUM_BINS,
     SOURCE_AFP,
     SOURCE_SSRF,
@@ -55,6 +55,7 @@ from common import (
     STORE_DTYPE,
     UNMANIP_SPECTRUM_ROWS_DIR,
     UNMANIP_TRAIN_DIR,
+    is_burn_bin,
 )
 from unmanipulated_bin_lineshape import unmanip_bin_path
 
@@ -166,8 +167,10 @@ def flatten_all_bins(
     missing: list[int] = []
     n_rows_total = 0
     n_bins_written = 0
+    # Spectrum manip shards are generated only for burn-window bins.
+    required_bins = [int(b) for b in np.asarray(BURN_BIN_CHOICES, dtype=int).tolist()]
 
-    for bin_idx in bin_index_range(int(num_bins)):
+    for bin_idx in required_bins:
         if source == "ssrf":
             if not list_ssrf_spectrum_shard_paths(shard_dir, bin_idx):
                 missing.append(bin_idx)
@@ -340,6 +343,12 @@ def main(argv: list[str] | None = None) -> None:
         raise SystemExit(
             "Provide --bin-idx <int>, set SLURM_ARRAY_TASK_ID, or pass --flatten-all"
         )
+    if not is_burn_bin(bin_idx):
+        print(
+            f"Skipping bin_idx={bin_idx}: outside burn window (no manip spectrum expected)",
+            flush=True,
+        )
+        return
 
     out_path = cfg["rows_path_fn"](output_dir, bin_idx)
     if args.skip_if_exists and out_path.is_file():

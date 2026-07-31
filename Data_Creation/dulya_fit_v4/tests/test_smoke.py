@@ -36,6 +36,12 @@ from combine_spectrum_train import combine_spectrum_shards
 from flatten_spectrum_rows import flatten_one_bin, flatten_unmanipulated_rows
 from bin_setup import equilibrium_lineshape, generate_unmanipulated_cube, get_shape_params
 from common import (
+    AFP_N_RELAX,
+    BURN_BIN_ARRAY_END,
+    BURN_BIN_ARRAY_START,
+    BURN_BIN_CHOICES,
+    BURN_R_MAX,
+    BURN_R_MIN,
     DEMO_BURN_BIN,
     DEMO_P,
     DT,
@@ -49,6 +55,12 @@ from common import (
     SOURCE_AFP,
     SOURCE_SSRF,
     SOURCE_UNMANIP,
+    SPECTRUM_DENSE_BIN_STRIDE,
+    burn_steps_grid,
+    effective_afp_step_subsample,
+    gamma_rf_grid,
+    is_burn_bin,
+    is_dense_spectrum_bin,
 )
 from model_bridge import build_spin1_model, configure_ssrf_burn
 from ssrf_bin_traj import run_one_bin as run_ssrf_bin
@@ -74,6 +86,41 @@ def smoke_dirs(tmp_path: Path) -> dict[str, Path]:
     for d in dirs.values():
         d.mkdir(parents=True, exist_ok=True)
     return dirs
+
+
+def test_spectrum_train_grid_defaults() -> None:
+    g = gamma_rf_grid()
+    s = burn_steps_grid()
+    np.testing.assert_allclose(g, np.array([5.0, 7.5, 10.0], dtype=float))
+    np.testing.assert_array_equal(s, np.array([20, 40, 60, 80, 100], dtype=np.int32))
+    assert BURN_R_MIN == -3.0 and BURN_R_MAX == 3.0
+    assert int(BURN_BIN_CHOICES.size) == 250
+    assert BURN_BIN_ARRAY_START == 125 and BURN_BIN_ARRAY_END == 374
+    assert AFP_N_RELAX == 0
+    assert effective_afp_step_subsample(0, 50) == 1
+    assert effective_afp_step_subsample(5000, 50) == 50
+    assert is_burn_bin(250)
+    assert not is_burn_bin(0)
+    # First burn bin is dense; next is MC for stride 5.
+    assert is_dense_spectrum_bin(int(BURN_BIN_CHOICES[0]), stride=SPECTRUM_DENSE_BIN_STRIDE)
+    assert not is_dense_spectrum_bin(int(BURN_BIN_CHOICES[1]), stride=SPECTRUM_DENSE_BIN_STRIDE)
+
+
+def test_afp_instant_flip_keeps_single_spectrum_step() -> None:
+    traj = run_afp_one(3, 0.3, n_relax=0, capture_spectrum=True, num_bins=32)
+    assert int(traj["n_steps"]) == 1
+    assert traj["ps_full"] is not None
+    assert np.asarray(traj["ps_full"]).shape == (1, 32)
+    spec = run_afp_spectrum_bin(
+        3,
+        p_values=SMOKE_P[:1],
+        num_bins=32,
+        n_relax=0,
+        step_subsample=50,
+        unmanip_fraction=0.0,
+    )
+    assert int(spec["step_subsample"]) == 1
+    assert int(spec["n_steps"][0]) == 1
 
 
 def test_package_is_self_contained() -> None:

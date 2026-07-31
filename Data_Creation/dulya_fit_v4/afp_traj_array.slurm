@@ -1,37 +1,42 @@
 #!/bin/bash
-# Flatten one AFP spectrum shard per array task into row-oriented NPZs.
-#
-# Run after afp_spectrum_array.slurm (or afp_traj_array.slurm --spectrum-mode):
-#   AFP_ID=$(sbatch --parsable afp_spectrum_array.slurm)
-#   sbatch --dependency=afterok:${AFP_ID} flatten_afp_spectrum_rows.slurm
+# Dulya-fit v2 AFP per-bin trajectory array (500 independent center bins).
 #
 # Submit from THIS directory (dulya_fit_v2/):
-#   sbatch flatten_afp_spectrum_rows.slurm
+#   sbatch afp_traj_array.slurm
+#
+# Then organize:
+#   ARRAY_JOB_ID=$(sbatch --parsable afp_traj_array.slurm)
+#   sbatch --dependency=afterok:${ARRAY_JOB_ID} afp_traj_combine.slurm
 
-#SBATCH --job-name=dulya-v2-flatten-afp-rows
+#SBATCH --job-name=dulya-v2-afp-traj
 #SBATCH --array=0-499
 #SBATCH --partition=standard
 #SBATCH -A spinquest_standard
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --output=slurm_logs/flatten_afp_rows_%A_%a.out
-#SBATCH --error=slurm_logs/flatten_afp_rows_%A_%a.err
-#SBATCH --time=04:00:00
+#SBATCH --output=slurm_logs/afp_traj_%A_%a.out
+#SBATCH --error=slurm_logs/afp_traj_%A_%a.err
+#SBATCH --time=12:00:00
 #SBATCH --cpus-per-task=2
-#SBATCH --mem=16G
+#SBATCH --mem=4G
 
 set -euo pipefail
 
 PKG_DIR="${SLURM_SUBMIT_DIR:-$(cd "$(dirname "$0")" && pwd)}"
 SHARD_DIR="${SHARD_DIR:-data/afp_shards}"
-OUTPUT_DIR="${OUTPUT_DIR:-data/afp_spectrum_rows}"
 NUM_BINS="${NUM_BINS:-500}"
-AFP_STEP_SUBSAMPLE="${AFP_STEP_SUBSAMPLE:-50}"
+P_MIN="${P_MIN:--0.9}"
+P_MAX="${P_MAX:-0.9}"
+P_STEP="${P_STEP:-0.05}"
+DT="${DT:-0.0015}"
+N_RELAX="${N_RELAX:-0}"
+AFP_WINDOW="${AFP_WINDOW:-8}"
+AFP_EFFICIENCY="${AFP_EFFICIENCY:-1.0}"
 
 cd "${PKG_DIR}"
 
 mkdir -p slurm_logs
-mkdir -p "${OUTPUT_DIR}"
+mkdir -p "${SHARD_DIR}"
 
 export MPLBACKEND="${MPLBACKEND:-Agg}"
 export MPLCONFIGDIR="${MPLCONFIGDIR:-${TMPDIR:-/tmp}/mplconfig_${SLURM_JOB_ID:-$$}}"
@@ -51,16 +56,23 @@ if [[ -z "${SLURM_ARRAY_TASK_ID:-}" ]]; then
   exit 1
 fi
 
-echo "Flatten AFP spectrum rows bin ${SLURM_ARRAY_TASK_ID} shard=${SHARD_DIR} -> ${OUTPUT_DIR}"
+echo "Dulya v2 AFP traj bin ${SLURM_ARRAY_TASK_ID} on $(hostname)"
+echo "Pkg dir: ${PKG_DIR}"
+echo "Shard dir: ${SHARD_DIR}"
+echo "P: [${P_MIN}, ${P_MAX}] step=${P_STEP}  dt=${DT}  n_relax=${N_RELAX}  window=${AFP_WINDOW}"
 
 apptainer run --bind "${PKG_DIR}:${PKG_DIR}" --pwd "${PKG_DIR}" \
   "${CONTAINERDIR}/pytorch-2.9.0.sif" \
-  flatten_spectrum_rows.py \
-  --source afp \
+  afp_bin_traj.py \
   --bin-idx "${SLURM_ARRAY_TASK_ID}" \
   --shard-dir "${SHARD_DIR}" \
-  --output-dir "${OUTPUT_DIR}" \
   --num-bins "${NUM_BINS}" \
-  --afp-step-subsample "${AFP_STEP_SUBSAMPLE}" \
+  --p-min "${P_MIN}" \
+  --p-max "${P_MAX}" \
+  --p-step "${P_STEP}" \
+  --dt "${DT}" \
+  --n-relax "${N_RELAX}" \
+  --afp-window "${AFP_WINDOW}" \
+  --afp-efficiency "${AFP_EFFICIENCY}" \
   --skip-if-exists \
   "$@"

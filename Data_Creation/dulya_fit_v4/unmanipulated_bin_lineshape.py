@@ -45,6 +45,53 @@ def unmanip_bin_path(output_dir: Path, bin_idx: int) -> Path:
     return Path(output_dir) / f"unmanip_bin_{int(bin_idx):04d}.npz"
 
 
+def verify_unmanip_train_dir(
+    unmanip_dir: Path,
+    *,
+    num_bins: int = NUM_BINS,
+    p_min: float = P_MIN,
+    p_max: float = P_MAX,
+    p_step: float = P_STEP,
+) -> dict:
+    """Check that per-bin unmanip NPZs cover ``0..num_bins-1`` with a shared P grid."""
+    unmanip_dir = Path(unmanip_dir)
+    expected_p = polarization_grid(float(p_min), float(p_max), float(p_step))
+    missing: list[int] = []
+    p_mismatch: list[int] = []
+    p_values: np.ndarray | None = None
+
+    for bin_idx in range(int(num_bins)):
+        path = unmanip_bin_path(unmanip_dir, bin_idx)
+        if not path.is_file():
+            missing.append(int(bin_idx))
+            continue
+        with np.load(path, allow_pickle=False) as data:
+            p0 = np.asarray(data["p0"], dtype=float)
+        if p_values is None:
+            p_values = p0
+            if p0.shape != expected_p.shape or not np.allclose(p0, expected_p, atol=1e-5):
+                p_mismatch.append(int(bin_idx))
+        elif p0.shape != p_values.shape or not np.allclose(p0, p_values, atol=1e-5):
+            p_mismatch.append(int(bin_idx))
+
+    ok = not missing and not p_mismatch and p_values is not None
+    return {
+        "ok": bool(ok),
+        "unmanip_dir": str(unmanip_dir),
+        "num_bins": int(num_bins),
+        "n_present": int(num_bins) - len(missing),
+        "n_missing": len(missing),
+        "missing_bins": missing,
+        "p_mismatch_bins": p_mismatch,
+        "n_p": int(p_values.size) if p_values is not None else 0,
+        "p_values": (
+            np.asarray(p_values, dtype=float)
+            if p_values is not None
+            else np.zeros(0, dtype=float)
+        ),
+    }
+
+
 def save_unmanip_bin(
     bin_idx: int,
     *,
@@ -228,11 +275,34 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--p-max", type=float, default=P_MAX)
     p.add_argument("--p-step", type=float, default=P_STEP)
     p.add_argument("--skip-if-exists", action="store_true")
+    p.add_argument(
+        "--verify-only",
+        action="store_true",
+        help="Verify existing unmanip_bin_XXXX.npz coverage/P-grid and exit",
+    )
     return p
 
 
 def main(argv: list[str] | None = None) -> None:
     args = build_arg_parser().parse_args(argv)
+    if args.verify_only:
+        report = verify_unmanip_train_dir(
+            args.output_dir,
+            num_bins=int(args.num_bins),
+            p_min=float(args.p_min),
+            p_max=float(args.p_max),
+            p_step=float(args.p_step),
+        )
+        print(
+            f"unmanip verify: ok={report['ok']}  present={report['n_present']}/"
+            f"{report['num_bins']}  n_p={report['n_p']}  "
+            f"missing={report['n_missing']}  p_mismatch={len(report['p_mismatch_bins'])}",
+            flush=True,
+        )
+        if not report["ok"]:
+            raise SystemExit(1)
+        return
+
     shape = get_shape_params()
     print_shape_banner(shape, num_bins=int(args.num_bins))
 

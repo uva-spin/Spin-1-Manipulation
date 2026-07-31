@@ -72,6 +72,8 @@ from common import (
     RF_MODE_PHYSICAL_VOIGT,
     RF_MODE_SINGLE_BIN,
     SEED,
+    SPECTRUM_DENSE_BIN_STRIDE,
+    SPECTRUM_MC_DRAWS_PER_BIN,
     SPECTRUM_SSRF_SHARD_DIR,
     STORE_DTYPE,
     SSRF_SHARD_DIR,
@@ -79,6 +81,8 @@ from common import (
     UNMANIP_TRAIN_FRACTION,
     burn_steps_grid,
     gamma_rf_grid,
+    is_burn_bin,
+    is_dense_spectrum_bin,
 )
 from model_bridge import (
     build_spin1_model,
@@ -114,6 +118,39 @@ def _sample_random_burn_params(
     gamma = rng.uniform(float(gamma_min), float(gamma_max))
     n_steps = rng.randint(int(steps_min), int(steps_max))
     return float(gamma), int(n_steps)
+
+
+def _sample_on_grid_burn_params(
+    rng: random.Random,
+    gamma_values: np.ndarray,
+    steps_values: np.ndarray,
+) -> tuple[float, int]:
+    """Sample (gamma_rf, n_steps) from the discrete training grids."""
+    g_vals = np.asarray(gamma_values, dtype=float)
+    s_vals = np.asarray(steps_values, dtype=np.int32)
+    if g_vals.size == 0 or s_vals.size == 0:
+        raise ValueError("gamma_values and steps_values must be non-empty for on-grid sampling")
+    return float(rng.choice(g_vals)), int(rng.choice(s_vals))
+
+
+def _build_mc_combos(
+    p_values: np.ndarray,
+    gamma_values: np.ndarray,
+    steps_values: np.ndarray,
+    *,
+    draws_per_p: int,
+    seed: int,
+    bin_idx: int,
+) -> list[tuple[float, float, int]]:
+    """Full P grid × ``draws_per_p`` on-grid (γ, n_steps) draws (deterministic per bin)."""
+    rng = _rng(int(seed) + 1_000_003 * int(bin_idx))
+    combos: list[tuple[float, float, int]] = []
+    n_draws = max(1, int(draws_per_p))
+    for p0 in np.asarray(p_values, dtype=float):
+        for _ in range(n_draws):
+            g, n_burn = _sample_on_grid_burn_params(rng, gamma_values, steps_values)
+            combos.append((float(p0), float(g), int(n_burn)))
+    return combos
 
 
 def _sample_multi_burn_plan(
@@ -1058,10 +1095,38 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Generate multi-burn (2-5 burns) random trajectories (spectrum mode)",
     )
     p.add_argument(
+        "--dense-bin-stride",
+        type=int,
+        default=SPECTRUM_DENSE_BIN_STRIDE,
+        help=(
+            "In --spectrum-mode, every Nth burn-window bin gets full Cartesian "
+            "P×gamma×steps; others use --mc-draws-per-bin on-grid MC samples"
+        ),
+    )
+    p.add_argument(
+        "--mc-draws-per-bin",
+        type=int,
+        default=SPECTRUM_MC_DRAWS_PER_BIN,
+        help="On-grid (gamma, n_steps) draws per polarization for non-dense spectrum bins",
+    )
+    p.add_argument(
+        "--force-dense",
+        action="store_true",
+        help="Force Cartesian P×gamma×steps for this bin (ignore dense-bin stride)",
+    )
+    p.add_argument(
+        "--force-mc",
+        action="store_true",
+        help="Force MC sampling for this bin (ignore dense-bin stride)",
+    )
+    p.add_argument(
         "--unmanip-fraction",
         type=float,
         default=UNMANIP_TRAIN_FRACTION,
-        help="Fraction of unmanipulated equilibrium samples (spectrum mode)",
+        help=(
+            "Fraction of unmanipulated equilibrium samples injected into spectrum "
+            "shards (default 0; prefer combine_spectrum_train --unmanip-dir)"
+        ),
     )
     p.add_argument(
         "--combo-batch-size",
@@ -1118,13 +1183,50 @@ def main(argv: list[str] | None = None) -> None:
             print(f"Skipping existing shard(s) for bin {bin_idx}", flush=True)
             return
 
+    if args.spectrum_mode and not is_burn_bin(bin_idx):
+        print(
+            f"Skipping bin_idx={bin_idx}: outside burn window "
+            f"(not in BURN_BIN_CHOICES, R not in burn range)",
+            flush=True,
+        )
+        return
+
     shape = get_shape_params()
     print_shape_banner(shape, num_bins=int(args.num_bins))
 
     p_values = polarization_grid(args.p_min, args.p_max, args.p_step)
     g_values = gamma_rf_grid(args.gamma_min, args.gamma_max, args.gamma_step)
     s_values = burn_steps_grid(args.steps_min, args.steps_max, args.steps_step)
-    n_combos = int(p_values.size * g_values.size * s_values.size)
+    if bool(args.force_dense) and bool(args.force_mc):
+        raise SystemExit("Pass at most one of --force-dense / --force-mc")
+    if args.spectrum_mode:
+        if bool(args.force_dense):
+            dense_mode = True
+        elif bool(args.force_mc):
+            dense_mode = False
+        else:
+            dense_mode = is_dense_spectrum_bin(
+                bin_idx, stride=int(args.dense_bin_stride)
+            )
+        if dense_mode:
+            combos = _build_combos(p_values, g_values, s_values)
+            sample_mode = "dense_cartesian"
+        else:
+            combos = _build_mc_combos(
+                p_values,
+                g_values,
+                s_values,
+                draws_per_p=int(args.mc_draws_per_bin),
+                seed=int(args.seed),
+                bin_idx=int(bin_idx),
+            )
+            sample_mode = "mc_on_grid"
+        n_combos = len(combos)
+    else:
+        dense_mode = True
+        sample_mode = "traj_cartesian"
+        combos = _build_combos(p_values, g_values, s_values)
+        n_combos = len(combos)
     if args.combo_batch_size is None:
         default_batch = (
             DEFAULT_SSRF_COMBO_BATCH_SIZE
@@ -1145,6 +1247,7 @@ def main(argv: list[str] | None = None) -> None:
     print(
         f"bin_idx={bin_idx}  n_P={p_values.size}  n_gamma={g_values.size}  "
         f"n_steps_grid={s_values.size}  n_combos={n_combos}  "
+        f"sample_mode={sample_mode}  "
         f"spectrum_mode={bool(args.spectrum_mode)}  combo_batch_size={combo_batch_size}  "
         f"est_monolithic~{est_full_gib:.1f} GiB  "
         f"random_samples={int(args.random_samples)}  multi_burn={bool(args.multi_burn)}  "
@@ -1164,19 +1267,26 @@ def main(argv: list[str] | None = None) -> None:
         lorentzian_fwhm_R=float(args.lorentz_fwhm),
         diffusion_scale=float(args.diffusion_scale),
     )
+    extra_meta["spectrum_sample_mode"] = sample_mode
+    extra_meta["dense_bin_stride"] = int(args.dense_bin_stride)
+    extra_meta["mc_draws_per_bin"] = int(args.mc_draws_per_bin)
     if args.spectrum_mode:
-        use_batches = n_combos > combo_batch_size
-        if use_batches and (
-            int(args.random_samples) > 0 or bool(args.multi_burn) or float(args.unmanip_fraction) > 0
-        ):
-            print(
-                "WARNING: batched spectrum generation supports the base grid only; "
-                "random/multi-burn/unmanip extras are skipped. "
-                "Lower combo count or increase --combo-batch-size to use run_one_bin_spectrum.",
-                flush=True,
-            )
-        if use_batches:
-            combos = _build_combos(p_values, g_values, s_values)
+        use_extras = (
+            int(args.random_samples) > 0
+            or bool(args.multi_burn)
+            or float(args.unmanip_fraction) > 0
+        )
+        # MC bins and large dense grids go through the combo-batch writer.
+        # Small dense grids with extras keep run_one_bin_spectrum for inject paths.
+        use_combo_writer = (not dense_mode) or (n_combos > combo_batch_size) or (not use_extras)
+        if use_combo_writer:
+            if dense_mode and use_extras and n_combos > combo_batch_size:
+                print(
+                    "WARNING: batched spectrum generation supports the base grid only; "
+                    "random/multi-burn/unmanip extras are skipped. "
+                    "Lower combo count or increase --combo-batch-size to use run_one_bin_spectrum.",
+                    flush=True,
+                )
             result = save_ssrf_spectrum_in_batches(
                 bin_idx,
                 combos=combos,
@@ -1194,7 +1304,7 @@ def main(argv: list[str] | None = None) -> None:
             )
             print(
                 f"Wrote {result['n_parts']} part shard(s) + manifest for bin {bin_idx}  "
-                f"n_samples={result['n_samples']}",
+                f"n_samples={result['n_samples']}  mode={sample_mode}",
                 flush=True,
             )
             return

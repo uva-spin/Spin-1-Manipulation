@@ -57,6 +57,8 @@ from common import (
     SOURCE_AFP,
     SOURCE_UNMANIP,
     UNMANIP_TRAIN_FRACTION,
+    effective_afp_step_subsample,
+    is_burn_bin,
 )
 from model_bridge import (
     afp_touched_bins,
@@ -324,6 +326,7 @@ def run_one_bin_spectrum(
 ) -> dict:
     """Full-spectrum AFP trajectories with step subsampling metadata."""
     rng = random.Random(int(seed))
+    effective_sub = effective_afp_step_subsample(int(n_relax), int(step_subsample))
     base = run_one_bin(
         bin_idx,
         p_values=p_values,
@@ -333,7 +336,7 @@ def run_one_bin_spectrum(
         afp_window=afp_window,
         afp_efficiency=afp_efficiency,
         capture_spectrum=True,
-        step_subsample=step_subsample,
+        step_subsample=effective_sub,
     )
     n_base = int(base["p_values"].size)
     n_unmanip = 0
@@ -407,13 +410,19 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--step-subsample",
         type=int,
         default=AFP_STEP_SUBSAMPLE,
-        help="Keep every Nth AFP relax step when combining (spectrum mode)",
+        help=(
+            "Keep every Nth AFP relax step when combining (spectrum mode). "
+            "Forced to 1 when --n-relax is 0 (instant flip only)."
+        ),
     )
     p.add_argument(
         "--unmanip-fraction",
         type=float,
         default=UNMANIP_TRAIN_FRACTION,
-        help="Fraction of unmanipulated equilibrium samples (spectrum mode)",
+        help=(
+            "Fraction of unmanipulated equilibrium samples injected into spectrum "
+            "shards (default 0; prefer combine_spectrum_train --unmanip-dir)"
+        ),
     )
     p.add_argument("--seed", type=int, default=SEED)
     p.add_argument("--skip-if-exists", action="store_true")
@@ -454,13 +463,22 @@ def main(argv: list[str] | None = None) -> None:
         print(f"Skipping existing shard {out}", flush=True)
         return
 
+    if args.spectrum_mode and not is_burn_bin(bin_idx):
+        print(
+            f"Skipping bin_idx={bin_idx}: outside burn window "
+            f"(not in BURN_BIN_CHOICES, R not in burn range)",
+            flush=True,
+        )
+        return
+
     shape = get_shape_params()
     print_shape_banner(shape, num_bins=int(args.num_bins))
 
     p_values = polarization_grid(args.p_min, args.p_max, args.p_step)
+    effective_sub = effective_afp_step_subsample(int(args.n_relax), int(args.step_subsample))
     print(
         f"bin_idx={bin_idx}  n_P={p_values.size}  spectrum_mode={bool(args.spectrum_mode)}  "
-        f"step_subsample={int(args.step_subsample)}  "
+        f"step_subsample={effective_sub} (requested={int(args.step_subsample)})  "
         f"unmanip_fraction={float(args.unmanip_fraction):.3f}  "
         f"P=[{args.p_min},{args.p_max}] step={args.p_step}  "
         f"dt={args.dt}  n_relax={args.n_relax}  "
@@ -476,7 +494,7 @@ def main(argv: list[str] | None = None) -> None:
             n_relax=args.n_relax,
             afp_window=args.afp_window,
             afp_efficiency=args.afp_efficiency,
-            step_subsample=int(args.step_subsample),
+            step_subsample=effective_sub,
             unmanip_fraction=float(args.unmanip_fraction),
             seed=int(args.seed),
         )

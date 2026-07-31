@@ -26,7 +26,8 @@ AFP_SHARD_DIR="${AFP_SHARD_DIR:-data/afp_shards}"
 UNMANIP_DIR="${UNMANIP_DIR:-data/unmanip_train}"
 OUTPUT="${OUTPUT:-data/spectrum_train/spectrum_train.npz}"
 NUM_BINS="${NUM_BINS:-500}"
-AFP_STEP_SUBSAMPLE="${AFP_STEP_SUBSAMPLE:-50}"
+# Instant-flip AFP shards use subsample 1; prefer_file_step_subsample also honors shard meta.
+AFP_STEP_SUBSAMPLE="${AFP_STEP_SUBSAMPLE:-1}"
 SHARD_SIZE="${SHARD_SIZE:-200000}"
 
 cd "${PKG_DIR}"

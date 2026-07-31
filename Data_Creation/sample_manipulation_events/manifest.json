@@ -1,0 +1,76 @@
+{
+  "dataset": "manipulation_event_v1",
+  "n_events": 10,
+  "events": [
+    {
+      "path": "afp/afp_p0.350_bin190.npz",
+      "event_id": "afp_p0.350_bin190",
+      "source": "afp",
+      "p0": 0.3499999940395355,
+      "center_bin": 190
+    },
+    {
+      "path": "afp/afp_p0.350_bin220.npz",
+      "event_id": "afp_p0.350_bin220",
+      "source": "afp",
+      "p0": 0.3499999940395355,
+      "center_bin": 220
+    },
+    {
+      "path": "afp/afp_p0.550_bin190.npz",
+      "event_id": "afp_p0.550_bin190",
+      "source": "afp",
+      "p0": 0.550000011920929,
+      "center_bin": 190
+    },
+    {
+      "path": "afp/afp_p0.550_bin220.npz",
+      "event_id": "afp_p0.550_bin220",
+      "source": "afp",
+      "p0": 0.550000011920929,
+      "center_bin": 220
+    },
+    {
+      "path": "ssrf/ssrf_p0.350_g7.5_b60_bin190.npz",
+      "event_id": "ssrf_p0.350_g7.5_b60_bin190",
+      "source": "ssrf",
+      "p0": 0.3499999940395355,
+      "center_bin": 190
+    },
+    {
+      "path": "ssrf/ssrf_p0.350_g7.5_b60_bin220.npz",
+      "event_id": "ssrf_p0.350_g7.5_b60_bin220",
+      "source": "ssrf",
+      "p0": 0.3499999940395355,
+      "center_bin": 220
+    },
+    {
+      "path": "ssrf/ssrf_p0.550_g7.5_b60_bin190.npz",
+      "event_id": "ssrf_p0.550_g7.5_b60_bin190",
+      "source": "ssrf",
+      "p0": 0.550000011920929,
+      "center_bin": 190
+    },
+    {
+      "path": "ssrf/ssrf_p0.550_g7.5_b60_bin220.npz",
+      "event_id": "ssrf_p0.550_g7.5_b60_bin220",
+      "source": "ssrf",
+      "p0": 0.550000011920929,
+      "center_bin": 220
+    },
+    {
+      "path": "unmanip/unmanip_p0.350.npz",
+      "event_id": "unmanip_p0.350",
+      "source": "unmanip",
+      "p0": 0.3499999940395355,
+      "center_bin": 250
+    },
+    {
+      "path": "unmanip/unmanip_p0.550.npz",
+      "event_id": "unmanip_p0.550",
+      "source": "unmanip",
+      "p0": 0.550000011920929,
+      "center_bin": 250
+    }
+  ]
+}
