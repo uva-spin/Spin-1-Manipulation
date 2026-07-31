@@ -232,3 +232,4 @@ models/
 **/sgd_trajectory_3d_rotating.gif
 
 *.pkl
+*.npz
