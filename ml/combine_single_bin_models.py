@@ -9,7 +9,8 @@ directory are ignored.
 
 Expects the current single_bin checkpoint schema:
   model_state_dict, X_mean, X_std, Ps_mean, Ps_std,
-  Iplus_mean/std, Iminus_mean/std, feature_names, hidden_dim, args, ...
+  P_mean/std, Q_mean/std, feature_names, hidden_dim, args, ...
+  (legacy Iplus/Iminus stats are accepted for older checkpoints)
 
 Example:
   python ml/combine_single_bin_models.py \\
@@ -31,7 +32,7 @@ import torch
 MODEL_PATTERN = re.compile(r"^binning_model_bin_(\d+)\.pth$")
 DEFAULT_MODEL_DIR = Path("TensorStudies/single_bin_results_v2")
 DEFAULT_NUM_BINS = 500
-DEFAULT_FEATURE_NAMES = ["ps", "p0"]
+DEFAULT_FEATURE_NAMES = ["ps"]
 
 
 def parse_args() -> argparse.Namespace:
@@ -141,8 +142,8 @@ def _as_feature_vector(value: Any, field_name: str, bin_idx: int) -> np.ndarray:
 
 
 def _input_dim_from_state_dict(state_dict: Dict[str, torch.Tensor]) -> Optional[int]:
-    """Infer MLP input width from the first Linear weight (net.0.weight)."""
-    for key in ("net.0.weight", "0.weight"):
+    """Infer MLP input width from the first trunk or legacy net Linear weight."""
+    for key in ("trunk.0.weight", "net.0.weight", "0.weight"):
         if key in state_dict:
             weight = state_dict[key]
             if hasattr(weight, "shape") and len(weight.shape) == 2:
@@ -174,6 +175,32 @@ def _load_input_stats(
     )
 
 
+def _load_output_stats(model_payload: Dict[str, Any], bin_idx: int) -> Tuple[float, float, float, float]:
+    """Return per-bin (P_mean, P_std, Q_mean, Q_std) from a checkpoint."""
+    if "P_mean" in model_payload and "Q_mean" in model_payload:
+        return (
+            float(model_payload["P_mean"]),
+            float(model_payload["P_std"]),
+            float(model_payload["Q_mean"]),
+            float(model_payload["Q_std"]),
+        )
+    if "Iplus_mean" in model_payload and "Iminus_mean" in model_payload:
+        return (
+            float(model_payload["Iplus_mean"]),
+            float(model_payload["Iplus_std"]),
+            float(model_payload["Iminus_mean"]),
+            float(model_payload["Iminus_std"]),
+        )
+    raise KeyError(
+        f"Model file for bin {bin_idx} is missing output scaling stats "
+        "(expected P_mean/P_std/Q_mean/Q_std or legacy Iplus/Iminus stats)."
+    )
+
+
+def _output_stats_are_pq(model_payload: Dict[str, Any]) -> bool:
+    return "P_mean" in model_payload and "Q_mean" in model_payload
+
+
 def _load_ps_stats(
     model_payload: Dict[str, Any],
     x_mean_row: np.ndarray,
@@ -190,7 +217,7 @@ def _normalize_feature_set(
     if feature_set is None:
         if list(feature_names) == ["ps"] or list(feature_names) == ["ps_at_burn_bin"]:
             return "ps"
-        if list(feature_names) == ["ps", "p0"]:
+        if list(feature_names) == ["ps", "p0"] or list(feature_names) == ["p0", "ps"]:
             return "ps_p0"
         return "burn_context" if len(feature_names) > 1 else "ps"
     name = str(feature_set).strip().lower()
@@ -224,13 +251,17 @@ def load_bin_models(
     x_std_rows: List[np.ndarray] = []
     ps_mean: List[float] = []
     ps_std: List[float] = []
-    iplus_mean: List[float] = []
-    iplus_std: List[float] = []
-    iminus_mean: List[float] = []
-    iminus_std: List[float] = []
+    p_mean: List[float] = []
+    p_std: List[float] = []
+    q_mean: List[float] = []
+    q_std: List[float] = []
     best_val_loss: List[float] = []
     metrics_per_bin: List[Dict[str, Any]] = []
     loaded_bin_indices: List[int] = []
+    target_mode: Optional[str] = None
+    pq_post_correct: Optional[bool] = None
+    targets_precalibrated: Optional[bool] = None
+    pq_target_scope: Optional[str] = None
 
     use_hidden: Optional[bool] = None
     hidden_dim: Optional[int] = None
@@ -330,16 +361,59 @@ def load_bin_models(
             )
 
         ps_m, ps_s = _load_ps_stats(model_payload, x_mean_row, x_std_row)
+        out_m, out_s, out2_m, out2_s = _load_output_stats(model_payload, bin_idx)
+        payload_target_mode = (
+            "pq"
+            if _output_stats_are_pq(model_payload)
+            else str(model_payload.get("target_mode", "iplus_iminus"))
+        )
+        _require_same(target_mode, payload_target_mode, "target_mode", bin_idx)
+        target_mode = payload_target_mode
+
+        payload_pq_post_correct = bool(model_payload.get("pq_post_correct", True))
+        payload_targets_precalibrated = bool(
+            model_payload.get("targets_precalibrated", False)
+        )
+        payload_pq_target_scope = str(
+            model_payload.get("pq_target_scope", "per_bin" if payload_targets_precalibrated else "")
+        )
+        if pq_post_correct is None:
+            pq_post_correct = payload_pq_post_correct
+        else:
+            _require_same(
+                pq_post_correct,
+                payload_pq_post_correct,
+                "pq_post_correct",
+                bin_idx,
+            )
+        if targets_precalibrated is None:
+            targets_precalibrated = payload_targets_precalibrated
+        else:
+            _require_same(
+                targets_precalibrated,
+                payload_targets_precalibrated,
+                "targets_precalibrated",
+                bin_idx,
+            )
+        if pq_target_scope is None:
+            pq_target_scope = payload_pq_target_scope or None
+        elif payload_pq_target_scope:
+            _require_same(
+                pq_target_scope,
+                payload_pq_target_scope,
+                "pq_target_scope",
+                bin_idx,
+            )
 
         bin_state_dicts.append(state_dict)
         x_mean_rows.append(x_mean_row)
         x_std_rows.append(x_std_row)
         ps_mean.append(ps_m)
         ps_std.append(ps_s)
-        iplus_mean.append(float(model_payload["Iplus_mean"]))
-        iplus_std.append(float(model_payload["Iplus_std"]))
-        iminus_mean.append(float(model_payload["Iminus_mean"]))
-        iminus_std.append(float(model_payload["Iminus_std"]))
+        p_mean.append(out_m)
+        p_std.append(out_s)
+        q_mean.append(out2_m)
+        q_std.append(out2_s)
         best_val_loss.append(float(model_payload.get("best_val_loss", float("nan"))))
         metrics_per_bin.append(dict(model_payload.get("metrics") or {}))
         loaded_bin_indices.append(int(model_payload.get("bin_idx", bin_idx)))
@@ -352,23 +426,34 @@ def load_bin_models(
         "X_std": np.stack(x_std_rows, axis=0).astype(np.float32),
         "Ps_mean": np.asarray(ps_mean, dtype=np.float32),
         "Ps_std": np.asarray(ps_std, dtype=np.float32),
-        "Iplus_mean": np.asarray(iplus_mean, dtype=np.float32),
-        "Iplus_std": np.asarray(iplus_std, dtype=np.float32),
-        "Iminus_mean": np.asarray(iminus_mean, dtype=np.float32),
-        "Iminus_std": np.asarray(iminus_std, dtype=np.float32),
+        "P_mean": np.asarray(p_mean, dtype=np.float32),
+        "P_std": np.asarray(p_std, dtype=np.float32),
+        "Q_mean": np.asarray(q_mean, dtype=np.float32),
+        "Q_std": np.asarray(q_std, dtype=np.float32),
     }
+    if target_mode == "iplus_iminus":
+        stats["Iplus_mean"] = stats["P_mean"]
+        stats["Iplus_std"] = stats["P_std"]
+        stats["Iminus_mean"] = stats["Q_mean"]
+        stats["Iminus_std"] = stats["Q_std"]
 
     return {
         "bin_state_dicts": bin_state_dicts,
         "stats": stats,
         "loaded_bin_indices": loaded_bin_indices,
+        "target_mode": target_mode if target_mode is not None else "pq",
+        "pq_post_correct": bool(pq_post_correct if pq_post_correct is not None else True),
+        "targets_precalibrated": bool(
+            targets_precalibrated if targets_precalibrated is not None else False
+        ),
+        "pq_target_scope": pq_target_scope or "per_bin",
         "use_hidden": use_hidden if use_hidden is not None else True,
         "hidden_dim": hidden_dim if hidden_dim is not None else 256,
         "feature_names": feature_names
         if feature_names is not None
         else list(DEFAULT_FEATURE_NAMES),
-        "feature_set": feature_set if feature_set is not None else "ps_p0",
-        "input_dim": input_dim if input_dim is not None else 2,
+        "feature_set": feature_set if feature_set is not None else "ps",
+        "input_dim": input_dim if input_dim is not None else 1,
         "best_val_loss": np.asarray(best_val_loss, dtype=np.float32),
         "metrics_per_bin": metrics_per_bin,
     }
@@ -395,6 +480,10 @@ def main() -> None:
         "input_dim": combined["input_dim"],
         "feature_names": combined["feature_names"],
         "feature_set": combined["feature_set"],
+        "target_mode": combined.get("target_mode", "pq"),
+        "pq_post_correct": combined.get("pq_post_correct", True),
+        "pq_target_scope": combined.get("pq_target_scope", "per_bin"),
+        "targets_precalibrated": combined.get("targets_precalibrated", False),
         "loaded_bin_indices": combined["loaded_bin_indices"],
         "best_val_loss_per_bin": combined["best_val_loss"],
         "metrics_per_bin": combined["metrics_per_bin"],

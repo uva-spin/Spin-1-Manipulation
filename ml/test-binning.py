@@ -1,9 +1,8 @@
 """
-Evaluate the combined per-bin burn-context model on test lineshapes.
+Evaluate the combined per-bin model on test lineshapes.
 
-For full-spectrum Ps-only inference with a single global model, see:
-  ml/spectrum_split_model.py  (training + inference)
-  ml/test_spectrum_split.py   (holdout evaluation)
+Test data must include pre-calibrated per-bin ``P``/``Q`` (or ``P_bins``/``Q_bins``)
+and optionally integrated ``true_P``/``true_Q`` — same convention as train NPZs.
 
 Run:
   python ml/test-binning.py
@@ -14,7 +13,9 @@ from __future__ import annotations
 import json
 import os
 import pickle
+import sys
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import matplotlib.pyplot as plt
@@ -22,6 +23,15 @@ import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+ML_DIR = REPO_ROOT / "ml"
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+if str(ML_DIR) not in sys.path:
+    sys.path.insert(0, str(ML_DIR))
+
+from single_bin import BinModel as LinearBinModel, load_bin_model_state_dict
 
 # ---------------------------------------------------------------------------
 # Config
@@ -34,7 +44,7 @@ SCALING_FILE = None
 
 DEVICE = "mps"
 NUM_BINS = 500
-FEATURE_CLIP_Z = 8.0
+FEATURE_CLIP_Z = 0.0
 EXAMPLES = 12
 EXAMPLE_SELECTION = "stratified"  # stratified | sequential | spread
 MAX_HEATMAP_SAMPLES = 200
@@ -177,26 +187,6 @@ def load_test_events(path: str) -> Tuple[List[LineshapeEvent], pd.DataFrame]:
 # ---------------------------------------------------------------------------
 
 
-class LinearBinModel(nn.Module):
-    def __init__(self, input_dim: int, hidden_dim: int = 256):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, 2),
-        )
-
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        out = self.net(x)
-        return out[:, 0], out[:, 1]
-
-
 def _resolve_input_stats(
     stats: Dict[str, np.ndarray], num_models: int, input_dim: int
 ) -> Tuple[np.ndarray, np.ndarray]:
@@ -219,14 +209,22 @@ def _resolve_input_stats(
 
 def _resolve_output_stats(
     stats: Dict[str, np.ndarray], num_models: int
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+) -> Tuple[str, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    if "P_mean" in stats and "Q_mean" in stats:
+        keys = ("P_mean", "P_std", "Q_mean", "Q_std")
+        mode = "pq"
+    else:
+        keys = ("Iplus_mean", "Iplus_std", "Iminus_mean", "Iminus_std")
+        mode = "iplus_iminus"
     out = {}
-    for key in ("Iplus_mean", "Iplus_std", "Iminus_mean", "Iminus_std"):
+    for key in keys:
         arr = np.asarray(stats[key], dtype=np.float32)
         if arr.shape != (num_models,):
             raise ValueError(f"Expected per-bin {key} length {num_models}, got {arr.shape}.")
         out[key] = arr
-    return out["Iplus_mean"], out["Iplus_std"], out["Iminus_mean"], out["Iminus_std"]
+    if mode == "pq":
+        return mode, out["P_mean"], out["P_std"], out["Q_mean"], out["Q_std"]
+    return mode, out["Iplus_mean"], out["Iplus_std"], out["Iminus_mean"], out["Iminus_std"]
 
 
 class Combined500BinModel(nn.Module):
@@ -253,13 +251,15 @@ class Combined500BinModel(nn.Module):
         )
 
         x_mean, x_std = _resolve_input_stats(stats, self.num_models, self.input_dim)
-        ip_m, ip_s, im_m, im_s = _resolve_output_stats(stats, self.num_models)
+        self.target_mode, out0_m, out0_s, out1_m, out1_s = _resolve_output_stats(
+            stats, self.num_models
+        )
         self._X_mean = torch.from_numpy(x_mean).float()
         self._X_std = torch.from_numpy(x_std).float()
-        self._Iplus_mean = torch.from_numpy(ip_m).float()
-        self._Iplus_std = torch.from_numpy(ip_s).float()
-        self._Iminus_mean = torch.from_numpy(im_m).float()
-        self._Iminus_std = torch.from_numpy(im_s).float()
+        self._Out0_mean = torch.from_numpy(out0_m).float()
+        self._Out0_std = torch.from_numpy(out0_s).float()
+        self._Out1_mean = torch.from_numpy(out1_m).float()
+        self._Out1_std = torch.from_numpy(out1_s).float()
 
     def _predict_bin(self, model_idx: int, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         mean = self._X_mean[model_idx].to(x.device)
@@ -267,10 +267,10 @@ class Combined500BinModel(nn.Module):
         x_norm = (x - mean) / (std + 1e-12)
         if self.feature_clip_z > 0:
             x_norm = torch.clamp(x_norm, -self.feature_clip_z, self.feature_clip_z)
-        ip_n, im_n = self.bin_models[model_idx](x_norm)
-        ip = ip_n * self._Iplus_std[model_idx].to(x.device) + self._Iplus_mean[model_idx].to(x.device)
-        im = im_n * self._Iminus_std[model_idx].to(x.device) + self._Iminus_mean[model_idx].to(x.device)
-        return ip, im
+        out0_n, out1_n = self.bin_models[model_idx](x_norm)
+        out0 = out0_n * self._Out0_std[model_idx].to(x.device) + self._Out0_mean[model_idx].to(x.device)
+        out1 = out1_n * self._Out1_std[model_idx].to(x.device) + self._Out1_mean[model_idx].to(x.device)
+        return out0, out1
 
     def forward(
         self, features: torch.Tensor, spectrum_bins: Optional[int] = None
@@ -279,15 +279,15 @@ class Combined500BinModel(nn.Module):
         if dim != self.input_dim:
             raise ValueError(f"Expected input_dim={self.input_dim}, got {dim}.")
         n_out = n_feat if spectrum_bins is None else spectrum_bins
-        pred_ip = torch.full((batch, n_out), float("nan"), device=features.device)
-        pred_im = torch.full((batch, n_out), float("nan"), device=features.device)
+        pred_out0 = torch.full((batch, n_out), float("nan"), device=features.device)
+        pred_out1 = torch.full((batch, n_out), float("nan"), device=features.device)
         for model_idx, bin_idx in enumerate(self.loaded_bin_indices):
             if bin_idx >= n_feat or bin_idx >= n_out:
                 continue
-            ip, im = self._predict_bin(model_idx, features[:, bin_idx, :])
-            pred_ip[:, bin_idx] = ip
-            pred_im[:, bin_idx] = im
-        return pred_ip, pred_im
+            out0, out1 = self._predict_bin(model_idx, features[:, bin_idx, :])
+            pred_out0[:, bin_idx] = out0
+            pred_out1[:, bin_idx] = out1
+        return pred_out0, pred_out1
 
     def predict_events(
         self, events: List[LineshapeEvent], spectrum_bins: int = NUM_BINS
@@ -296,15 +296,23 @@ class Combined500BinModel(nn.Module):
             np.stack([e.feature_matrix(self.feature_names) for e in events], axis=0)
         ).float().to(next(self.parameters()).device)
         with torch.no_grad():
-            ip, im = self(feats, spectrum_bins=spectrum_bins)
-        return ip.cpu().numpy(), im.cpu().numpy()
+            out0, out1 = self(feats, spectrum_bins=spectrum_bins)
+        return out0.cpu().numpy(), out1.cpu().numpy()
+
+    def predict_iplus_iminus_events(
+        self, events: List[LineshapeEvent], spectrum_bins: int = NUM_BINS
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        out0, out1 = self.predict_events(events, spectrum_bins=spectrum_bins)
+        if self.target_mode == "pq":
+            return 0.5 * (out0 + out1), 0.5 * (out0 - out1)
+        return out0, out1
 
 
 def load_combined_model(
     model_path: str,
     device: torch.device,
     scaling_path: Optional[str] = None,
-) -> Combined500BinModel:
+) -> Tuple[Combined500BinModel, dict]:
     payload = torch.load(model_path, map_location=device, weights_only=False)
     num_bins = payload["num_bins"]
     feature_names = list(payload.get("feature_names", ["ps_at_burn_bin"]))
@@ -325,7 +333,7 @@ def load_combined_model(
     models = []
     for i in range(num_bins):
         m = LinearBinModel(input_dim, hidden_dim)
-        m.load_state_dict(payload["bin_state_dicts"][i])
+        load_bin_model_state_dict(m, payload["bin_state_dicts"][i])
         m.eval()
         models.append(m)
 
@@ -335,7 +343,13 @@ def load_combined_model(
         feature_names,
         loaded_bin_indices=payload.get("loaded_bin_indices"),
     )
-    return combined.to(device).eval()
+    combined.target_mode = str(payload.get("target_mode", combined.target_mode))
+    meta = {
+        "pq_post_correct": bool(payload.get("pq_post_correct", True)),
+        "targets_precalibrated": bool(payload.get("targets_precalibrated", False)),
+        "target_mode": combined.target_mode,
+    }
+    return combined.to(device).eval(), meta
 
 
 # ---------------------------------------------------------------------------
@@ -345,6 +359,44 @@ def load_combined_model(
 
 def integrated_polarization(iplus: np.ndarray, iminus: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
     return np.nansum(iplus + iminus, axis=1), np.nansum(iplus - iminus, axis=1)
+
+
+def _stack_spectrum_column(df: pd.DataFrame, column: str) -> np.ndarray:
+    first = df[column].iloc[0]
+    if isinstance(first, (np.ndarray, list, tuple)):
+        return np.stack(
+            [np.asarray(row[column], dtype=np.float32) for _, row in df.iterrows()],
+            axis=0,
+        )
+    return np.stack([np.asarray(row, dtype=np.float32) for row in df[column]], axis=0)
+
+
+def pq_truth_from_dataframe(
+    df: pd.DataFrame,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Load pre-calibrated per-bin and integrated P/Q already stored in the test table."""
+    if "P_bins" in df.columns and "Q_bins" in df.columns:
+        p_bins = _stack_spectrum_column(df, "P_bins")
+        q_bins = _stack_spectrum_column(df, "Q_bins")
+    elif "P" in df.columns and "Q" in df.columns:
+        p_bins = _stack_spectrum_column(df, "P")
+        q_bins = _stack_spectrum_column(df, "Q")
+    else:
+        raise KeyError(
+            "Test file must include pre-calibrated per-bin truth: "
+            "'P_bins'/'Q_bins' or per-row 'P'/'Q' spectrum arrays"
+        )
+
+    if "true_P" in df.columns and "true_Q" in df.columns:
+        p_int = df["true_P"].to_numpy(dtype=np.float64)
+        q_int = df["true_Q"].to_numpy(dtype=np.float64)
+    elif "P_int" in df.columns and "Q_int" in df.columns:
+        p_int = df["P_int"].to_numpy(dtype=np.float64)
+        q_int = df["Q_int"].to_numpy(dtype=np.float64)
+    else:
+        p_int = np.nanmean(p_bins, axis=1)
+        q_int = np.nanmean(q_bins, axis=1)
+    return p_bins, q_bins, p_int, q_int
 
 
 def compute_rpe(pred: np.ndarray, true: np.ndarray, mask: np.ndarray) -> np.ndarray:
@@ -357,6 +409,12 @@ def compute_rpe(pred: np.ndarray, true: np.ndarray, mask: np.ndarray) -> np.ndar
 def print_results_table(stats: Dict[str, float]) -> None:
     """Print evaluation metrics as aligned tables."""
     sections = [
+        ("Per-bin targets", [
+            ("L1 P", stats["L1_P"], ""),
+            ("L1 Q", stats["L1_Q"], ""),
+            ("Median RPE P", stats["median_RPE_P"], "%"),
+            ("Median RPE Q", stats["median_RPE_Q"], "%"),
+        ]),
         ("Lineshape decomposition", [
             ("L1 I+", stats["L1_Iplus"], ""),
             ("L1 I-", stats["L1_Iminus"], ""),
@@ -457,16 +515,20 @@ def main() -> None:
     device = torch.device(DEVICE)
     print(f"Device: {device}")
 
-    model = load_combined_model(MODEL_PATH, device, SCALING_FILE)
+    model, model_meta = load_combined_model(MODEL_PATH, device, SCALING_FILE)
     events, df = load_test_events(TEST_FILE)
+
+    if bool(model_meta.get("targets_precalibrated", True)):
+        print("Evaluating against pre-calibrated NPZ/P/Q test targets", flush=True)
 
     ps = np.stack([e.ps for e in events])
     ip_true = np.stack([e.iplus for e in events])
     im_true = np.stack([e.iminus for e in events])
     n_bins = ps.shape[1]
 
-    ip_pred, im_pred = model.predict_events(events, spectrum_bins=n_bins)
-    pred_mask = np.isfinite(ip_pred) & np.isfinite(im_pred)
+    ip_pred, im_pred = model.predict_iplus_iminus_events(events, spectrum_bins=n_bins)
+    p_pred, q_pred = model.predict_events(events, spectrum_bins=n_bins)
+    pred_mask = np.isfinite(p_pred) & np.isfinite(q_pred)
     if not pred_mask.any():
         raise ValueError("No finite predictions produced.")
 
@@ -475,11 +537,28 @@ def main() -> None:
         f"({model.loaded_bin_indices[0]}..{model.loaded_bin_indices[-1]}), per-bin normalization."
     )
 
-    if "true_P" in df.columns:
+    if model.target_mode == "pq":
+        p_true_bins, q_true_bins, p_true, q_true = pq_truth_from_dataframe(df)
+    elif "true_P" in df.columns and "true_Q" in df.columns:
         p_true, q_true = df["true_P"].to_numpy(float), df["true_Q"].to_numpy(float)
+        p_true_bins = ps
+        q_true_bins = ip_true - im_true
     else:
         p_true, q_true = integrated_polarization(ip_true, im_true)
-    p_pred, q_pred = integrated_polarization(ip_pred, im_pred)
+        p_true_bins = ps
+        q_true_bins = ip_true - im_true
+
+    p_pred_bins = p_pred
+    q_pred_bins = q_pred
+    p_pred_int = np.nanmean(p_pred_bins, axis=1)
+    q_pred_int = np.nanmean(q_pred_bins, axis=1)
+
+    p_bin_mask = pred_mask & (np.abs(p_true_bins) > 1e-10)
+    q_bin_mask = pred_mask & (np.abs(q_true_bins) > 1e-10)
+    p_bin_rpe = compute_rpe(p_pred_bins, p_true_bins, p_bin_mask)
+    q_bin_rpe = compute_rpe(q_pred_bins, q_true_bins, q_bin_mask)
+    res_p_bins = np.where(pred_mask, p_pred_bins - p_true_bins, np.nan)
+    res_q_bins = np.where(pred_mask, q_pred_bins - q_true_bins, np.nan)
 
     ip_rpe = compute_rpe(ip_pred, ip_true, pred_mask)
     im_rpe = compute_rpe(im_pred, im_true, pred_mask)
@@ -490,17 +569,23 @@ def main() -> None:
 
     p_mask = np.abs(p_true) > 1e-10
     q_mask = np.abs(q_true) > 1e-10
-    p_rpe = compute_rpe(p_pred, p_true, p_mask)
-    q_rpe = compute_rpe(q_pred, q_true, q_mask)
-    res_p = p_pred - p_true
-    res_q = q_pred - q_true
+    p_rpe = compute_rpe(p_pred_int, p_true, p_mask)
+    q_rpe = compute_rpe(q_pred_int, q_true, q_mask)
+    res_p = p_pred_int - p_true
+    res_q = q_pred_int - q_true
 
+    med_p_bin = np.nanmedian(p_bin_rpe, axis=0)
+    med_q_bin = np.nanmedian(q_bin_rpe, axis=0)
     med_ip_bin = np.nanmedian(ip_rpe, axis=0)
     med_im_bin = np.nanmedian(im_rpe, axis=0)
 
     stats = {
         "n_samples": int(ps.shape[0]),
         "n_bins": int(n_bins),
+        "L1_P": float(np.mean(np.abs(p_pred_bins[pred_mask] - p_true_bins[pred_mask]))),
+        "L1_Q": float(np.mean(np.abs(q_pred_bins[pred_mask] - q_true_bins[pred_mask]))),
+        "median_RPE_P": float(np.nanmedian(p_bin_rpe[p_bin_mask])),
+        "median_RPE_Q": float(np.nanmedian(q_bin_rpe[q_bin_mask])),
         "L1_Iplus": float(np.mean(np.abs(ip_pred[pred_mask] - ip_true[pred_mask]))),
         "L1_Iminus": float(np.mean(np.abs(im_pred[pred_mask] - im_true[pred_mask]))),
         "median_RPE_Iplus": float(np.nanmedian(ip_rpe[ip_mask])),
@@ -518,7 +603,13 @@ def main() -> None:
         json.dump(stats, f, indent=2)
 
     pd.DataFrame(
-        {"bin_idx": np.arange(n_bins), "median_rpe_iplus": med_ip_bin, "median_rpe_iminus": med_im_bin}
+        {
+            "bin_idx": np.arange(n_bins),
+            "median_rpe_p": med_p_bin,
+            "median_rpe_q": med_q_bin,
+            "median_rpe_iplus": med_ip_bin,
+            "median_rpe_iminus": med_im_bin,
+        }
     ).to_csv(os.path.join(OUTPUT_DIR, "median_rpe_per_bin.csv"), index=False)
 
     print_results_table(stats)

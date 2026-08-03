@@ -2,15 +2,15 @@
 # Combine per-bin model checkpoints after the array job finishes.
 #
 # Submit with dependency on a completed array job (from repo root):
-#   ARRAY_JOB_ID=$(sbatch --parsable ml/train_single_bin_array.slurm)
-#   sbatch --dependency=afterok:${ARRAY_JOB_ID} ml/combine_single_bin_models.slurm
+#   TRAIN_JOB=$(sbatch --parsable ml/train_single_bin_array.slurm)
+#   sbatch --dependency=afterok:${TRAIN_JOB} ml/combine_single_bin_models.slurm
 #
 # Or standalone once all per-bin checkpoints exist:
 #   sbatch ml/combine_single_bin_models.slurm
 #
-# Override:
-#   MODEL_DIR=TensorStudies/single_bin_results_v2 \
-#   OUTPUT=TensorStudies/single_bin_results_v2/combined_bin_model.pth \
+# Override (match OUTPUT_DIR / TARGET_MODE from train job):
+#   MODEL_DIR=TensorStudies/single_bin_spectrum_splitq \
+#   OUTPUT=TensorStudies/single_bin_spectrum_splitq/combined_bin_model.pth \
 #   NUM_BINS=500 \
 #     sbatch ml/combine_single_bin_models.slurm
 
@@ -26,7 +26,7 @@
 set -euo pipefail
 
 REPO_ROOT="${SLURM_SUBMIT_DIR:-$(pwd)}"
-MODEL_DIR="${MODEL_DIR:-TensorStudies/single_bin_results_v2}"
+MODEL_DIR="${MODEL_DIR:-single_bin_models}"
 OUTPUT="${OUTPUT:-${MODEL_DIR}/combined_bin_model.pth}"
 NUM_BINS="${NUM_BINS:-500}"
 STRICT="${STRICT:-1}"

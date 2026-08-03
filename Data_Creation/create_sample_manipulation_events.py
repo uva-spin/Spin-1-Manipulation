@@ -30,7 +30,6 @@ if str(DULYA_PKG) not in sys.path:
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
-import _bootstrap  # noqa: E402
 from afp_bin_traj import run_one_polarization as run_afp_event  # noqa: E402
 from common import (  # noqa: E402
     AFP_N_RELAX,

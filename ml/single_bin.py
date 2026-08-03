@@ -1,13 +1,11 @@
 """
-Train one per-bin model: ps -> (iplus, iminus) at that spectral bin.
+Train one per-bin model from per-bin NPZ data.
 
-Expects a per-bin training NPZ from the rate_eqs_test organize/combine pipeline:
-  combined_train/train_bin_XXXX.npz
-  ssrf_train/ssrf_train_bin_XXXX.npz
-  afp_train/afp_train_bin_XXXX.npz
+Features: p0 (initial polarization) and ps at the observation bin.
+Targets: CC-calibrated P and Q stored in the NPZ (from the data-generation pipeline).
 
-Required arrays: ps, iplus, iminus, p0 (p0 is used for train/holdout splits only)
-Optional: amp, is_mirror, source, center_bin / burn_bin
+Required NPZ arrays: ps, p0, iplus, iminus, P, Q
+Optional: q, amp, source, center_bin, meta_json
 """
 
 from __future__ import annotations
@@ -29,8 +27,8 @@ SEED = 42
 ### Training parameters ###
 
 TRAIN_POLARIZATION_FRACTION = 0.8
-FEATURE_SET = "ps"
-NUM_BINS = 500
+FEATURE_SET = "p0_ps"
+TARGET_MODE = "pq"
 NUM_EPOCHS = 1000
 BATCH_SIZE = 64
 LEARNING_RATE = 1e-3
@@ -42,9 +40,10 @@ LR_FACTOR = 0.5
 LR_MIN = 1e-8
 MAX_GRAD_NORM = 1.0
 HIDDEN_DIM = 256
+HEAD_LAYOUT = "split"
 
-DEFAULT_DATA_DIR = Path("physics/lineshape/rate_eqs_test/combined_train_all")
-DEFAULT_OUTPUT_DIR = Path("TensorStudies/single_bin_results_v2")
+DEFAULT_DATA_DIR = Path("combined_train_all")
+DEFAULT_OUTPUT_DIR = Path("single_bin_models")
 
 
 def to_column(values: np.ndarray) -> torch.Tensor:
@@ -56,9 +55,11 @@ def to_matrix(values: np.ndarray) -> torch.Tensor:
 
 
 class BinModel(nn.Module):
+    """Shared trunk with separate P and Q output heads."""
+
     def __init__(self, input_dim: int, hidden_dim: int = 128):
         super().__init__()
-        self.net = nn.Sequential(
+        self.trunk = nn.Sequential(
             nn.Linear(input_dim, hidden_dim, bias=True),
             nn.ReLU(),
             nn.Linear(hidden_dim, hidden_dim, bias=True),
@@ -67,8 +68,9 @@ class BinModel(nn.Module):
             nn.ReLU(),
             nn.Linear(hidden_dim, hidden_dim, bias=True),
             nn.ReLU(),
-            nn.Linear(hidden_dim, 2, bias=True),
         )
+        self.head_p = nn.Linear(hidden_dim, 1, bias=True)
+        self.head_q = nn.Linear(hidden_dim, 1, bias=True)
         self._initialize_weights()
 
     def _initialize_weights(self) -> None:
@@ -79,8 +81,44 @@ class BinModel(nn.Module):
                     nn.init.constant_(module.bias, 0.0)
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        out = self.net(x)
-        return out[:, 0], out[:, 1]
+        hidden = self.trunk(x)
+        return self.head_p(hidden).squeeze(-1), self.head_q(hidden).squeeze(-1)
+
+
+def _is_split_head_state_dict(state_dict: Dict[str, torch.Tensor]) -> bool:
+    return "head_p.weight" in state_dict
+
+
+def _legacy_fused_to_split_state_dict(
+    state_dict: Dict[str, torch.Tensor],
+) -> Dict[str, torch.Tensor]:
+    """Upgrade checkpoints from a single Linear(hidden, 2) output layer."""
+    if _is_split_head_state_dict(state_dict):
+        return state_dict
+    if "net.8.weight" not in state_dict:
+        raise KeyError(
+            "Unrecognized checkpoint layout: expected split heads (head_p/head_q) "
+            "or legacy fused net.8 output"
+        )
+    out: Dict[str, torch.Tensor] = {}
+    for layer_idx in (0, 2, 4, 6):
+        out[f"trunk.{layer_idx}.weight"] = state_dict[f"net.{layer_idx}.weight"]
+        out[f"trunk.{layer_idx}.bias"] = state_dict[f"net.{layer_idx}.bias"]
+    fused_weight = state_dict["net.8.weight"]
+    fused_bias = state_dict["net.8.bias"]
+    out["head_p.weight"] = fused_weight[0:1].clone()
+    out["head_p.bias"] = fused_bias[0:1].clone()
+    out["head_q.weight"] = fused_weight[1:2].clone()
+    out["head_q.bias"] = fused_bias[1:2].clone()
+    return out
+
+
+def load_bin_model_state_dict(
+    model: BinModel,
+    state_dict: Dict[str, torch.Tensor],
+) -> None:
+    """Load split-head or legacy fused-head per-bin checkpoint weights."""
+    model.load_state_dict(_legacy_fused_to_split_state_dict(state_dict), strict=True)
 
 
 def resolve_bin_npz(data_dir: Path, bin_idx: int) -> Path:
@@ -104,20 +142,30 @@ def load_bin_npz(path: Path) -> Dict[str, np.ndarray]:
     path = Path(path)
     with np.load(path, allow_pickle=False) as data:
         ps = np.asarray(data["ps"], dtype=np.float32)
-        iplus = np.asarray(data["iplus"], dtype=np.float32)
-        iminus = np.asarray(data["iminus"], dtype=np.float32)
         p0 = np.asarray(data["p0"], dtype=np.float32)
+        if "P" not in data.files or "Q" not in data.files:
+            raise KeyError(
+                f"{path}: missing calibrated 'P' and/or 'Q'; "
+                "regenerate train NPZs with combine_all_train.py or "
+                "combine_spectrum_train_bins.py"
+            )
         out: Dict[str, np.ndarray] = {
             "ps": ps,
-            "iplus": iplus,
-            "iminus": iminus,
             "p0": p0,
+            "P": np.asarray(data["P"], dtype=np.float32),
+            "Q": np.asarray(data["Q"], dtype=np.float32),
             "amp": (
                 np.asarray(data["amp"], dtype=np.float32)
                 if "amp" in data.files
                 else np.abs(ps)
             ),
         }
+        if "q" in data.files:
+            out["q"] = np.asarray(data["q"], dtype=np.float32)
+        if "iplus" in data.files:
+            out["iplus"] = np.asarray(data["iplus"], dtype=np.float32)
+        if "iminus" in data.files:
+            out["iminus"] = np.asarray(data["iminus"], dtype=np.float32)
         if "is_mirror" in data.files:
             out["is_mirror"] = np.asarray(data["is_mirror"], dtype=np.float32)
         if "source" in data.files:
@@ -141,39 +189,11 @@ def load_bin_npz(path: Path) -> Dict[str, np.ndarray]:
     return out
 
 
-def build_features(
-    arrays: Dict[str, np.ndarray],
-    feature_set: str,
-) -> Tuple[np.ndarray, List[str]]:
-    """Build model input matrix and ordered feature names."""
-    name = str(feature_set).strip().lower()
-    if name in ("ps", "ps_only", "burn_context"):
-        cols = [arrays["ps"]]
-        names = ["ps"]
-    elif name in ("ps_p0",):
-        cols = [arrays["ps"], arrays["p0"]]
-        names = ["ps", "p0"]
-    elif name in ("amp_p0",):
-        cols = [arrays["amp"], arrays["p0"]]
-        names = ["amp", "p0"]
-    elif name in ("ps_p0_source", "full"):
-        if "source" not in arrays:
-            raise KeyError(
-                f"feature_set={feature_set!r} needs 'source' "
-                "(use combined_train/train_bin_*.npz)"
-            )
-        cols = [arrays["ps"], arrays["p0"], arrays["source"]]
-        names = ["ps", "p0", "source"]
-        if "is_mirror" in arrays:
-            cols.append(arrays["is_mirror"])
-            names.append("is_mirror")
-    else:
-        raise ValueError(
-            f"Unknown feature_set={feature_set!r}; "
-            "expected one of: ps, ps_p0, amp_p0, ps_p0_source, full"
-        )
-    features = np.column_stack(cols).astype(np.float32, copy=False)
-    return features, names
+def build_features(arrays: Dict[str, np.ndarray]) -> Tuple[np.ndarray, List[str], int]:
+    p0 = arrays["p0"].reshape(-1, 1).astype(np.float32, copy=False)
+    ps = arrays["ps"].reshape(-1, 1).astype(np.float32, copy=False)
+    features = np.concatenate([p0, ps], axis=1).astype(np.float32, copy=False)
+    return features, ["p0", "ps"], 1
 
 
 def clip_features_z(features: np.ndarray, clip_z: float) -> np.ndarray:
@@ -190,15 +210,14 @@ def clip_features_z(features: np.ndarray, clip_z: float) -> np.ndarray:
 def load_bin_arrays(
     data_path: Path,
     train_polarization_fraction: float,
-    feature_set: str,
     feature_clip_z: float = 0.0,
 ) -> Dict[str, Any]:
     raw = load_bin_npz(data_path)
-    features, feature_names = build_features(raw, feature_set)
+    features, feature_names, ps_col = build_features(raw)
     features = clip_features_z(features, feature_clip_z)
 
-    iplus = raw["iplus"]
-    iminus = raw["iminus"]
+    p_target = np.asarray(raw["P"], dtype=np.float32)
+    q_target = np.asarray(raw["Q"], dtype=np.float32)
     polarizations = raw["p0"]
 
     unique_p = np.unique(polarizations)
@@ -222,12 +241,13 @@ def load_bin_arrays(
 
     return {
         "x_train": to_matrix(features[train_mask]),
-        "iplus_train": to_column(iplus[train_mask]),
-        "iminus_train": to_column(iminus[train_mask]),
+        "P_train": to_column(p_target[train_mask]),
+        "Q_train": to_column(q_target[train_mask]),
         "x_holdout": to_matrix(features[holdout_mask]),
-        "iplus_holdout": to_column(iplus[holdout_mask]),
-        "iminus_holdout": to_column(iminus[holdout_mask]),
+        "P_holdout": to_column(p_target[holdout_mask]),
+        "Q_holdout": to_column(q_target[holdout_mask]),
         "feature_names": feature_names,
+        "ps_col": int(ps_col),
         "n_samples": int(features.shape[0]),
         "n_train": int(train_mask.sum()),
         "n_holdout": int(holdout_mask.sum()),
@@ -261,16 +281,10 @@ def parse_args() -> argparse.Namespace:
         help="Directory for checkpoints and metrics",
     )
     parser.add_argument(
-        "--feature-set",
-        type=str,
-        default=FEATURE_SET,
-        help="Feature set: ps|ps_p0|amp_p0|ps_p0_source|full (default: ps)",
-    )
-    parser.add_argument(
         "--feature-clip-z",
         type=float,
         default=0.0,
-        help="Optional |z|-clip on features before split (0 disables)",
+        help="Optional |z|-clip on ps before split (0 disables)",
     )
     parser.add_argument(
         "--train-polarization-fraction",
@@ -286,32 +300,48 @@ def build_bin_datasets(
     validation_fraction: float,
 ) -> Tuple[data.TensorDataset, data.TensorDataset, data.TensorDataset, Dict[str, torch.Tensor]]:
     x_train = arrays["x_train"]
-    iplus_train = arrays["iplus_train"]
-    iminus_train = arrays["iminus_train"]
     x_holdout = arrays["x_holdout"]
-    iplus_holdout = arrays["iplus_holdout"]
-    iminus_holdout = arrays["iminus_holdout"]
+    ps_col = int(arrays["ps_col"])
 
     x_mean = x_train.mean(dim=0, keepdim=True)
     x_std = x_train.std(dim=0, keepdim=True).clamp_min(1e-12)
-
-    iplus_mean = iplus_train.mean()
-    iplus_std = iplus_train.std().clamp_min(1e-12)
-
-    iminus_mean = iminus_train.mean()
-    iminus_std = iminus_train.std().clamp_min(1e-12)
-
     x_train_norm = (x_train - x_mean) / x_std
-    iplus_train_norm = (iplus_train - iplus_mean) / iplus_std
-    iminus_train_norm = (iminus_train - iminus_mean) / iminus_std
-
     x_holdout_norm = (x_holdout - x_mean) / x_std
-    iplus_holdout_norm = (iplus_holdout - iplus_mean) / iplus_std
-    iminus_holdout_norm = (iminus_holdout - iminus_mean) / iminus_std
 
+    p_train = arrays["P_train"]
+    q_train = arrays["Q_train"]
+    p_holdout = arrays["P_holdout"]
+    q_holdout = arrays["Q_holdout"]
+
+    p_mean = p_train.mean()
+    p_std = p_train.std().clamp_min(1e-12)
+    q_mean = q_train.mean()
+    q_std = q_train.std().clamp_min(1e-12)
+
+    stats: Dict[str, torch.Tensor] = {
+        "x_mean": x_mean.detach().cpu(),
+        "x_std": x_std.detach().cpu(),
+        "ps_mean": x_mean[0, ps_col].detach().cpu(),
+        "ps_std": x_std[0, ps_col].detach().cpu(),
+        "ps_col": ps_col,
+        "P_mean": p_mean.detach().cpu(),
+        "P_std": p_std.detach().cpu(),
+        "Q_mean": q_mean.detach().cpu(),
+        "Q_std": q_std.detach().cpu(),
+    }
+
+    p_train_norm = (p_train - p_mean) / p_std
+    q_train_norm = (q_train - q_mean) / q_std
+    p_holdout_norm = (p_holdout - p_mean) / p_std
+    q_holdout_norm = (q_holdout - q_mean) / q_std
+
+    train_dataset = data.TensorDataset(x_train_norm, p_train_norm, q_train_norm)
     split_source = data.TensorDataset(
-        x_holdout_norm, iplus_holdout_norm, iminus_holdout_norm
+        x_holdout_norm,
+        p_holdout_norm,
+        q_holdout_norm,
     )
+
     val_count = int(round(len(split_source) * validation_fraction))
     val_count = max(1, min(val_count, len(split_source) - 1))
     test_count = len(split_source) - val_count
@@ -321,37 +351,20 @@ def build_bin_datasets(
         generator=torch.Generator().manual_seed(SEED),
     )
 
-    train_dataset = data.TensorDataset(
-        x_train_norm,
-        iplus_train_norm,
-        iminus_train_norm,
-    )
-
     val_indices = val_dataset.indices
     test_indices = test_dataset.indices
 
     val_bin_dataset = data.TensorDataset(
-        x_holdout_norm[val_indices],
-        iplus_holdout_norm[val_indices],
-        iminus_holdout_norm[val_indices],
+        split_source.tensors[0][val_indices],
+        split_source.tensors[1][val_indices],
+        split_source.tensors[2][val_indices],
     )
     test_bin_dataset = data.TensorDataset(
-        x_holdout_norm[test_indices],
-        iplus_holdout_norm[test_indices],
-        iminus_holdout_norm[test_indices],
+        split_source.tensors[0][test_indices],
+        split_source.tensors[1][test_indices],
+        split_source.tensors[2][test_indices],
     )
 
-    # Ps_* are the first feature column (ps or amp) for combined-model tooling.
-    stats = {
-        "x_mean": x_mean.detach().cpu(),
-        "x_std": x_std.detach().cpu(),
-        "ps_mean": x_mean[0, 0].detach().cpu(),
-        "ps_std": x_std[0, 0].detach().cpu(),
-        "iplus_mean": iplus_mean.detach().cpu(),
-        "iplus_std": iplus_std.detach().cpu(),
-        "iminus_mean": iminus_mean.detach().cpu(),
-        "iminus_std": iminus_std.detach().cpu(),
-    }
     return train_dataset, val_bin_dataset, test_bin_dataset, stats
 
 
@@ -363,6 +376,7 @@ def train_model(
     train_dataset: data.TensorDataset,
     val_dataset: data.TensorDataset,
     args: argparse.Namespace,
+    stats: Dict[str, torch.Tensor],
     device: torch.device = DEVICE,
 ) -> Tuple[nn.Module, float]:
     train_loader = data.DataLoader(
@@ -399,13 +413,12 @@ def train_model(
         model.train()
         train_loss_sum = 0.0
         train_batches = 0
-        for x_batch, y_iplus, y_iminus in train_loader:
+        for x_batch, y_p, y_q in train_loader:
             x_batch = x_batch.to(device)
-            y_iplus = y_iplus.squeeze(-1).to(device)
-            y_iminus = y_iminus.squeeze(-1).to(device)
-
-            pred_iplus, pred_iminus = model(x_batch)
-            loss = loss_fn(pred_iplus, y_iplus) + loss_fn(pred_iminus, y_iminus)
+            y_p = y_p.squeeze(-1).to(device)
+            y_q = y_q.squeeze(-1).to(device)
+            pred_p, pred_q = model(x_batch)
+            loss = loss_fn(pred_p, y_p) + loss_fn(pred_q, y_q)
 
             optimizer.zero_grad()
             loss.backward()
@@ -421,15 +434,12 @@ def train_model(
         val_loss_sum = 0.0
         val_batches = 0
         with torch.no_grad():
-            for x_val, y_iplus_val, y_iminus_val in val_loader:
+            for x_val, y_p_val, y_q_val in val_loader:
                 x_val = x_val.to(device)
-                y_iplus_val = y_iplus_val.squeeze(-1).to(device)
-                y_iminus_val = y_iminus_val.squeeze(-1).to(device)
-
-                pred_iplus_val, pred_iminus_val = model(x_val)
-                val_loss = loss_fn(pred_iplus_val, y_iplus_val) + loss_fn(
-                    pred_iminus_val, y_iminus_val
-                )
+                y_p_val = y_p_val.squeeze(-1).to(device)
+                y_q_val = y_q_val.squeeze(-1).to(device)
+                pred_p_val, pred_q_val = model(x_val)
+                val_loss = loss_fn(pred_p_val, y_p_val) + loss_fn(pred_q_val, y_q_val)
                 val_loss_sum += val_loss.item()
                 val_batches += 1
 
@@ -469,82 +479,86 @@ def evaluate_model(
     model: nn.Module,
     test_dataset: data.TensorDataset,
     stats: Dict[str, torch.Tensor],
-    args: argparse.Namespace,
     device: torch.device,
 ) -> Dict[str, float]:
     test_loader = data.DataLoader(test_dataset, batch_size=1024, shuffle=False)
     loss_fn = nn.L1Loss()
 
-    pred_iplus_batches = []
-    pred_iminus_batches = []
-    true_iplus_batches = []
-    true_iminus_batches = []
+    p_mean = float(stats["P_mean"].item())
+    p_std = float(stats["P_std"].item())
+    q_mean = float(stats["Q_mean"].item())
+    q_std = float(stats["Q_std"].item())
+
     test_loss_sum = 0.0
     test_batches = 0
+    pred_p_batches: List[torch.Tensor] = []
+    pred_q_batches: List[torch.Tensor] = []
+    true_p_batches: List[torch.Tensor] = []
+    true_q_batches: List[torch.Tensor] = []
 
     model.eval()
     with torch.no_grad():
-        for x_test, y_iplus, y_iminus in test_loader:
+        for x_test, y_p, y_q in test_loader:
             x_test = x_test.to(device)
-            y_iplus = y_iplus.squeeze(-1).to(device)
-            y_iminus = y_iminus.squeeze(-1).to(device)
-
-            pred_iplus, pred_iminus = model(x_test)
-            test_loss = loss_fn(pred_iplus, y_iplus) + loss_fn(pred_iminus, y_iminus)
-
-            pred_iplus_batches.append(pred_iplus.cpu())
-            pred_iminus_batches.append(pred_iminus.cpu())
-            true_iplus_batches.append(y_iplus.cpu())
-            true_iminus_batches.append(y_iminus.cpu())
+            y_p = y_p.squeeze(-1).to(device)
+            y_q = y_q.squeeze(-1).to(device)
+            pred_p, pred_q = model(x_test)
+            test_loss = loss_fn(pred_p, y_p) + loss_fn(pred_q, y_q)
+            pred_p_batches.append((pred_p * p_std + p_mean).cpu())
+            pred_q_batches.append((pred_q * q_std + q_mean).cpu())
+            true_p_batches.append((y_p * p_std + p_mean).cpu())
+            true_q_batches.append((y_q * q_std + q_mean).cpu())
             test_loss_sum += test_loss.item()
             test_batches += 1
 
-    pred_iplus_norm = torch.cat(pred_iplus_batches).numpy()
-    pred_iminus_norm = torch.cat(pred_iminus_batches).numpy()
-    true_iplus_norm = torch.cat(true_iplus_batches).numpy()
-    true_iminus_norm = torch.cat(true_iminus_batches).numpy()
+    pred_p = torch.cat(pred_p_batches).numpy()
+    pred_q = torch.cat(pred_q_batches).numpy()
+    true_p = torch.cat(true_p_batches).numpy()
+    true_q = torch.cat(true_q_batches).numpy()
 
-    iplus_mean = float(stats["iplus_mean"].item())
-    iplus_std = float(stats["iplus_std"].item())
-    iminus_mean = float(stats["iminus_mean"].item())
-    iminus_std = float(stats["iminus_std"].item())
-
-    pred_iplus = pred_iplus_norm * iplus_std + iplus_mean
-    pred_iminus = pred_iminus_norm * iminus_std + iminus_mean
-    true_iplus = true_iplus_norm * iplus_std + iplus_mean
-    true_iminus = true_iminus_norm * iminus_std + iminus_mean
-
-    ss_res_iplus = np.sum((true_iplus - pred_iplus) ** 2)
-    ss_tot_iplus = np.sum((true_iplus - np.mean(true_iplus)) ** 2)
-    ss_res_iminus = np.sum((true_iminus - pred_iminus) ** 2)
-    ss_tot_iminus = np.sum((true_iminus - np.mean(true_iminus)) ** 2)
-
-    rpe_iplus = np.zeros_like(true_iplus)
-    rpe_iminus = np.zeros_like(true_iminus)
-    mask_iplus = np.abs(true_iplus) > 1e-10
-    mask_iminus = np.abs(true_iminus) > 1e-10
-    rpe_iplus[mask_iplus] = (
-        np.abs(pred_iplus[mask_iplus] - true_iplus[mask_iplus])
-        / np.abs(true_iplus[mask_iplus])
-        * 100.0
-    )
-    rpe_iminus[mask_iminus] = (
-        np.abs(pred_iminus[mask_iminus] - true_iminus[mask_iminus])
-        / np.abs(true_iminus[mask_iminus])
-        * 100.0
-    )
+    ss_res_p = np.sum((true_p - pred_p) ** 2)
+    ss_tot_p = np.sum((true_p - np.mean(true_p)) ** 2)
+    ss_res_q = np.sum((true_q - pred_q) ** 2)
+    ss_tot_q = np.sum((true_q - np.mean(true_q)) ** 2)
+    rpe_p = np.zeros_like(true_p)
+    rpe_q = np.zeros_like(true_q)
+    mask_p = np.abs(true_p) > 1e-10
+    mask_q = np.abs(true_q) > 1e-10
+    rpe_p[mask_p] = np.abs(pred_p[mask_p] - true_p[mask_p]) / np.abs(true_p[mask_p]) * 100.0
+    rpe_q[mask_q] = np.abs(pred_q[mask_q] - true_q[mask_q]) / np.abs(true_q[mask_q]) * 100.0
 
     return {
         "test_l1_loss": test_loss_sum / max(test_batches, 1),
-        "r2_iplus": 1.0 - float(ss_res_iplus / (ss_tot_iplus + 1e-12)),
-        "r2_iminus": 1.0 - float(ss_res_iminus / (ss_tot_iminus + 1e-12)),
-        "median_rpe_iplus": float(np.median(rpe_iplus[mask_iplus]))
-        if np.any(mask_iplus)
-        else 0.0,
-        "median_rpe_iminus": float(np.median(rpe_iminus[mask_iminus]))
-        if np.any(mask_iminus)
-        else 0.0,
+        "l1_P": float(np.mean(np.abs(true_p - pred_p))),
+        "l1_Q": float(np.mean(np.abs(true_q - pred_q))),
+        "r2_P": 1.0 - float(ss_res_p / (ss_tot_p + 1e-12)),
+        "r2_Q": 1.0 - float(ss_res_q / (ss_tot_q + 1e-12)),
+        "median_rpe_P": float(np.median(rpe_p[mask_p])) if np.any(mask_p) else 0.0,
+        "median_rpe_Q": float(np.median(rpe_q[mask_q])) if np.any(mask_q) else 0.0,
     }
+
+
+def _validate_saved_stats(
+    stats: Dict[str, torch.Tensor],
+    arrays: Dict[str, Any],
+    *,
+    bin_idx: int,
+) -> None:
+    """Sanity-check normalization stats before writing a checkpoint."""
+    x_train = arrays.get("x_train")
+    if x_train is None:
+        return
+    x_mean = stats["x_mean"].reshape(-1)
+    train_p0 = np.asarray(x_train[:, 0].numpy(), dtype=np.float64)
+    if train_p0.size == 0:
+        return
+    expected_p0 = float(np.mean(train_p0))
+    saved_p0 = float(x_mean[0].item())
+    if abs(saved_p0 - expected_p0) > 1e-4:
+        raise RuntimeError(
+            f"bin {bin_idx}: X_mean[p0]={saved_p0:.6f} != train p0 mean "
+            f"{expected_p0:.6f}; refusing to save a corrupt checkpoint"
+        )
 
 
 def save_outputs(
@@ -556,26 +570,38 @@ def save_outputs(
     feature_names: List[str],
     model_path: Path,
     metrics_path: Path,
+    *,
+    arrays: Dict[str, Any] | None = None,
 ) -> None:
-    payload = {
+    _validate_saved_stats(stats, arrays or {}, bin_idx=int(args.bin_idx))
+    x_mean = stats["x_mean"].numpy().reshape(-1)
+    x_std = stats["x_std"].numpy().reshape(-1)
+    payload: Dict[str, Any] = {
         "model_state_dict": model.state_dict(),
         "best_val_loss": best_val_loss,
-        "X_mean": stats["x_mean"].numpy(),
-        "X_std": stats["x_std"].numpy(),
+        "X_mean": x_mean,
+        "X_std": x_std,
         "Ps_mean": float(stats["ps_mean"].item()),
         "Ps_std": float(stats["ps_std"].item()),
-        "Iplus_mean": float(stats["iplus_mean"].item()),
-        "Iplus_std": float(stats["iplus_std"].item()),
-        "Iminus_mean": float(stats["iminus_mean"].item()),
-        "Iminus_std": float(stats["iminus_std"].item()),
+        "target_mode": TARGET_MODE,
+        "head_layout": HEAD_LAYOUT,
+        "ps_col": int(stats["ps_col"]),
         "feature_names": list(feature_names),
         "input_dim": int(len(feature_names)),
         "use_hidden": True,
         "bin_idx": args.bin_idx,
         "hidden_dim": HIDDEN_DIM,
         "metrics": metrics,
+        "P_mean": float(stats["P_mean"].item()),
+        "P_std": float(stats["P_std"].item()),
+        "Q_mean": float(stats["Q_mean"].item()),
+        "Q_std": float(stats["Q_std"].item()),
+        "targets_precalibrated": True,
+        "pq_target_scope": "per_bin",
+        "pq_post_correct": True,
         "args": {
-            **{k: (str(v) if isinstance(v, Path) else v) for k, v in vars(args).items()}
+            **{k: (str(v) if isinstance(v, Path) else v) for k, v in vars(args).items()},
+            "feature_set": FEATURE_SET,
         },
     }
     torch.save(payload, model_path)
@@ -608,15 +634,14 @@ def main() -> None:
         else resolve_bin_npz(args.data_dir, args.bin_idx)
     )
     print(
-        f"bin_idx={args.bin_idx}  data={data_path}  "
-        f"feature_set={args.feature_set}  device={DEVICE}",
+        f"bin_idx={args.bin_idx}  data={data_path}  features={FEATURE_SET}  "
+        f"targets=P,Q (oracle p0 input)  device={DEVICE}",
         flush=True,
     )
 
     arrays = load_bin_arrays(
         data_path=data_path,
         train_polarization_fraction=args.train_polarization_fraction,
-        feature_set=args.feature_set,
         feature_clip_z=args.feature_clip_z,
     )
     print(
@@ -634,13 +659,13 @@ def main() -> None:
         train_dataset=train_dataset,
         val_dataset=val_dataset,
         args=args,
+        stats=stats,
         device=DEVICE,
     )
     metrics = evaluate_model(
         model=model,
         test_dataset=test_dataset,
         stats=stats,
-        args=args,
         device=DEVICE,
     )
     save_outputs(
@@ -652,6 +677,7 @@ def main() -> None:
         feature_names=arrays["feature_names"],
         model_path=model_path,
         metrics_path=metrics_path,
+        arrays=arrays,
     )
 
     print(f"Saved model to {model_path}", flush=True)
@@ -661,8 +687,8 @@ def main() -> None:
             [
                 f"best_val={best_val_loss:.6f}",
                 f"test_l1={metrics['test_l1_loss']:.6f}",
-                f"r2_iplus={metrics['r2_iplus']:.6f}",
-                f"r2_iminus={metrics['r2_iminus']:.6f}",
+                f"r2_P={metrics['r2_P']:.6f}",
+                f"r2_Q={metrics['r2_Q']:.6f}",
             ]
         ),
         flush=True,
