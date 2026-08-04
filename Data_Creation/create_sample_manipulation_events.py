@@ -21,7 +21,7 @@ import numpy as np
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parent
-DULYA_V4 = SCRIPT_DIR / "dulya_fit_v4"
+DULYA_V4 = SCRIPT_DIR / "dulya_fit_v5"
 DULYA_V2 = SCRIPT_DIR / "dulya_fit_v2"
 DULYA_PKG = DULYA_V4 if DULYA_V4.is_dir() else DULYA_V2
 

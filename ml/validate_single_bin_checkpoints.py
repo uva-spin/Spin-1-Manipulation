@@ -1,9 +1,9 @@
 """
 Validate per-bin single_bin checkpoints against training NPZs.
 
-Compares saved X_mean / P_mean in each binning_model_bin_XXXX.pth to the
-statistics recomputed from the corresponding train_bin_XXXX.npz using the
-same split logic as ml/single_bin.py.
+Compares saved X_mean and primary target mean in each
+binning_model_bin_XXXX.pth to the statistics recomputed from the
+corresponding train_bin_XXXX.npz using the same split logic as ml/single_bin.py.
 
 Use before combine to catch corrupted normalization stats. Mismatched bins
 must be retrained (do not patch stats in place — weights are tied to the
@@ -36,7 +36,13 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from single_bin import build_bin_datasets, load_bin_arrays
+from single_bin import (
+    TARGET_MODE,
+    build_bin_datasets,
+    load_bin_arrays,
+    resolve_target_mode,
+    target_stat_keys,
+)
 
 MODEL_PATTERN = re.compile(r"^binning_model_bin_(\d+)\.pth$")
 DEFAULT_P0_MEAN_TOL = 0.05
@@ -81,7 +87,13 @@ def parse_args() -> argparse.Namespace:
         "--p-mean-tol",
         type=float,
         default=DEFAULT_P_MEAN_TOL,
-        help="Max |checkpoint P_mean - expected| before flagging",
+        help="Max |checkpoint primary-target mean - expected| before flagging",
+    )
+    parser.add_argument(
+        "--target-mode",
+        type=str,
+        default=TARGET_MODE,
+        help="Must match training TARGET_MODE (pq or iplus_iminus)",
     )
     parser.add_argument(
         "--print-array",
@@ -117,20 +129,26 @@ def expected_stats(
     *,
     train_polarization_fraction: float,
     feature_clip_z: float,
-) -> Dict[str, np.ndarray | float]:
+    target_mode: str,
+) -> Dict[str, np.ndarray | float | str]:
+    mode = resolve_target_mode(target_mode)
+    mean0_key, std0_key, mean1_key, std1_key = target_stat_keys(mode)
     arrays = load_bin_arrays(
         data_path=data_path,
         train_polarization_fraction=train_polarization_fraction,
         feature_clip_z=feature_clip_z,
+        target_mode=mode,
     )
     _, _, _, stats = build_bin_datasets(arrays, validation_fraction=0.5)
     return {
+        "target_mode": mode,
+        "mean0_key": mean0_key,
         "x_mean": stats["x_mean"].numpy().reshape(-1),
         "x_std": stats["x_std"].numpy().reshape(-1),
-        "P_mean": float(stats["P_mean"].item()),
-        "P_std": float(stats["P_std"].item()),
-        "Q_mean": float(stats["Q_mean"].item()),
-        "Q_std": float(stats["Q_std"].item()),
+        mean0_key: float(stats[mean0_key].item()),
+        std0_key: float(stats[std0_key].item()),
+        mean1_key: float(stats[mean1_key].item()),
+        std1_key: float(stats[std1_key].item()),
     }
 
 
@@ -142,28 +160,37 @@ def validate_checkpoint(
     feature_clip_z: float,
     p0_mean_tol: float,
     p_mean_tol: float,
+    target_mode: str,
 ) -> Tuple[bool, Dict[str, Any]]:
+    mode = resolve_target_mode(target_mode)
+    mean0_key, _, _, _ = target_stat_keys(mode)
     payload = torch.load(model_path, map_location="cpu", weights_only=False)
     ck_x_mean = _feature_vector(payload.get("X_mean"))
-    ck_p_mean = float(payload["P_mean"])
+    if mean0_key not in payload:
+        raise KeyError(
+            f"{model_path}: missing {mean0_key} for target_mode={mode!r}"
+        )
+    ck_y0_mean = float(payload[mean0_key])
 
     expected = expected_stats(
         data_path,
         train_polarization_fraction=train_polarization_fraction,
         feature_clip_z=feature_clip_z,
+        target_mode=mode,
     )
 
     dp0 = abs(float(ck_x_mean[0]) - float(expected["x_mean"][0]))
-    dp = abs(ck_p_mean - float(expected["P_mean"]))
-    ok = dp0 <= p0_mean_tol and dp <= p_mean_tol
+    dy0 = abs(ck_y0_mean - float(expected[mean0_key]))
+    ok = dp0 <= p0_mean_tol and dy0 <= p_mean_tol
     return ok, {
         "bin_idx": int(payload.get("bin_idx", -1)),
+        "mean0_key": mean0_key,
         "ck_x_mean": ck_x_mean.tolist(),
         "exp_x_mean": expected["x_mean"].tolist(),
-        "ck_P_mean": ck_p_mean,
-        "exp_P_mean": float(expected["P_mean"]),
+        "ck_y0_mean": ck_y0_mean,
+        "exp_y0_mean": float(expected[mean0_key]),
         "dp0_mean": dp0,
-        "dP_mean": dp,
+        "dy0_mean": dy0,
     }
 
 
@@ -192,17 +219,19 @@ def main() -> None:
             feature_clip_z=float(args.feature_clip_z),
             p0_mean_tol=float(args.p0_mean_tol),
             p_mean_tol=float(args.p_mean_tol),
+            target_mode=str(args.target_mode),
         )
         if ok:
             continue
 
         bad.append(bin_idx)
+        mean0_key = info["mean0_key"]
         print(
             f"FAIL bin {bin_idx}: "
             f"X_mean[p0] checkpoint={info['ck_x_mean'][0]:.4f} "
             f"expected={info['exp_x_mean'][0]:.4f} (Δ={info['dp0_mean']:.4f})  "
-            f"P_mean checkpoint={info['ck_P_mean']:.4f} "
-            f"expected={info['exp_P_mean']:.4f} (Δ={info['dP_mean']:.4f})",
+            f"{mean0_key} checkpoint={info['ck_y0_mean']:.4f} "
+            f"expected={info['exp_y0_mean']:.4f} (Δ={info['dy0_mean']:.4f})",
             flush=True,
         )
 

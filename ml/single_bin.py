@@ -1,15 +1,3 @@
-"""
-Train one per-bin model from per-bin NPZ data.
-
-Features: p0 (initial polarization) and ps at the observation bin.
-Targets: CC-calibrated P and Q stored in the NPZ (from the data-generation pipeline).
-
-Required NPZ arrays: ps, p0, iplus, iminus, P, Q
-Optional: q, amp, source, center_bin, meta_json
-"""
-
-from __future__ import annotations
-
 import argparse
 import json
 from pathlib import Path
@@ -28,7 +16,7 @@ SEED = 42
 
 TRAIN_POLARIZATION_FRACTION = 0.8
 FEATURE_SET = "p0_ps"
-TARGET_MODE = "pq"
+TARGET_MODE = "iplus_iminus"
 NUM_EPOCHS = 1000
 BATCH_SIZE = 64
 LEARNING_RATE = 1e-3
@@ -45,6 +33,36 @@ HEAD_LAYOUT = "split"
 DEFAULT_DATA_DIR = Path("combined_train_all")
 DEFAULT_OUTPUT_DIR = Path("single_bin_models")
 
+VALID_TARGET_MODES = ("pq", "iplus_iminus")
+
+
+def resolve_target_mode(mode: str = TARGET_MODE) -> str:
+    normalized = str(mode).strip().lower()
+    if normalized not in VALID_TARGET_MODES:
+        raise ValueError(
+            f"Unsupported TARGET_MODE={mode!r}; expected one of {VALID_TARGET_MODES}"
+        )
+    return normalized
+
+
+def target_labels(mode: str = TARGET_MODE) -> Tuple[str, str]:
+    resolved = resolve_target_mode(mode)
+    if resolved == "pq":
+        return "P", "Q"
+    return "Iplus", "Iminus"
+
+
+def target_npz_keys(mode: str = TARGET_MODE) -> Tuple[str, str]:
+    resolved = resolve_target_mode(mode)
+    if resolved == "pq":
+        return "P", "Q"
+    return "iplus", "iminus"
+
+
+def target_stat_keys(mode: str = TARGET_MODE) -> Tuple[str, str, str, str]:
+    label0, label1 = target_labels(mode)
+    return f"{label0}_mean", f"{label0}_std", f"{label1}_mean", f"{label1}_std"
+
 
 def to_column(values: np.ndarray) -> torch.Tensor:
     return torch.from_numpy(np.asarray(values, dtype=np.float32)).float().reshape(-1, 1)
@@ -55,7 +73,7 @@ def to_matrix(values: np.ndarray) -> torch.Tensor:
 
 
 class BinModel(nn.Module):
-    """Shared trunk with separate P and Q output heads."""
+    """Shared trunk with separate heads for the two target channels."""
 
     def __init__(self, input_dim: int, hidden_dim: int = 128):
         super().__init__()
@@ -138,34 +156,33 @@ def resolve_bin_npz(data_dir: Path, bin_idx: int) -> Path:
     )
 
 
-def load_bin_npz(path: Path) -> Dict[str, np.ndarray]:
+def load_bin_npz(path: Path, target_mode: str = TARGET_MODE) -> Dict[str, np.ndarray]:
     path = Path(path)
+    mode = resolve_target_mode(target_mode)
+    key0, key1 = target_npz_keys(mode)
     with np.load(path, allow_pickle=False) as data:
         ps = np.asarray(data["ps"], dtype=np.float32)
         p0 = np.asarray(data["p0"], dtype=np.float32)
-        if "P" not in data.files or "Q" not in data.files:
+        missing = [key for key in (key0, key1) if key not in data.files]
+        if missing:
             raise KeyError(
-                f"{path}: missing calibrated 'P' and/or 'Q'; "
-                "regenerate train NPZs with combine_all_train.py or "
-                "combine_spectrum_train_bins.py"
+                f"{path}: missing target field(s) {missing} for "
+                f"TARGET_MODE={mode!r}; regenerate train NPZs or switch mode"
             )
         out: Dict[str, np.ndarray] = {
             "ps": ps,
             "p0": p0,
-            "P": np.asarray(data["P"], dtype=np.float32),
-            "Q": np.asarray(data["Q"], dtype=np.float32),
+            key0: np.asarray(data[key0], dtype=np.float32),
+            key1: np.asarray(data[key1], dtype=np.float32),
             "amp": (
                 np.asarray(data["amp"], dtype=np.float32)
                 if "amp" in data.files
                 else np.abs(ps)
             ),
         }
-        if "q" in data.files:
-            out["q"] = np.asarray(data["q"], dtype=np.float32)
-        if "iplus" in data.files:
-            out["iplus"] = np.asarray(data["iplus"], dtype=np.float32)
-        if "iminus" in data.files:
-            out["iminus"] = np.asarray(data["iminus"], dtype=np.float32)
+        for optional_key in ("P", "Q", "q", "iplus", "iminus"):
+            if optional_key in data.files and optional_key not in out:
+                out[optional_key] = np.asarray(data[optional_key], dtype=np.float32)
         if "is_mirror" in data.files:
             out["is_mirror"] = np.asarray(data["is_mirror"], dtype=np.float32)
         if "source" in data.files:
@@ -211,13 +228,16 @@ def load_bin_arrays(
     data_path: Path,
     train_polarization_fraction: float,
     feature_clip_z: float = 0.0,
+    target_mode: str = TARGET_MODE,
 ) -> Dict[str, Any]:
-    raw = load_bin_npz(data_path)
+    mode = resolve_target_mode(target_mode)
+    key0, key1 = target_npz_keys(mode)
+    raw = load_bin_npz(data_path, target_mode=mode)
     features, feature_names, ps_col = build_features(raw)
     features = clip_features_z(features, feature_clip_z)
 
-    p_target = np.asarray(raw["P"], dtype=np.float32)
-    q_target = np.asarray(raw["Q"], dtype=np.float32)
+    y0_target = np.asarray(raw[key0], dtype=np.float32)
+    y1_target = np.asarray(raw[key1], dtype=np.float32)
     polarizations = raw["p0"]
 
     unique_p = np.unique(polarizations)
@@ -241,11 +261,13 @@ def load_bin_arrays(
 
     return {
         "x_train": to_matrix(features[train_mask]),
-        "P_train": to_column(p_target[train_mask]),
-        "Q_train": to_column(q_target[train_mask]),
+        "y0_train": to_column(y0_target[train_mask]),
+        "y1_train": to_column(y1_target[train_mask]),
         "x_holdout": to_matrix(features[holdout_mask]),
-        "P_holdout": to_column(p_target[holdout_mask]),
-        "Q_holdout": to_column(q_target[holdout_mask]),
+        "y0_holdout": to_column(y0_target[holdout_mask]),
+        "y1_holdout": to_column(y1_target[holdout_mask]),
+        "target_mode": mode,
+        "target_labels": list(target_labels(mode)),
         "feature_names": feature_names,
         "ps_col": int(ps_col),
         "n_samples": int(features.shape[0]),
@@ -298,7 +320,10 @@ def parse_args() -> argparse.Namespace:
 def build_bin_datasets(
     arrays: Dict[str, Any],
     validation_fraction: float,
-) -> Tuple[data.TensorDataset, data.TensorDataset, data.TensorDataset, Dict[str, torch.Tensor]]:
+) -> Tuple[data.TensorDataset, data.TensorDataset, data.TensorDataset, Dict[str, Any]]:
+    mode = resolve_target_mode(str(arrays.get("target_mode", TARGET_MODE)))
+    mean0_key, std0_key, mean1_key, std1_key = target_stat_keys(mode)
+
     x_train = arrays["x_train"]
     x_holdout = arrays["x_holdout"]
     ps_col = int(arrays["ps_col"])
@@ -308,38 +333,39 @@ def build_bin_datasets(
     x_train_norm = (x_train - x_mean) / x_std
     x_holdout_norm = (x_holdout - x_mean) / x_std
 
-    p_train = arrays["P_train"]
-    q_train = arrays["Q_train"]
-    p_holdout = arrays["P_holdout"]
-    q_holdout = arrays["Q_holdout"]
+    y0_train = arrays["y0_train"]
+    y1_train = arrays["y1_train"]
+    y0_holdout = arrays["y0_holdout"]
+    y1_holdout = arrays["y1_holdout"]
 
-    p_mean = p_train.mean()
-    p_std = p_train.std().clamp_min(1e-12)
-    q_mean = q_train.mean()
-    q_std = q_train.std().clamp_min(1e-12)
+    y0_mean = y0_train.mean()
+    y0_std = y0_train.std().clamp_min(1e-12)
+    y1_mean = y1_train.mean()
+    y1_std = y1_train.std().clamp_min(1e-12)
 
-    stats: Dict[str, torch.Tensor] = {
+    stats: Dict[str, Any] = {
         "x_mean": x_mean.detach().cpu(),
         "x_std": x_std.detach().cpu(),
         "ps_mean": x_mean[0, ps_col].detach().cpu(),
         "ps_std": x_std[0, ps_col].detach().cpu(),
         "ps_col": ps_col,
-        "P_mean": p_mean.detach().cpu(),
-        "P_std": p_std.detach().cpu(),
-        "Q_mean": q_mean.detach().cpu(),
-        "Q_std": q_std.detach().cpu(),
+        "target_mode": mode,
+        mean0_key: y0_mean.detach().cpu(),
+        std0_key: y0_std.detach().cpu(),
+        mean1_key: y1_mean.detach().cpu(),
+        std1_key: y1_std.detach().cpu(),
     }
 
-    p_train_norm = (p_train - p_mean) / p_std
-    q_train_norm = (q_train - q_mean) / q_std
-    p_holdout_norm = (p_holdout - p_mean) / p_std
-    q_holdout_norm = (q_holdout - q_mean) / q_std
+    y0_train_norm = (y0_train - y0_mean) / y0_std
+    y1_train_norm = (y1_train - y1_mean) / y1_std
+    y0_holdout_norm = (y0_holdout - y0_mean) / y0_std
+    y1_holdout_norm = (y1_holdout - y1_mean) / y1_std
 
-    train_dataset = data.TensorDataset(x_train_norm, p_train_norm, q_train_norm)
+    train_dataset = data.TensorDataset(x_train_norm, y0_train_norm, y1_train_norm)
     split_source = data.TensorDataset(
         x_holdout_norm,
-        p_holdout_norm,
-        q_holdout_norm,
+        y0_holdout_norm,
+        y1_holdout_norm,
     )
 
     val_count = int(round(len(split_source) * validation_fraction))
@@ -376,7 +402,7 @@ def train_model(
     train_dataset: data.TensorDataset,
     val_dataset: data.TensorDataset,
     args: argparse.Namespace,
-    stats: Dict[str, torch.Tensor],
+    stats: Dict[str, Any],
     device: torch.device = DEVICE,
 ) -> Tuple[nn.Module, float]:
     train_loader = data.DataLoader(
@@ -478,68 +504,79 @@ def train_model(
 def evaluate_model(
     model: nn.Module,
     test_dataset: data.TensorDataset,
-    stats: Dict[str, torch.Tensor],
+    stats: Dict[str, Any],
     device: torch.device,
 ) -> Dict[str, float]:
     test_loader = data.DataLoader(test_dataset, batch_size=1024, shuffle=False)
     loss_fn = nn.L1Loss()
 
-    p_mean = float(stats["P_mean"].item())
-    p_std = float(stats["P_std"].item())
-    q_mean = float(stats["Q_mean"].item())
-    q_std = float(stats["Q_std"].item())
+    mode = resolve_target_mode(str(stats.get("target_mode", TARGET_MODE)))
+    label0, label1 = target_labels(mode)
+    mean0_key, std0_key, mean1_key, std1_key = target_stat_keys(mode)
+    y0_mean = float(stats[mean0_key].item())
+    y0_std = float(stats[std0_key].item())
+    y1_mean = float(stats[mean1_key].item())
+    y1_std = float(stats[std1_key].item())
 
     test_loss_sum = 0.0
     test_batches = 0
-    pred_p_batches: List[torch.Tensor] = []
-    pred_q_batches: List[torch.Tensor] = []
-    true_p_batches: List[torch.Tensor] = []
-    true_q_batches: List[torch.Tensor] = []
+    pred_y0_batches: List[torch.Tensor] = []
+    pred_y1_batches: List[torch.Tensor] = []
+    true_y0_batches: List[torch.Tensor] = []
+    true_y1_batches: List[torch.Tensor] = []
 
     model.eval()
     with torch.no_grad():
-        for x_test, y_p, y_q in test_loader:
+        for x_test, y0, y1 in test_loader:
             x_test = x_test.to(device)
-            y_p = y_p.squeeze(-1).to(device)
-            y_q = y_q.squeeze(-1).to(device)
-            pred_p, pred_q = model(x_test)
-            test_loss = loss_fn(pred_p, y_p) + loss_fn(pred_q, y_q)
-            pred_p_batches.append((pred_p * p_std + p_mean).cpu())
-            pred_q_batches.append((pred_q * q_std + q_mean).cpu())
-            true_p_batches.append((y_p * p_std + p_mean).cpu())
-            true_q_batches.append((y_q * q_std + q_mean).cpu())
+            y0 = y0.squeeze(-1).to(device)
+            y1 = y1.squeeze(-1).to(device)
+            pred_y0, pred_y1 = model(x_test)
+            test_loss = loss_fn(pred_y0, y0) + loss_fn(pred_y1, y1)
+            pred_y0_batches.append((pred_y0 * y0_std + y0_mean).cpu())
+            pred_y1_batches.append((pred_y1 * y1_std + y1_mean).cpu())
+            true_y0_batches.append((y0 * y0_std + y0_mean).cpu())
+            true_y1_batches.append((y1 * y1_std + y1_mean).cpu())
             test_loss_sum += test_loss.item()
             test_batches += 1
 
-    pred_p = torch.cat(pred_p_batches).numpy()
-    pred_q = torch.cat(pred_q_batches).numpy()
-    true_p = torch.cat(true_p_batches).numpy()
-    true_q = torch.cat(true_q_batches).numpy()
+    pred_y0 = torch.cat(pred_y0_batches).numpy()
+    pred_y1 = torch.cat(pred_y1_batches).numpy()
+    true_y0 = torch.cat(true_y0_batches).numpy()
+    true_y1 = torch.cat(true_y1_batches).numpy()
 
-    ss_res_p = np.sum((true_p - pred_p) ** 2)
-    ss_tot_p = np.sum((true_p - np.mean(true_p)) ** 2)
-    ss_res_q = np.sum((true_q - pred_q) ** 2)
-    ss_tot_q = np.sum((true_q - np.mean(true_q)) ** 2)
-    rpe_p = np.zeros_like(true_p)
-    rpe_q = np.zeros_like(true_q)
-    mask_p = np.abs(true_p) > 1e-10
-    mask_q = np.abs(true_q) > 1e-10
-    rpe_p[mask_p] = np.abs(pred_p[mask_p] - true_p[mask_p]) / np.abs(true_p[mask_p]) * 100.0
-    rpe_q[mask_q] = np.abs(pred_q[mask_q] - true_q[mask_q]) / np.abs(true_q[mask_q]) * 100.0
+    ss_res_y0 = np.sum((true_y0 - pred_y0) ** 2)
+    ss_tot_y0 = np.sum((true_y0 - np.mean(true_y0)) ** 2)
+    ss_res_y1 = np.sum((true_y1 - pred_y1) ** 2)
+    ss_tot_y1 = np.sum((true_y1 - np.mean(true_y1)) ** 2)
+    rpe_y0 = np.zeros_like(true_y0)
+    rpe_y1 = np.zeros_like(true_y1)
+    mask_y0 = np.abs(true_y0) > 1e-10
+    mask_y1 = np.abs(true_y1) > 1e-10
+    rpe_y0[mask_y0] = (
+        np.abs(pred_y0[mask_y0] - true_y0[mask_y0]) / np.abs(true_y0[mask_y0]) * 100.0
+    )
+    rpe_y1[mask_y1] = (
+        np.abs(pred_y1[mask_y1] - true_y1[mask_y1]) / np.abs(true_y1[mask_y1]) * 100.0
+    )
 
     return {
         "test_l1_loss": test_loss_sum / max(test_batches, 1),
-        "l1_P": float(np.mean(np.abs(true_p - pred_p))),
-        "l1_Q": float(np.mean(np.abs(true_q - pred_q))),
-        "r2_P": 1.0 - float(ss_res_p / (ss_tot_p + 1e-12)),
-        "r2_Q": 1.0 - float(ss_res_q / (ss_tot_q + 1e-12)),
-        "median_rpe_P": float(np.median(rpe_p[mask_p])) if np.any(mask_p) else 0.0,
-        "median_rpe_Q": float(np.median(rpe_q[mask_q])) if np.any(mask_q) else 0.0,
+        f"l1_{label0}": float(np.mean(np.abs(true_y0 - pred_y0))),
+        f"l1_{label1}": float(np.mean(np.abs(true_y1 - pred_y1))),
+        f"r2_{label0}": 1.0 - float(ss_res_y0 / (ss_tot_y0 + 1e-12)),
+        f"r2_{label1}": 1.0 - float(ss_res_y1 / (ss_tot_y1 + 1e-12)),
+        f"median_rpe_{label0}": (
+            float(np.median(rpe_y0[mask_y0])) if np.any(mask_y0) else 0.0
+        ),
+        f"median_rpe_{label1}": (
+            float(np.median(rpe_y1[mask_y1])) if np.any(mask_y1) else 0.0
+        ),
     }
 
 
 def _validate_saved_stats(
-    stats: Dict[str, torch.Tensor],
+    stats: Dict[str, Any],
     arrays: Dict[str, Any],
     *,
     bin_idx: int,
@@ -565,7 +602,7 @@ def save_outputs(
     args: argparse.Namespace,
     model: nn.Module,
     best_val_loss: float,
-    stats: Dict[str, torch.Tensor],
+    stats: Dict[str, Any],
     metrics: Dict[str, float],
     feature_names: List[str],
     model_path: Path,
@@ -574,8 +611,11 @@ def save_outputs(
     arrays: Dict[str, Any] | None = None,
 ) -> None:
     _validate_saved_stats(stats, arrays or {}, bin_idx=int(args.bin_idx))
+    mode = resolve_target_mode(str(stats.get("target_mode", TARGET_MODE)))
+    mean0_key, std0_key, mean1_key, std1_key = target_stat_keys(mode)
     x_mean = stats["x_mean"].numpy().reshape(-1)
     x_std = stats["x_std"].numpy().reshape(-1)
+    is_pq = mode == "pq"
     payload: Dict[str, Any] = {
         "model_state_dict": model.state_dict(),
         "best_val_loss": best_val_loss,
@@ -583,7 +623,7 @@ def save_outputs(
         "X_std": x_std,
         "Ps_mean": float(stats["ps_mean"].item()),
         "Ps_std": float(stats["ps_std"].item()),
-        "target_mode": TARGET_MODE,
+        "target_mode": mode,
         "head_layout": HEAD_LAYOUT,
         "ps_col": int(stats["ps_col"]),
         "feature_names": list(feature_names),
@@ -592,16 +632,17 @@ def save_outputs(
         "bin_idx": args.bin_idx,
         "hidden_dim": HIDDEN_DIM,
         "metrics": metrics,
-        "P_mean": float(stats["P_mean"].item()),
-        "P_std": float(stats["P_std"].item()),
-        "Q_mean": float(stats["Q_mean"].item()),
-        "Q_std": float(stats["Q_std"].item()),
-        "targets_precalibrated": True,
-        "pq_target_scope": "per_bin",
-        "pq_post_correct": True,
+        mean0_key: float(stats[mean0_key].item()),
+        std0_key: float(stats[std0_key].item()),
+        mean1_key: float(stats[mean1_key].item()),
+        std1_key: float(stats[std1_key].item()),
+        "targets_precalibrated": bool(is_pq),
+        "pq_target_scope": "per_bin" if is_pq else "",
+        "pq_post_correct": bool(is_pq),
         "args": {
             **{k: (str(v) if isinstance(v, Path) else v) for k, v in vars(args).items()},
             "feature_set": FEATURE_SET,
+            "target_mode": mode,
         },
     }
     torch.save(payload, model_path)
@@ -628,6 +669,8 @@ def main() -> None:
     np.random.seed(SEED)
     torch.manual_seed(SEED)
 
+    mode = resolve_target_mode(TARGET_MODE)
+    label0, label1 = target_labels(mode)
     data_path = (
         Path(args.data_file)
         if args.data_file is not None
@@ -635,7 +678,7 @@ def main() -> None:
     )
     print(
         f"bin_idx={args.bin_idx}  data={data_path}  features={FEATURE_SET}  "
-        f"targets=P,Q (oracle p0 input)  device={DEVICE}",
+        f"targets={label0},{label1} (mode={mode})  device={DEVICE}",
         flush=True,
     )
 
@@ -643,6 +686,7 @@ def main() -> None:
         data_path=data_path,
         train_polarization_fraction=args.train_polarization_fraction,
         feature_clip_z=args.feature_clip_z,
+        target_mode=mode,
     )
     print(
         f"samples={arrays['n_samples']}  train={arrays['n_train']}  "
@@ -687,8 +731,8 @@ def main() -> None:
             [
                 f"best_val={best_val_loss:.6f}",
                 f"test_l1={metrics['test_l1_loss']:.6f}",
-                f"r2_P={metrics['r2_P']:.6f}",
-                f"r2_Q={metrics['r2_Q']:.6f}",
+                f"r2_{label0}={metrics[f'r2_{label0}']:.6f}",
+                f"r2_{label1}={metrics[f'r2_{label1}']:.6f}",
             ]
         ),
         flush=True,

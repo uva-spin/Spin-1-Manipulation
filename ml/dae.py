@@ -1,32 +1,37 @@
 """
 Denoising Autoencoder (DAE) for 500-point NMR signals.
 
-Uses Ps (Iplus + Iminus) at each bin as the training target. Loads binning_training.pkl /
-binning_testing.pkl, applies noise to the 500-point Ps signals BEFORE normalizing,
-then trains a simple DAE to denoise.
+Uses Ps (Iplus + Iminus) at each bin as the training target. Loads Voigt-burn
+spectra from ``dae_voigt_burn_spectra/spectra.npz`` (shape N×2×500: I+, I-),
+forms Ps, applies noise BEFORE normalizing, then trains a simple DAE to denoise.
 
 For use with the DAE+combined pipeline (dae_combined_pipeline.py), train with
 --no-scale-01 so the DAE output is in raw Ps scale compatible with the combined model.
 
 Usage:
-  python TensorStudies/dae.py
-  python TensorStudies/dae.py --data-dir . --noise-std 0.1
-  python TensorStudies/dae.py --test-only --checkpoint dae_denoise_results/dae_denoise_500.pth
+  python ml/dae.py
+  python ml/dae.py --data-dir ml/dae_voigt_burn_spectra --noise-std 0.1
+  python ml/dae.py --test-only --checkpoint dae_denoise_results/dae_denoise_500.pth
 """
+
+from __future__ import annotations
 
 import argparse
 import json
 import os
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 import matplotlib.pyplot as plt
 from scipy.ndimage import gaussian_filter1d
 import numpy as np
-import pandas as pd
 import torch
 import torch.nn as nn
 import torch.optim as optim
 import torch.utils.data as data
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+DEFAULT_DATA_DIR = os.path.join(SCRIPT_DIR, "dae_voigt_burn_spectra")
+DEFAULT_SPECTRA_NAME = "spectra.npz"
 
 
 # =============================================================================
@@ -145,48 +150,113 @@ def _minmax_scale_01(x: np.ndarray) -> np.ndarray:
     return (x - x_min) / span
 
 
+def _resolve_spectra_path(data_dir: str, spectra_file: Optional[str] = None) -> str:
+    """Resolve NPZ path under data_dir (default: spectra.npz)."""
+    if spectra_file is not None:
+        path = spectra_file
+        if not os.path.isabs(path):
+            candidate = os.path.join(data_dir, path)
+            path = candidate if os.path.isfile(candidate) else path
+    else:
+        path = os.path.join(data_dir, DEFAULT_SPECTRA_NAME)
+    if not os.path.isfile(path):
+        raise FileNotFoundError(
+            f"Spectra NPZ not found: {path}. "
+            "Generate with Data_Creation/create_dae_voigt_burn_spectra.py "
+            "or set --data-dir / --spectra-file."
+        )
+    return path
+
+
+def load_voigt_burn_ps(
+    data_dir: str,
+    num_points: int = 500,
+    spectra_file: Optional[str] = None,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Load Voigt-burn NPZ spectra and return (Ps, P_proxy).
+
+    NPZ key 'spectra' has shape (N, 2, num_points): channel0=Iplus, channel1=Iminus.
+    Ps is Iplus+Iminus. P_proxy is integrated (Iplus-Iminus)/(Iplus+Iminus).
+    """
+    path = _resolve_spectra_path(data_dir, spectra_file=spectra_file)
+    loaded = np.load(path, allow_pickle=False)
+    try:
+        if "spectra" not in loaded.files:
+            raise KeyError(f"{path}: missing 'spectra' array; found {loaded.files}")
+        spectra = np.asarray(loaded["spectra"], dtype=np.float64)
+    finally:
+        loaded.close()
+
+    if spectra.ndim != 3 or spectra.shape[1] != 2 or spectra.shape[2] != num_points:
+        raise ValueError(
+            f"{path}: expected spectra shape (N, 2, {num_points}), got {spectra.shape}"
+        )
+
+    iplus = spectra[:, 0, :]
+    iminus = spectra[:, 1, :]
+    ps = (iplus + iminus).astype(np.float64)
+    total = np.sum(ps, axis=1)
+    diff = np.sum(iplus - iminus, axis=1)
+    p_proxy = np.divide(
+        diff,
+        total,
+        out=np.zeros_like(diff),
+        where=np.abs(total) > 1e-12,
+    )
+    print(
+        f"Loaded Voigt-burn spectra: {path}  N={ps.shape[0]}  "
+        f"Ps shape={ps.shape} (from Iplus/Iminus)",
+        flush=True,
+    )
+    return ps, p_proxy.astype(np.float64)
+
+
+
 def load_and_prepare_data(
     data_dir: str,
     num_points: int = 500,
     noise_std: float = 0.1,
     val_frac: float = 0.2,
+    test_frac: float = 0.2,
     seed: int = 42,
     scale_01: bool = True,
     override_stats: dict = None,
+    spectra_file: Optional[str] = None,
 ):
     """
-    Load binning data, add noise to signals before normalizing.
+    Load Voigt-burn spectra, form Ps, add noise before normalizing.
+
     If scale_01=True (default), each spectrum is min-max scaled to [0,1] per sample
     first, then noise is added. Signals stay in a 0-1 range (noise may push slightly outside).
     If override_stats is provided (e.g. from a checkpoint), use its Ps_mean/Ps_std for
     normalization instead of computing from train (ensures test-only matches training).
-    Returns: train/val loaders, stats for denormalization.
+    Returns: train/val/test datasets, stats for denormalization, and test P proxies.
     """
-    train_path = os.path.join(data_dir, "training_data.pkl")
-    test_path = os.path.join(data_dir, "testing_data.pkl")
-
-    if not os.path.exists(train_path):
-        raise FileNotFoundError(
-            f"Training data not found: {train_path}. "
-            "Run from project root or set --data-dir."
-        )
-    if not os.path.exists(test_path):
-        raise FileNotFoundError(f"Test data not found: {test_path}")
-
     rng = np.random.default_rng(seed)
+    ps_all, p_all = load_voigt_burn_ps(
+        data_dir,
+        num_points=num_points,
+        spectra_file=spectra_file,
+    )
 
-    df_train = pd.read_pickle(train_path)
-    df_test = pd.read_pickle(test_path)
-    print(f"Loaded burned signal data: {len(df_train)} train, {len(df_test)} test (Ps_burned -> denoise)")
+    n_total = int(ps_all.shape[0])
+    if n_total < 3:
+        raise ValueError(f"Need at least 3 spectra for train/val/test split, got {n_total}")
 
-    # Ps = Iplus + Iminus (500-point signal per sample)
-    Ps_train = np.stack(df_train["Ps"].values).reshape(-1, num_points)
-    Ps_test = np.stack(df_test["Ps"].values).reshape(-1, num_points)
-    if "P" in df_test.columns:
-        P_test = df_test["P"].values.astype(np.float64)
-    else:
-        # Fallback for data created before P was added to ssRFData.py
-        P_test = np.zeros(len(df_test), dtype=np.float64)
+    perm_all = rng.permutation(n_total)
+    n_test = max(1, int(round(n_total * float(test_frac))))
+    n_test = min(n_test, n_total - 2)
+    test_idx = perm_all[:n_test]
+    train_pool = perm_all[n_test:]
+
+    Ps_train = ps_all[train_pool]
+    Ps_test = ps_all[test_idx]
+    P_test = p_all[test_idx]
+    print(
+        f"Split: train_pool={len(Ps_train)}  test={len(Ps_test)}  "
+        f"(val carved from train_pool)",
+        flush=True,
+    )
 
     if scale_01:
         # Min-max to [0,1] per sample first so signals are in 0-1 range
@@ -420,7 +490,7 @@ def run_test(
     plots_dir = os.path.join(output_dir, "plots")
     os.makedirs(plots_dir, exist_ok=True)
 
-    x = np.linspace(-3, 3, n_bins)
+    x = np.linspace(-6, 6, n_bins)
 
     # Select examples: polarization + hole-burning (prioritize burn-heavy)
     polarization_scales: List[Tuple[float, float, float]] = [
@@ -659,8 +729,20 @@ def parse_args():
     parser.add_argument(
         "--data-dir",
         type=str,
-        default=".",
-        help="Directory containing training_data.pkl and testing_data.pkl",
+        default=DEFAULT_DATA_DIR,
+        help="Directory containing Voigt-burn spectra.npz (default: ml/dae_voigt_burn_spectra)",
+    )
+    parser.add_argument(
+        "--spectra-file",
+        type=str,
+        default=None,
+        help="NPZ filename or path (default: <data-dir>/spectra.npz)",
+    )
+    parser.add_argument(
+        "--test-frac",
+        type=float,
+        default=0.2,
+        help="Fraction of spectra held out as test (default: 0.2)",
     )
     parser.add_argument(
         "--output-dir",
@@ -679,7 +761,7 @@ def parse_args():
         action="store_true",
         help="Disable min-max scaling to [0,1]. Use z-score normalization instead.",
     )
-    parser.add_argument("--num-epochs", type=int, default=1000)
+    parser.add_argument("--num-epochs", type=int, default=100)
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--learning-rate", type=float, default=0.001)
     parser.add_argument("--hidden-dims", type=int, nargs="+", default=[256, 128, 64])
@@ -741,6 +823,8 @@ def main():
             seed=args.seed,
             scale_01=scale_01_ckpt,
             override_stats=ckpt_stats if not scale_01_ckpt else None,
+            spectra_file=args.spectra_file,
+            test_frac=float(args.test_frac),
         )
         hidden_dims = tuple(ckpt["hidden_dims"])
         model = DenoisingAutoencoder(
@@ -772,6 +856,8 @@ def main():
         noise_std=args.noise_std,
         seed=args.seed,
         scale_01=not args.no_scale_01,
+        spectra_file=args.spectra_file,
+        test_frac=float(args.test_frac),
     )
 
     train_loader = data.DataLoader(
@@ -811,8 +897,8 @@ def main():
         else:
             epochs_no_improve += 1
 
-        if (epoch + 1) % 50 == 0 or epoch == 0:
-            print(f"Epoch {epoch + 1}: train={train_loss:.6f} val={val_loss:.6f} lr={scheduler.get_last_lr()[0]:.2e}")
+        # if (epoch + 1) % 50 == 0 or epoch == 0:
+        print(f"Epoch {epoch + 1}: train={train_loss:.6f} val={val_loss:.6f} lr={scheduler.get_last_lr()[0]:.2e}")
 
     if best_state is not None:
         model.load_state_dict(best_state)
