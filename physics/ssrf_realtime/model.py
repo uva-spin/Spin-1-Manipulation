@@ -1,9 +1,9 @@
 """
-Spin-1 Pake-doublet ss-RF real-time model.
+Spin-1 Pake-doublet ss-RF real-time model (v2).
 
-Position-dependent recovery pathways recompute local coefficients at every step
-from the selected physical R bin, mirror branch, initial event reference distance,
-neighboring bins, and population availability.
+Capacity-weighted version of the spin-1 ss-RF model.  Local Pake spin-packet
+density scales RF, DNP, same-theta recovery, and spectral-neighbor diffusion.
+AFP, multi-burn ssRF, and intensity loading follow the v1 conventions.
 
 With DNP off, RF is the only vector-polarization sink.  Internal recovery and
 neighbor diffusion conserve the current reduced P(t).  With DNP on, a separate
@@ -12,23 +12,28 @@ external reservoir builds toward P_DNP_sat.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
 from .conversions import physical_intensities_to_packet_n, packet_n_to_physical_intensities
+from .voigt_burn_physics import VoigtBurnPhysicsMixin
 from .lineshape import (
     boltzmann_Q,
     boltzmann_branch_ratio,
     level_populations_from_PQ,
     normalized_component,
+    pake_component_raw,
+    trapezoid_integral,
 )
 
 PLUS, ZERO, MINUS = 0, 1, 2
 
 
-
+def _clamp_p(P: float) -> float:
+    """Keep P inside the physically safe open interval for numeric use."""
+    return float(np.clip(float(P), -0.999999, 0.999999))
 
 
 @dataclass
@@ -42,31 +47,53 @@ class Spin1Params:
     line_gamma: float = 0.05
     line_asym: float = 0.04
 
+    # Intensity display scale: ``p0`` (initial vector polarization) when
+    # ``plot_signal_units`` is true; otherwise ``display_scale``.
+    plot_signal_units: bool = True
+    plot_divisor: float = 10.0
+    display_scale: float = 1.0
+    calibration_p: float = 0.50
+
     p0: float = 0.60
     q0: Optional[float] = None
-    initial_polarization: Optional[float] = None
 
     rf_burn_R: float = -0.92
     rf_enabled: bool = True
     gamma_rf: float = 2.0
     ssrf_subset_indices: Optional[List[int]] = None
     rf_profile: Optional[np.ndarray] = None
+    # Multi-bin Voigt capacity: "center_shared" or "separate_branch" (w[kp], w[km] per pair).
+    ssrf_multi_bin_capacity: str = "center_shared"
+
+    # Physical-R Voigt RF (spin1_ssrf_realtime_voigt_burn). Legacy discrete profiles
+    # from freeze_rf_profile / ssrf_subset_indices take precedence when installed.
+    use_physical_voigt_rf: bool = False
+    rf_gaussian_fwhm_R: float = 0.030
+    rf_lorentzian_fwhm_R: float = 0.015
+    rf_profile_normalization: str = "center_bin"
+    rf_profile_quadrature_order: int = 0
+
+    # Population-dependent spin-diffusion kernel (voigt_burn). diffusion_scale=0
+    # disables it. Legacy mode recovery can run alongside spin diffusion when
+    # ``relax_enabled`` is true (physical Voigt or discrete single-bin RF).
+    diffusion_scale: float = 0.0
+    zq_width_R: float = 0.05
+    cross_branch_ratio: float = 0.0
+    orientation_corr_fraction: float = 0.0
+    orientation_corr_width_deg: float = 20.0
+    kernel_cutoff_widths: float = 4.0
+    microwave_diffusion_factor: float = 1.0
 
     relax_enabled: bool = True
-    d_same_plus0: float = 0.25
-    d_same_0minus: float = 0.15
-    d_spec_plus0: float = 1.5
-    d_spec_0minus: float = 0.8
-    same_theta_mirror_gain: float = 1.5
-    
-    boltzmann_distance_gain: float = 0.5
-    population_availability: float = 1.0
+    d_same_plus0: float = 0.18
+    d_same_0minus: float = 0.10
+    d_spec_plus0: float = 2.0
+    d_spec_0minus: float = 1.0
     t2_width_R: float = 0.05
 
-    r_dependent_recovery: bool = True
-    recovery_position_power: float = 1.0
-    recovery_position_floor: float = 0.03
-    recovery_rate_clip: float = 20.0
+    # Local Pake-density / spin-packet capacity weighting.
+    capacity_rate_power: float = 1.0
+    capacity_rate_clip: float = 12.0
 
     ### DNP build/rebuild reservoir. ###
     dnp_enabled: bool = False
@@ -76,13 +103,12 @@ class Spin1Params:
     t1_rate: float = 0.0
     t1_p_eq: float = 0.0
 
-    dt: float = 0.015
+    dt: float = 0.0015
     noise_sigma: float = 0.0
 
     steps: int = 50
 
     # Instantaneous AFP: fired once before time stepping (apply_pending_afp / step), then cleared.
-    # Not a rate term — applied as a map before the Euler update that step.
     afp_enabled: bool = False
     afp_efficiency: float = 1.0
     afp_center_margin: int = 0
@@ -90,22 +116,22 @@ class Spin1Params:
     afp_subset_indices: Optional[List[int]] = None
 
 
-class Spin1Model:
+class Spin1Model(VoigtBurnPhysicsMixin):
     """Stateful spin-1 population model with ideal-bin ss-RF and optional DNP."""
 
     def __init__(
         self,
         params: Optional[Spin1Params] = None,
-        *,
-        initial_polarization: Optional[float] = None,
     ):
         self.params = params or Spin1Params()
-        if initial_polarization is not None:
-            self.params.initial_polarization = float(initial_polarization)
         self.reset()
 
     def reset(self) -> None:
         p = self.params
+        if p.n_bins < 5:
+            raise ValueError("n_bins must be at least 5")
+        if p.r_min >= p.r_max:
+            raise ValueError("r_min must be less than r_max")
         self.Rplus = np.linspace(p.r_min, p.r_max, p.n_bins)
         self.dR = float(self.Rplus[1] - self.Rplus[0])
 
@@ -114,25 +140,38 @@ class Spin1Model:
         self.mu = mu / max(float(mu.sum()), 1e-30)
         self.base_density = self.mu / self.dR
 
-        self.pref_initial = level_populations_from_PQ(p.p0, p.q0)
+        self.pref_initial = level_populations_from_PQ(_clamp_p(p.p0), p.q0)
         self.n_ref = self.mu[:, None] * self.pref_initial[None, :]
         self.n = self.n_ref.copy()
         self.n_initial = self.n.copy()
         self.t = 0.0
 
-        self.display_cal = self._event_display_calibration()
-        # Global spin-1 level fractions (sum=1, n+−n− = vector P). Packet ``self.n``
-        # is a different representation; these scalars are the physical levels.
+        self.display_cal = self._compute_display_calibration()
         self._populations_from_intensities = False
         self.n_plus = self.n_zero = self.n_minus = 0.0
         self.n_plus_initial = self.n_zero_initial = self.n_minus_initial = 0.0
         self._sync_level_populations(capture_initial=True)
 
-        self._invalidate_rate_cache()
         self._invalidate_branch_cache()
+        self._capacity_cache_key = None
+        self._capacity_cache = None
+        self._rf_profile_cache_key = None
+        self._rf_profile_cache = None
+        self._diffusion_kernel_key = None
+        self._same_i = np.empty(0, dtype=np.int64)
+        self._same_j = np.empty(0, dtype=np.int64)
+        self._same_base = np.empty(0, dtype=float)
+        self._cross_i = np.empty(0, dtype=np.int64)
+        self._cross_j = np.empty(0, dtype=np.int64)
+        self._cross_base = np.empty(0, dtype=float)
+        self._rf_profile_frozen = False
         self._active_idx: Optional[np.ndarray] = None
         self._window_radius: Optional[int] = None
-        # One-shot AFP before the next step() / apply_pending_afp when params.afp_enabled.
+        # Optional fixed vector P for Boltzmann rebuilds when P has moved (ssRF).
+        self._recovery_boltzmann_P: Optional[float] = None
+        # If True, always recover toward Boltzmann at ``_recovery_boltzmann_P``
+        # (AFP). If False, keep event ``n_ref`` while P≈P₀ (ssRF hole filling).
+        self._force_boltzmann_recovery: bool = False
         self._afp_pending: bool = bool(self.params.afp_enabled)
         self._afp_last_subset: List[int] = []
 
@@ -148,23 +187,83 @@ class Spin1Model:
         if self.params.rf_enabled:
             self.set_rf_profile()
 
-
     def set_rf_profile(self) -> None:
-        """Per-bin RF rate. Flat ``gamma_rf`` for now (Q-shaped profile commented out)."""
+        """Per-bin RF rate. Q-shaped profile peaks at deepest Q<0."""
         ip, im, _ = self.physical_intensities(self.n_initial)
-        # Q-shaped profile (peak ``gamma_rf`` at deepest Q<0):
         q = ip - im
         q_min = np.min(q)
         if q_min >= 0.0:
             self.params.rf_profile = np.zeros_like(q)
         else:
             self.params.rf_profile = self.params.gamma_rf * np.clip(q / q_min, 0.0, 1.0)
-        # self.params.rf_profile = np.full_like(ip, float(self.params.gamma_rf), dtype=float)
 
-    def _event_display_calibration(self) -> float:
-        """Intensity scale matching ``GenerateVectorLineshape`` event normalization (P₀)."""
+    def _compute_display_calibration(self) -> float:
+        """Scale packet differences to displayed intensities using initial ``p0``."""
         p = self.params
-        return float(p.initial_polarization if p.initial_polarization is not None else p.p0)
+        if not p.plot_signal_units:
+            return float(p.display_scale)
+        return float(_clamp_p(p.p0))
+
+    def _plot_signal_reference_calibration(self) -> float:
+        """Plot_Signal-style scale for ``static_plot_signal_reference`` comparisons only."""
+        p = self.params
+        if not p.plot_signal_units:
+            return float(p.display_scale)
+        Pcal = _clamp_p(p.calibration_p)
+        pref_cal = level_populations_from_PQ(Pcal, None)
+        minor_diff = abs(float(pref_cal[ZERO] - pref_cal[MINUS]))
+        if minor_diff < 1e-15:
+            pref_cal = level_populations_from_PQ(0.50, None)
+            minor_diff = abs(float(pref_cal[ZERO] - pref_cal[MINUS]))
+        raw = pake_component_raw(self.Rplus, +1, gamma=p.line_gamma, asym=p.line_asym)
+        raw_area = trapezoid_integral(raw, self.Rplus)
+        if raw_area <= 0 or not np.isfinite(raw_area):
+            return float(p.display_scale)
+        return float(p.display_scale * raw_area / (max(p.plot_divisor, 1e-15) * minor_diff))
+
+    def set_params(self, **kwargs) -> None:
+        rf_profile_changed = False
+        diffusion_changed = False
+        for key, value in kwargs.items():
+            if not hasattr(self.params, key):
+                raise AttributeError(f"Unknown parameter: {key}")
+            setattr(self.params, key, value)
+            if key in {
+                "rf_burn_R",
+                "rf_gaussian_fwhm_R",
+                "rf_lorentzian_fwhm_R",
+                "rf_profile_normalization",
+                "rf_profile_quadrature_order",
+                "use_physical_voigt_rf",
+            }:
+                rf_profile_changed = True
+            if key in {
+                "diffusion_scale",
+                "zq_width_R",
+                "cross_branch_ratio",
+                "orientation_corr_fraction",
+                "orientation_corr_width_deg",
+                "kernel_cutoff_widths",
+                "microwave_diffusion_factor",
+                "line_asym",
+                "n_bins",
+                "r_min",
+                "r_max",
+            }:
+                diffusion_changed = True
+        if rf_profile_changed:
+            self.invalidate_rf_profile()
+        if diffusion_changed:
+            self._diffusion_kernel_key = None
+
+    def as_dict(self) -> Dict[str, float]:
+        return asdict(self.params)
+
+    def set_rf_enabled(self, enabled: bool) -> None:
+        self.params.rf_enabled = bool(enabled)
+
+    def set_dnp_enabled(self, enabled: bool) -> None:
+        self.params.dnp_enabled = bool(enabled)
 
     def load_from_physical_intensities(self, Iplus: np.ndarray, Iminus: np.ndarray) -> None:
         """Set ``self.n`` from physical R-grid intensities using model conversions."""
@@ -178,8 +277,9 @@ class Spin1Model:
         self.n_initial = self.n.copy()
         self.n_ref = self.n.copy()
         self._populations_from_intensities = True
+        self._recovery_boltzmann_P = None
+        self._force_boltzmann_recovery = False
         self._sync_level_populations(capture_initial=True)
-        self._invalidate_rate_cache()
         self._afp_pending = bool(self.params.afp_enabled)
         self._afp_last_subset = []
         if self.params.rf_enabled:
@@ -254,13 +354,7 @@ class Spin1Model:
         Each index i swaps n+↔n0 at i and n0↔n- at mirror(i). Do not also pass
         mirror indices in ``subset_indices`` or AFP is applied twice. Only those
         packets are written; all other bins are left unchanged.
-
-        By default Σ(I⁺+I⁻) is left as the post-swap area (vector P can change).
-        When ``preserve_intensity_area`` is True, that sum is restored to the
-        pre-AFP event area by adding *common-mode* intensity on touched bins
-        (equal Δ to I⁺ and I⁻), leaving Q = Σ(I⁺−I⁻) unchanged.
         """
-
         ip_before, im_before, _ = self.physical_intensities()
         area_before = float(np.sum(ip_before + im_before))
 
@@ -282,55 +376,72 @@ class Spin1Model:
             self._renormalize_touched_intensity_area(touched, area_before)
 
         self._sync_level_populations(capture_initial=False)
-        self._invalidate_rate_cache()
         self._afp_last_subset = list(subset)
         self.ip_afp, self.im_afp, _ = self.physical_intensities()
         return subset
 
+    def _ssrf_burn_pairs(self) -> List[Tuple[Optional[int], Optional[int]]]:
+        subset = self.params.ssrf_subset_indices
+        if subset is None:
+            return [self.cached_branch_indices(self.params.rf_burn_R)]
+        n_bins = len(self.n)
+        pairs: List[Tuple[Optional[int], Optional[int]]] = []
+        for raw in subset:
+            i = int(raw)
+            if 0 <= i < n_bins:
+                pairs.append((i, n_bins - 1 - i))
+        return pairs
+
     def ssrf_burn(self) -> np.ndarray:
-        """Return RF population rates for each ssRF burn bin in params.
-
-        When ``params.ssrf_subset_indices`` is set, each index ``i`` is a burn
-        frequency: +↔0 at ``i`` and 0↔- at mirror(``i``). When it is ``None``,
-        burns the single ``rf_burn_R`` branch pair (legacy).
-
-        Per-bin rates come from ``rf_profile`` (Q-shaped; peak ``gamma_rf`` at deepest Q<0).
-        """
+        """Return RF population rates for each ssRF burn bin in params."""
         dn_rf = np.zeros_like(self.n)
         if float(self.params.gamma_rf) == 0.0:
             return dn_rf
 
         self.set_rf_profile()
         profile = np.asarray(self.params.rf_profile, dtype=float)
+        w = self.capacity_rate_weights()
 
         subset = self.params.ssrf_subset_indices
-        if subset is None:
-            pairs: List[Tuple[Optional[int], Optional[int]]] = [
-                self.cached_branch_indices(self.params.rf_burn_R)
-            ]
-        else:
-            n_bins = len(self.n)
-            pairs = []
-            for raw in subset:
-                i = int(raw)
-                if 0 <= i < n_bins:
-                    pairs.append((i, n_bins - 1 - i))
+        multi_bin = subset is not None
+        center_kp, center_km = self.cached_branch_indices(self.params.rf_burn_R)
+        w_center = (
+            float(w[center_kp])
+            if center_kp is not None
+            else float(w[center_km])
+            if center_km is not None
+            else 1.0
+        )
 
-        for kp, km in pairs:
+        for kp, km in self._ssrf_burn_pairs():
             if kp is not None:
-                gamma = float(profile[kp])
+                gamma_base = float(profile[kp])
             elif km is not None:
-                gamma = float(profile[km])
+                gamma_base = float(profile[km])
             else:
                 continue
-            if gamma == 0.0:
+            if gamma_base == 0.0:
                 continue
-            if kp is not None:
-                J = gamma * (self.n[kp, PLUS] - self.n[kp, ZERO])
+            if multi_bin:
+                mode = str(getattr(self.params, "ssrf_multi_bin_capacity", "center_shared"))
+                if mode == "separate_branch":
+                    gamma_plus = gamma_base * float(w[kp]) if kp is not None else 0.0
+                    gamma_minus = gamma_base * float(w[km]) if km is not None else 0.0
+                elif kp == center_kp and km == center_km:
+                    gamma_plus = gamma_base * float(w[center_kp]) if center_kp is not None else 0.0
+                    gamma_minus = gamma_base * float(w[center_km]) if center_km is not None else 0.0
+                else:
+                    gamma_plus = gamma_base * w_center
+                    gamma_minus = gamma_base * w_center
+            else:
+                gamma_plus = gamma_base * w[kp] if kp is not None else 0.0
+                gamma_minus = gamma_base * w[km] if km is not None else 0.0
+            if kp is not None and gamma_plus != 0.0:
+                J = gamma_plus * (self.n[kp, PLUS] - self.n[kp, ZERO])
                 dn_rf[kp, PLUS] -= J
                 dn_rf[kp, ZERO] += J
-            if km is not None:
-                J = gamma * (self.n[km, ZERO] - self.n[km, MINUS])
+            if km is not None and gamma_minus != 0.0:
+                J = gamma_minus * (self.n[km, ZERO] - self.n[km, MINUS])
                 dn_rf[km, ZERO] -= J
                 dn_rf[km, MINUS] += J
         return dn_rf
@@ -340,12 +451,7 @@ class Spin1Model:
         touched: List[int],
         area_target: float,
     ) -> None:
-        """
-        Restore Σ(I⁺+I⁻) to ``area_target`` on ``touched`` bins without changing Q.
-
-        Adds a common-mode offset (equal ΔI⁺ and ΔI⁻), weighted by local Ps on
-        touched bins. Untouched bins stay unchanged. Packet row sums stay ``mu``.
-        """
+        """Restore Σ(I⁺+I⁻) to ``area_target`` on ``touched`` bins without changing Q."""
         ip, im, _ = self.physical_intensities()
         ip_new = np.asarray(ip, dtype=float).copy()
         im_new = np.asarray(im, dtype=float).copy()
@@ -396,10 +502,9 @@ class Spin1Model:
                 self.n[k] *= float(self.mu[k]) / row
 
     def step(self, n_steps: int = 1, rf_on: Optional[bool] = None, dnp_on: Optional[bool] = None) -> None:
-
         if self.params.afp_enabled:
             self.afp_sweep()
-            self.params.afp_enabled = False ### only apply AFP once, set bool to false afterwards
+            self.params.afp_enabled = False
 
         dt = float(self.params.dt)
         if rf_on is None:
@@ -417,12 +522,7 @@ class Spin1Model:
         *,
         copy: bool = False,
     ) -> np.ndarray:
-        """
-        One Euler macro-step of RF / relaxation / DNP (no AFP).
-
-        AFP is instantaneous and must run before time stepping via ``afp_sweep``,
-        ``apply_pending_afp``, or ``step`` (which flushes pending AFP first).
-        """
+        """One Euler macro-step of RF / relaxation / DNP (no AFP)."""
         step_dt = float(self.params.dt if dt is None else dt)
         if rf_on is None:
             rf_on = bool(self.params.rf_enabled)
@@ -446,14 +546,7 @@ class Spin1Model:
         return self.n.copy() if copy else self.n
 
     def _sync_level_populations(self, *, capture_initial: bool = False) -> None:
-        """
-        Refresh stored global level fractions ``n_plus``, ``n_zero``, ``n_minus``.
-
-        When the state came from physical I±, invert via ``level_populations_from_PQ``
-        using event-normalized Σ(I++I−)=P when |ΣI|≤1, otherwise convert plot-unit
-        intensities with the ``dR/display_cal`` factor.  Boltzmann ``mu*pref``
-        initialization uses packet-integrated fractions instead.
-        """
+        """Refresh stored global level fractions ``n_plus``, ``n_zero``, ``n_minus``."""
         if self._populations_from_intensities:
             ip, im, _ = self.physical_intensities()
             p_raw = float(np.sum(ip + im))
@@ -463,7 +556,10 @@ class Spin1Model:
             else:
                 scale = float(self.dR) / max(abs(float(self.display_cal)), 1e-30)
                 p_vec, q_ten = p_raw * scale, q_raw * scale
-            pref = level_populations_from_PQ(p_vec, q_ten)
+            try:
+                pref = level_populations_from_PQ(p_vec, q_ten)
+            except ValueError:
+                pref = level_populations_from_PQ(p_vec, None)
         else:
             pops = np.sum(self.n, axis=0)
             total = max(float(pops.sum()), 1e-30)
@@ -491,55 +587,10 @@ class Spin1Model:
             "Q_initial": self.n_plus_initial - 2.0 * self.n_zero_initial + self.n_minus_initial,
         }
 
-    def _invalidate_rate_cache(self) -> None:
-        self._rate_cache_ref_id: Optional[int] = None
-        self._cached_ref_plus_norm: Optional[float] = None
-        self._cached_ref_minus_norm: Optional[float] = None
-        self._cached_t2_overlap: Optional[np.ndarray] = None
-        self._cached_edge_mass: Optional[np.ndarray] = None
-
     def _invalidate_branch_cache(self) -> None:
         self._cached_rf_burn_R: Optional[float] = None
         self._cached_kp: Optional[int] = None
         self._cached_km: Optional[int] = None
-
-    def _ensure_static_rate_cache(self, reference: np.ndarray) -> Tuple[float, float, np.ndarray, np.ndarray]:
-        """Cache reference norms and geometric edge factors (independent of ``self.n``)."""
-        ref_id = id(reference)
-        if (
-            self._rate_cache_ref_id == ref_id
-            and self._cached_ref_plus_norm is not None
-            and self._cached_t2_overlap is not None
-            and self._cached_edge_mass is not None
-        ):
-            return (
-                float(self._cached_ref_plus_norm),
-                float(self._cached_ref_minus_norm),
-                self._cached_t2_overlap,
-                self._cached_edge_mass,
-            )
-
-        ref_plus = self._transition_density_abs("plus0", reference)
-        ref_minus = self._transition_density_abs("0minus", reference)
-        finite_p = ref_plus[np.isfinite(ref_plus)]
-        finite_m = ref_minus[np.isfinite(ref_minus)]
-        plus_norm = max(finite_p)
-        minus_norm = max(finite_m)
-        if len(self.Rplus) < 2:
-            overlap = np.zeros(0, dtype=float)
-            edge_mass = np.zeros(0, dtype=float)
-        else:
-            dR_edges = self.Rplus[1:] - self.Rplus[:-1]
-            width = max(float(self.params.t2_width_R), 1e-12)
-            overlap = np.exp(-0.5 * (dR_edges / width) ** 2)
-            edge_mass = np.sqrt(self.mu[:-1] * self.mu[1:])
-
-        self._rate_cache_ref_id = ref_id
-        self._cached_ref_plus_norm = plus_norm
-        self._cached_ref_minus_norm = minus_norm
-        self._cached_t2_overlap = overlap
-        self._cached_edge_mass = edge_mass
-        return plus_norm, minus_norm, overlap, edge_mass
 
     def cached_branch_indices(self, R: Optional[float] = None) -> Tuple[Optional[int], Optional[int]]:
         """Like ``branch_indices``, but cached while ``rf_burn_R`` (or ``R``) is unchanged."""
@@ -559,29 +610,24 @@ class Spin1Model:
         return self.n_initial
 
     def equilibrium_reference(self, P: Optional[float] = None) -> np.ndarray:
-        """Boltzmann packet state at ``P``.
-
-        With no ``P``, return the fixed initial-event baseline ``n_ref`` (display /
-        response reference). Recovery pathways should pass the current vector
-        polarization so the null manifold tracks post-manipulation P, not P₀.
-        """
+        """Boltzmann-shaped packet state with the current grid weights (v15)."""
         if P is None:
-            return self.n_ref
-        pref = level_populations_from_PQ(float(P), None)
+            P = self.polarizations()["P"]
+        pref = level_populations_from_PQ(_clamp_p(float(P)), None)
         return self.mu[:, None] * pref[None, :]
 
-    def recovery_equilibrium_reference(self) -> np.ndarray:
+    def recovery_dynamic_reference(self) -> np.ndarray:
+        """Reference for mode recovery (Boltzmann at P(t), or loaded event shape)."""
+        if self._populations_from_intensities:
+            return self.recovery_equilibrium_reference()
+        return self.equilibrium_reference()
 
-        P = self.n_plus - self.n_minus
+    def _boltzmann_packet_at_vector_p(self, P: float) -> np.ndarray:
+        """Boltzmann packet state at vector ``P`` in the current intensity basis."""
+        pref = level_populations_from_PQ(float(P), None)
         if not self._populations_from_intensities:
-            return self.equilibrium_reference(P)
+            return self.mu[:, None] * pref[None, :]
 
-        P0 = self.n_plus_initial - self.n_minus_initial
-        if abs(P - P0) <= 1e-10:
-            return self.n_ref
-
-        # Boltzmann at P in event intensity units, then into the loaded packet basis.
-        pref = level_populations_from_PQ(P, None)
         n_ideal = self.mu[:, None] * pref[None, :]
         ip, im, _ = packet_n_to_physical_intensities(
             n_ideal, self.Rplus, display_cal=1.0, dR=self.dR
@@ -593,6 +639,150 @@ class Spin1Model:
             im = im * scale
         return physical_intensities_to_packet_n(
             ip, im, self.mu, display_cal=self.display_cal, dR=self.dR
+        )
+
+    def set_recovery_boltzmann_P(self, P: float) -> float:
+        """Use vector ``P`` when rebuilding Boltzmann after P drifts (ssRF).
+
+        Does not replace event ``n_ref`` — hole filling still targets the loaded
+        lineshape while P≈P₀.
+        """
+        self._recovery_boltzmann_P = float(P)
+        self._force_boltzmann_recovery = False
+        return self._recovery_boltzmann_P
+
+    def install_boltzmann_recovery_at_P(self, P: float) -> float:
+        """Always recover toward Boltzmann at vector ``P``; leave ``n`` unchanged.
+
+        Used after AFP (manipulated P). Overwrites ``n_ref`` with that Boltzmann.
+        """
+        P = float(P)
+        self._recovery_boltzmann_P = P
+        self._force_boltzmann_recovery = True
+        self.n_ref = self._boltzmann_packet_at_vector_p(P)
+        return P
+
+    def install_boltzmann_recovery_at_current_P(self) -> float:
+        """Set recovery to Boltzmann at the current (post-manipulation) vector P."""
+        self._sync_level_populations(capture_initial=False)
+        return self.install_boltzmann_recovery_at_P(float(self.n_plus - self.n_minus))
+
+    def recovery_equilibrium_reference(self) -> np.ndarray:
+        """Null manifold for mode recovery.
+
+        AFP (``_force_boltzmann_recovery``): always Boltzmann at the fixed
+        (manipulated) vector P so Q → Q_boltz(P).
+
+        ssRF / intensity-loaded events: always the loaded event shape ``n_ref``
+        (Dulya at the initial polarization). That way RF-mode recovery only
+        fills burn holes; unburned bins are already on the null manifold and
+        do not drift toward a global Boltzmann reshape when P dips under RF.
+        """
+        if self._force_boltzmann_recovery and self._recovery_boltzmann_P is not None:
+            return self._boltzmann_packet_at_vector_p(float(self._recovery_boltzmann_P))
+
+        if self._populations_from_intensities:
+            return self.n_ref
+
+        return self.equilibrium_reference(self.n_plus - self.n_minus)
+
+    def capacity_rate_weights(self) -> np.ndarray:
+        """Return Pake-density rate multipliers with mu-weighted average one."""
+        p = self.params
+        power = max(0.0, float(p.capacity_rate_power))
+        clip = max(1.0, float(p.capacity_rate_clip))
+        key = (power, clip)
+        if getattr(self, "_capacity_cache_key", None) == key and getattr(self, "_capacity_cache", None) is not None:
+            return self._capacity_cache
+        if power == 0.0:
+            w = np.ones_like(self.mu)
+            self._capacity_cache_key = key
+            self._capacity_cache = w
+            return w
+
+        density = np.maximum(self.base_density, 0.0)
+        avg_density = float(np.average(density, weights=self.mu))
+        if avg_density <= 0.0 or not np.isfinite(avg_density):
+            return np.ones_like(self.mu)
+
+        with np.errstate(divide="ignore", invalid="ignore"):
+            w = (density / avg_density) ** power
+        w = np.nan_to_num(w, nan=0.0, posinf=clip, neginf=0.0)
+        w = np.clip(w, 1.0 / clip, clip)
+
+        norm = float(np.average(w, weights=self.mu))
+        if norm > 0.0 and np.isfinite(norm):
+            w = w / norm
+        self._capacity_cache_key = key
+        self._capacity_cache = w
+        return w
+
+    def local_capacity_factors(self, R: Optional[float] = None) -> Dict[str, float]:
+        """Return local Pake-density capacities/rate weights at a physical R."""
+        if R is None:
+            R = self.params.rf_burn_R
+        kp, km = self.branch_indices(R)
+        w = self.capacity_rate_weights()
+        out = {
+            "R": float(R),
+            "w_Iplus_R": np.nan,
+            "w_Iminus_R": np.nan,
+            "density_Iplus_R": np.nan,
+            "density_Iminus_R": np.nan,
+            "mu_Iplus_R": np.nan,
+            "mu_Iminus_R": np.nan,
+        }
+        if kp is not None:
+            out["w_Iplus_R"] = float(w[kp])
+            out["density_Iplus_R"] = float(self.base_density[kp])
+            out["mu_Iplus_R"] = float(self.mu[kp])
+        if km is not None:
+            out["w_Iminus_R"] = float(w[km])
+            out["density_Iminus_R"] = float(self.base_density[km])
+            out["mu_Iminus_R"] = float(self.mu[km])
+        return out
+
+    def effective_local_rates(self, R: Optional[float] = None) -> Dict[str, float]:
+        """Return actual local rate multipliers at the selected physical R."""
+        if self._uses_physical_voigt_rf():
+            return self._physical_effective_local_rates(R)
+        cap = self.local_capacity_factors(R)
+        p = self.params
+        wp = cap["w_Iplus_R"]
+        wm = cap["w_Iminus_R"]
+        return {
+            **cap,
+            "gamma_rf_Iplus_R": float(p.gamma_rf * wp) if np.isfinite(wp) else np.nan,
+            "gamma_rf_Iminus_R": float(p.gamma_rf * wm) if np.isfinite(wm) else np.nan,
+            "dnp_Iplus_R": float(p.dnp_rate * wp) if np.isfinite(wp) else np.nan,
+            "dnp_Iminus_R": float(p.dnp_rate * wm) if np.isfinite(wm) else np.nan,
+            "same_plus0_Iplus_R": float(p.d_same_plus0 * wp) if np.isfinite(wp) else np.nan,
+            "same_0minus_Iminus_R": float(p.d_same_0minus * wm) if np.isfinite(wm) else np.nan,
+        }
+
+    def branch_areas(self, n: Optional[np.ndarray] = None) -> Dict[str, float]:
+        """Return display-calibrated integrated branch areas and total area (v15)."""
+        if n is None:
+            n = self.n
+        a_plus = float(self.display_cal * np.sum(n[:, PLUS] - n[:, ZERO]))
+        a_minus = float(self.display_cal * np.sum(n[:, ZERO] - n[:, MINUS]))
+        return {
+            "A_plus": a_plus,
+            "A_minus": a_minus,
+            "A_total": a_plus + a_minus,
+            "A_diff": a_plus - a_minus,
+        }
+
+    def static_plot_signal_reference(self):
+        """Return the Plot_Signal-style static reference for comparison (v15)."""
+        from .lineshape import plot_signal_reference
+
+        return plot_signal_reference(
+            self.Rplus,
+            P=self.params.p0,
+            gamma=self.params.line_gamma,
+            asym=self.params.line_asym,
+            divisor=self.params.plot_divisor,
         )
 
     def polarizations(self, n: Optional[np.ndarray] = None) -> Dict[str, float]:
@@ -608,7 +798,7 @@ class Spin1Model:
             "n_minus": float(pops[MINUS]),
             "P": P,
             "Q": Q,
-            "Q_boltz_at_P": boltzmann_Q(P),
+            "Q_boltz_at_P": boltzmann_Q(_clamp_p(P)),
         }
 
     def branch_indices(self, R: Optional[float] = None) -> Tuple[Optional[int], Optional[int]]:
@@ -699,13 +889,6 @@ class Spin1Model:
         })
         return out
 
-    def physical_intensities(self, n: Optional[np.ndarray] = None) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """Return I+(R), I-(R), and total on the model's physical R grid."""
-        state = self.n if n is None else n
-        return packet_n_to_physical_intensities(
-            state, self.Rplus, display_cal=self.display_cal, dR=self.dR
-        )
-
     def spectrum_from_state(self, n: np.ndarray):
         Iplus_packet, Iminus_packet = self._transition_differences(n)
         Iplus_packet = self.display_cal * Iplus_packet / self.dR
@@ -763,9 +946,6 @@ class Spin1Model:
         return dn
 
     def _project_conserve_vector(self, dn: np.ndarray) -> np.ndarray:
-        # Always use full-spectrum μ weights. Active-window reweighting dumps the
-        # P-conservation correction onto burn/mirror packets and can flip the
-        # apparent mirror-peak sign (normalization artifact).
         dP = float(np.sum(dn[:, PLUS] - dn[:, MINUS]))
         if abs(dP) < 1e-18:
             return dn
@@ -774,140 +954,67 @@ class Spin1Model:
         correction[:, MINUS] += 0.5 * dP * self.mu
         return dn + correction
 
-    def _level_fractions(self, n: Optional[np.ndarray] = None) -> np.ndarray:
-        if n is None:
-            n = self.n
-        return n / np.maximum(self.mu[:, None], 1e-30)
-
-    def _availability_factor(self, a: int, b: int, reference: Optional[np.ndarray] = None) -> np.ndarray:
-        weight = float(np.clip(self.params.population_availability, 0.0, 1.0))
-        if weight == 0.0:
-            return np.ones(len(self.Rplus))
-        p_cur = self._level_fractions(self.n)
-        p_ref = p_cur if reference is None else self._level_fractions(reference)
-        raw = np.sqrt(np.maximum(p_cur[:, a] * p_cur[:, b], 0.0) * np.maximum(p_ref[:, a] * p_ref[:, b], 0.0))
-        raw = np.clip(raw / (1.0 / 9.0), 0.0, 3.0)
-        return (1.0 - weight) + weight * raw
-
-    def _edge_availability_factor(self, a: int, b: int) -> np.ndarray:
-        weight = float(np.clip(self.params.population_availability, 0.0, 1.0))
-        if weight == 0.0 or len(self.Rplus) < 2:
-            return np.ones(max(0, len(self.Rplus) - 1))
-        p_cur = self._level_fractions(self.n)
-        raw = np.sqrt(np.maximum(p_cur[:-1, a] * p_cur[:-1, b], 0.0) * np.maximum(p_cur[1:, a] * p_cur[1:, b], 0.0))
-        raw = np.clip(raw / (1.0 / 9.0), 0.0, 3.0)
-        return (1.0 - weight) + weight * raw
-
-    def _transition_density_abs(self, which: str, state: Optional[np.ndarray] = None) -> np.ndarray:
-        if state is None:
-            state = self.n
+    def _mode_relax_reference(self, which: str, rate: float, reference: np.ndarray) -> np.ndarray:
+        """Same-bin backpath: decay an RF-created mode toward the current reference."""
+        if rate == 0.0:
+            return np.zeros_like(self.n)
+        a_plus0, b_0minus = self._rf_mode_amplitudes(reference)
+        w = self.capacity_rate_weights()
         if which == "plus0":
-            diff = state[:, PLUS] - state[:, ZERO]
+            return self._mode_to_population_derivative(-rate * w * a_plus0, np.zeros_like(b_0minus))
+        if which == "0minus":
+            return self._mode_to_population_derivative(np.zeros_like(a_plus0), -rate * w * b_0minus)
+        raise ValueError("which must be 'plus0' or '0minus'")
+
+    def _mode_diffuse_delta(self, which: str, rate: float, reference: np.ndarray) -> np.ndarray:
+        """Conservative nearest-neighbor diffusion of an RF-created hole mode."""
+        if rate == 0.0 or len(self.Rplus) < 2:
+            return np.zeros_like(self.n)
+        a_plus0, b_0minus = self._rf_mode_amplitudes(reference)
+        if which == "plus0":
+            mode = a_plus0
         elif which == "0minus":
-            diff = state[:, ZERO] - state[:, MINUS]
+            mode = b_0minus
         else:
             raise ValueError("which must be 'plus0' or '0minus'")
-        return np.abs(diff) / max(float(self.dR), 1e-30)
 
-    def _position_scale(self, values: np.ndarray) -> np.ndarray:
-        if not bool(self.params.r_dependent_recovery):
-            return np.ones_like(np.asarray(values, dtype=float))
-        x = np.abs(np.asarray(values, dtype=float))
-        finite = x[np.isfinite(x) & (x > 1e-30)]
-        if finite.size == 0:
-            return np.ones_like(x, dtype=float)
-        norm = max(float(np.nanpercentile(finite, 90.0)), 1e-30)
-        power = max(0.0, float(self.params.recovery_position_power))
-        raw = np.power(x / norm, power) if power != 0.0 else np.ones_like(x)
-        floor = float(np.clip(self.params.recovery_position_floor, 0.0, 1.0))
-        cap = max(1.0, float(self.params.recovery_rate_clip))
-        return np.clip(floor + (1.0 - floor) * raw, floor, cap)
+        rho_mode = mode / np.maximum(self.mu, 1e-30)
+        dR_edges = self.Rplus[1:] - self.Rplus[:-1]
+        width = max(self.params.t2_width_R, 1e-12)
+        overlap = np.exp(-0.5 * (dR_edges / width) ** 2)
+        edge_mass = np.sqrt(self.mu[:-1] * self.mu[1:])
+        w = self.capacity_rate_weights()
+        edge_rate_weight = np.sqrt(w[:-1] * w[1:])
 
-    def _position_rate_arrays(self, reference: np.ndarray) -> Dict[str, np.ndarray]:
-        a_plus0, b_0minus = self._rf_mode_amplitudes(reference)
-        ref_plus = self._transition_density_abs("plus0", reference)
-        ref_minus = self._transition_density_abs("0minus", reference)
-        cur_plus = self._transition_density_abs("plus0", self.n)
-        cur_minus = self._transition_density_abs("0minus", self.n)
-        plus_norm, minus_norm, overlap, edge_mass = self._ensure_static_rate_cache(reference)
-        mode_plus_density = np.abs(a_plus0) / max(float(self.dR), 1e-30)
-        mode_minus_density = np.abs(b_0minus) / max(float(self.dR), 1e-30)
-        dev_plus = np.clip(mode_plus_density / (ref_plus + 0.02 * plus_norm + 1e-30), 0.0, 50.0)
-        dev_minus = np.clip(mode_minus_density / (ref_minus + 0.02 * minus_norm + 1e-30), 0.0, 50.0)
+        flux = rate * edge_rate_weight * overlap * edge_mass * (rho_mode[1:] - rho_mode[:-1])
+        dmode_dt = np.zeros_like(mode)
+        dmode_dt[:-1] += flux
+        dmode_dt[1:] -= flux
 
-        # Same-theta recovery of one transition is weighted by the corresponding mirror branch.
-        # Norms are taken from the *current* arrays (not cached ref norms) so mirror
-        # weighting keeps the correct sign/scale after burns.
-        mirror_for_plus = self._position_scale(cur_minus)
-        mirror_for_minus = self._position_scale(cur_plus)
-        neighbor_plus_packet = self._position_scale(cur_plus)
-        neighbor_minus_packet = self._position_scale(cur_minus)
-        avail_plus = self._availability_factor(PLUS, ZERO, reference)
-        avail_minus = self._availability_factor(ZERO, MINUS, reference)
-        gain = max(0.0, float(self.params.same_theta_mirror_gain))
-        bgain = max(0.0, float(self.params.boltzmann_distance_gain))
-        cap = max(1.0, float(self.params.recovery_rate_clip))
-        same_plus = self.params.d_same_plus0 * mirror_for_plus * avail_plus * (1.0 + gain * dev_plus) * (1.0 + bgain * dev_plus)
-        same_minus = self.params.d_same_0minus * mirror_for_minus * avail_minus * (1.0 + gain * dev_minus) * (1.0 + bgain * dev_minus)
-        same_plus = np.clip(same_plus, 0.0, cap * max(abs(self.params.d_same_plus0), 1e-30))
-        same_minus = np.clip(same_minus, 0.0, cap * max(abs(self.params.d_same_0minus), 1e-30))
+        if which == "plus0":
+            return self._mode_to_population_derivative(dmode_dt, np.zeros_like(mode))
+        return self._mode_to_population_derivative(np.zeros_like(mode), dmode_dt)
 
-        if len(self.Rplus) < 2:
-            edge_plus = np.zeros(0, dtype=float)
-            edge_minus = np.zeros(0, dtype=float)
-            edge_plus_weight = np.zeros(0, dtype=float)
-            edge_minus_weight = np.zeros(0, dtype=float)
-        else:
-            edge_avail_plus = self._edge_availability_factor(PLUS, ZERO)
-            edge_avail_minus = self._edge_availability_factor(ZERO, MINUS)
-            edge_plus_weight = np.sqrt(neighbor_plus_packet[:-1] * neighbor_plus_packet[1:])
-            edge_minus_weight = np.sqrt(neighbor_minus_packet[:-1] * neighbor_minus_packet[1:])
-            edge_dev_plus = 0.5 * (dev_plus[:-1] + dev_plus[1:])
-            edge_dev_minus = 0.5 * (dev_minus[:-1] + dev_minus[1:])
-            edge_plus = self.params.d_spec_plus0 * overlap * edge_avail_plus * edge_plus_weight * edge_mass * (1.0 + 0.5 * bgain * edge_dev_plus)
-            edge_minus = self.params.d_spec_0minus * overlap * edge_avail_minus * edge_minus_weight * edge_mass * (1.0 + 0.5 * bgain * edge_dev_minus)
-            edge_plus = np.clip(edge_plus, 0.0, cap * max(abs(self.params.d_spec_plus0), 1e-30))
-            edge_minus = np.clip(edge_minus, 0.0, cap * max(abs(self.params.d_spec_0minus), 1e-30))
-
-        # Local-window burn: zero rates outside active packets (edges kept only if both ends active).
-        active = self._active_idx
-        if active is not None and active.size > 0:
-            mask = np.zeros(len(self.Rplus), dtype=bool)
-            mask[active] = True
-            same_plus = np.where(mask, same_plus, 0.0)
-            same_minus = np.where(mask, same_minus, 0.0)
-            if len(self.Rplus) >= 2:
-                edge_mask = mask[:-1] & mask[1:]
-                edge_plus = np.where(edge_mask, edge_plus, 0.0)
-                edge_minus = np.where(edge_mask, edge_minus, 0.0)
-
-        return {
-            "same_plus0": same_plus,
-            "same_0minus": same_minus,
-            "edge_plus0": edge_plus,
-            "edge_0minus": edge_minus,
-            "dev_plus0": dev_plus,
-            "dev_0minus": dev_minus,
-            "mirror_weight_plus0": mirror_for_plus,
-            "mirror_weight_0minus": mirror_for_minus,
-            "neighbor_weight_plus0": edge_plus_weight,
-            "neighbor_weight_0minus": edge_minus_weight,
-            "t2_overlap": overlap,
-            "availability_plus0": avail_plus,
-            "availability_0minus": avail_minus,
-        }
+    def _spectral_edge_rates(self, which: str) -> np.ndarray:
+        """Per-edge spectral diffusion rates for observability."""
+        p = self.params
+        rate = p.d_spec_plus0 if which == "plus0" else p.d_spec_0minus
+        if rate == 0.0 or len(self.Rplus) < 2:
+            return np.zeros(max(0, len(self.Rplus) - 1), dtype=float)
+        dR_edges = self.Rplus[1:] - self.Rplus[:-1]
+        width = max(float(p.t2_width_R), 1e-12)
+        overlap = np.exp(-0.5 * (dR_edges / width) ** 2)
+        edge_mass = np.sqrt(self.mu[:-1] * self.mu[1:])
+        w = self.capacity_rate_weights()
+        edge_rate_weight = np.sqrt(w[:-1] * w[1:])
+        return rate * edge_rate_weight * overlap * edge_mass
 
     def local_recovery_rates(self, R: Optional[float] = None) -> Dict[str, float]:
         if R is None:
             R = self.params.rf_burn_R
-        reference = self.recovery_equilibrium_reference()
-        rates = self._position_rate_arrays(reference)
         kp, km = self.branch_indices(R)
-
-        def arr(a: np.ndarray, k: Optional[int]) -> float:
-            if k is None or k < 0 or k >= len(a):
-                return float("nan")
-            return float(a[k])
+        w = self.capacity_rate_weights()
+        p = self.params
 
         def edge(a: np.ndarray, k: Optional[int], side: str) -> float:
             if k is None:
@@ -917,22 +1024,28 @@ class Spin1Model:
                 return 0.0
             return float(a[idx] / max(self.mu[k], 1e-30))
 
+        edge_plus = self._spectral_edge_rates("plus0")
+        edge_minus = self._spectral_edge_rates("0minus")
         _, parts = self.derivative(rf_on=False, dnp_on=self.params.dnp_enabled, breakdown=True)
+
+        def same(k: Optional[int], base: float) -> float:
+            if k is None:
+                return float("nan")
+            return float(base * w[k])
+
         return {
             "R": float(R),
             "k_Iplus": -1 if kp is None else int(kp),
             "k_Iminus": -1 if km is None else int(km),
-            "Iplus_same_theta": arr(rates["same_plus0"], kp),
-            "Iplus_neighbor_left": edge(rates["edge_plus0"], kp, "left"),
-            "Iplus_neighbor_right": edge(rates["edge_plus0"], kp, "right"),
-            "Iplus_mirror_factor": arr(rates["mirror_weight_plus0"], kp),
-            "Iplus_deviation": arr(rates["dev_plus0"], kp),
+            "Iplus_same_theta": same(kp, p.d_same_plus0),
+            "Iplus_neighbor_left": edge(edge_plus, kp, "left"),
+            "Iplus_neighbor_right": edge(edge_plus, kp, "right"),
+            "Iplus_capacity_weight": float(w[kp]) if kp is not None else float("nan"),
             "Iplus_refill_dt_no_rf": float(parts["net"].get("dIplus_R_dt", float("nan"))),
-            "Iminus_same_theta": arr(rates["same_0minus"], km),
-            "Iminus_neighbor_left": edge(rates["edge_0minus"], km, "left"),
-            "Iminus_neighbor_right": edge(rates["edge_0minus"], km, "right"),
-            "Iminus_mirror_factor": arr(rates["mirror_weight_0minus"], km),
-            "Iminus_deviation": arr(rates["dev_0minus"], km),
+            "Iminus_same_theta": same(km, p.d_same_0minus),
+            "Iminus_neighbor_left": edge(edge_minus, km, "left"),
+            "Iminus_neighbor_right": edge(edge_minus, km, "right"),
+            "Iminus_capacity_weight": float(w[km]) if km is not None else float("nan"),
             "Iminus_refill_dt_no_rf": float(parts["net"].get("dIminus_R_dt", float("nan"))),
         }
 
@@ -952,66 +1065,11 @@ class Spin1Model:
             "right_plus0_eff": float(local["Iplus_neighbor_right"]),
             "left_0minus_eff": float(local["Iminus_neighbor_left"]),
             "right_0minus_eff": float(local["Iminus_neighbor_right"]),
-            "mirror_plus0_factor": float(local["Iplus_mirror_factor"]),
-            "mirror_0minus_factor": float(local["Iminus_mirror_factor"]),
-            "dev_plus0": float(local["Iplus_deviation"]),
-            "dev_0minus": float(local["Iminus_deviation"]),
+            "capacity_weight_plus0": float(local["Iplus_capacity_weight"]),
+            "capacity_weight_0minus": float(local["Iminus_capacity_weight"]),
             "Iplus_refill_dt_no_rf": float(local["Iplus_refill_dt_no_rf"]),
             "Iminus_refill_dt_no_rf": float(local["Iminus_refill_dt_no_rf"]),
         }
-
-    def _mode_relax_reference(
-        self,
-        which: str,
-        rate: float,
-        reference: np.ndarray,
-        *,
-        rates: Optional[Dict[str, np.ndarray]] = None,
-        amplitudes: Optional[Tuple[np.ndarray, np.ndarray]] = None,
-    ) -> np.ndarray:
-        if rate == 0.0:
-            return np.zeros_like(self.n)
-        a_plus0, b_0minus = amplitudes if amplitudes is not None else self._rf_mode_amplitudes(reference)
-        if rates is None:
-            rates = self._position_rate_arrays(reference)
-        if which == "plus0":
-            dmode_dt = -rates["same_plus0"] * a_plus0
-            return self._mode_to_population_derivative(dmode_dt, np.zeros_like(a_plus0))
-        if which == "0minus":
-            dmode_dt = -rates["same_0minus"] * b_0minus
-            return self._mode_to_population_derivative(np.zeros_like(b_0minus), dmode_dt)
-        raise ValueError("which must be 'plus0' or '0minus'")
-
-    def _mode_diffuse_delta(
-        self,
-        which: str,
-        rate: float,
-        reference: np.ndarray,
-        *,
-        rates: Optional[Dict[str, np.ndarray]] = None,
-        amplitudes: Optional[Tuple[np.ndarray, np.ndarray]] = None,
-    ) -> np.ndarray:
-        if rate == 0.0 or len(self.Rplus) < 2:
-            return np.zeros_like(self.n)
-        a_plus0, b_0minus = amplitudes if amplitudes is not None else self._rf_mode_amplitudes(reference)
-        if rates is None:
-            rates = self._position_rate_arrays(reference)
-        if which == "plus0":
-            mode = a_plus0
-            edge_rate = rates["edge_plus0"]
-        elif which == "0minus":
-            mode = b_0minus
-            edge_rate = rates["edge_0minus"]
-        else:
-            raise ValueError("which must be 'plus0' or '0minus'")
-        rho_mode = mode / np.maximum(self.mu, 1e-30)
-        flux = edge_rate * (rho_mode[1:] - rho_mode[:-1])
-        dmode_dt = np.zeros_like(mode)
-        dmode_dt[:-1] += flux
-        dmode_dt[1:] -= flux
-        if which == "plus0":
-            return self._mode_to_population_derivative(dmode_dt, np.zeros_like(mode))
-        return self._mode_to_population_derivative(np.zeros_like(mode), dmode_dt)
 
     def derivative(self, rf_on: Optional[bool] = None, dnp_on: Optional[bool] = None, breakdown: bool = False):
         if rf_on is None:
@@ -1019,56 +1077,42 @@ class Spin1Model:
         if dnp_on is None:
             dnp_on = bool(self.params.dnp_enabled)
         dn_terms: Dict[str, np.ndarray] = {}
-        dn_rf = self.ssrf_burn() if rf_on else np.zeros_like(self.n)
+        if rf_on:
+            if self._uses_physical_voigt_rf():
+                dn_rf = self._rf_population_term(True)
+            else:
+                dn_rf = self.ssrf_burn()
+        else:
+            dn_rf = np.zeros_like(self.n)
         dn_terms["RF"] = dn_rf
 
-        # Recover toward Boltzmann at current P (post-manipulation), not initial n_ref.
-        dynamic_ref = self.recovery_equilibrium_reference()
-        need_same = self.params.d_same_plus0 != 0.0 or self.params.d_same_0minus != 0.0
-        need_spec = self.params.d_spec_plus0 != 0.0 or self.params.d_spec_0minus != 0.0
-        rates = None
-        amplitudes = None
-        if need_same or need_spec:
-            rates = self._position_rate_arrays(dynamic_ref)
-            amplitudes = self._rf_mode_amplitudes(dynamic_ref)
+        if float(self.params.diffusion_scale) > 0.0:
+            dn_terms.update(self._spin_diffusion_terms(bool(dnp_on)))
+        if self.params.relax_enabled:
+            dynamic_ref = self.recovery_dynamic_reference()
 
-        if need_same:
-            dn_same = (
-                self._mode_relax_reference(
-                    "plus0", self.params.d_same_plus0, dynamic_ref, rates=rates, amplitudes=amplitudes
-                )
-                + self._mode_relax_reference(
-                    "0minus", self.params.d_same_0minus, dynamic_ref, rates=rates, amplitudes=amplitudes
-                )
-            )
-            dn_same = self._project_conserve_vector(dn_same)
-        else:
             dn_same = np.zeros_like(self.n)
-        dn_terms["same_theta_mirror_backpath"] = dn_same
+            dn_same += self._mode_relax_reference("plus0", self.params.d_same_plus0, dynamic_ref)
+            dn_same += self._mode_relax_reference("0minus", self.params.d_same_0minus, dynamic_ref)
+            dn_same = self._project_conserve_vector(dn_same)
+            dn_terms["spin_temp_redistribution"] = dn_same
 
-        if need_spec:
-            dn_spec = (
-                self._mode_diffuse_delta(
-                    "plus0", self.params.d_spec_plus0, dynamic_ref, rates=rates, amplitudes=amplitudes
-                )
-                + self._mode_diffuse_delta(
-                    "0minus", self.params.d_spec_0minus, dynamic_ref, rates=rates, amplitudes=amplitudes
-                )
-            )
-            dn_spec = self._project_conserve_vector(dn_spec)
-        else:
             dn_spec = np.zeros_like(self.n)
-        dn_terms["spectral_neighbor_diffusion"] = dn_spec
+            dn_spec += self._mode_diffuse_delta("plus0", self.params.d_spec_plus0, dynamic_ref)
+            dn_spec += self._mode_diffuse_delta("0minus", self.params.d_spec_0minus, dynamic_ref)
+            dn_spec = self._project_conserve_vector(dn_spec)
+            dn_terms["spectral_neighbors"] = dn_spec
 
         dn_dnp = np.zeros_like(self.n)
         if dnp_on and self.params.dnp_rate != 0.0:
-            dnp_target = self.equilibrium_reference(self.params.p_dnp_sat)
-            dn_dnp = self.params.dnp_rate * (dnp_target - self.n)
+            dnp_target = self.equilibrium_reference(_clamp_p(self.params.p_dnp_sat))
+            w = self.capacity_rate_weights()[:, None]
+            dn_dnp = self.params.dnp_rate * w * (dnp_target - self.n)
         dn_terms["DNP_sat"] = dn_dnp
 
         dn_t1 = np.zeros_like(self.n)
         if self.params.t1_rate != 0.0:
-            t1_target = self.equilibrium_reference(self.params.t1_p_eq)
+            t1_target = self.equilibrium_reference(_clamp_p(self.params.t1_p_eq))
             dn_t1 = self.params.t1_rate * (t1_target - self.n)
         dn_terms["T1"] = dn_t1
 
@@ -1119,15 +1163,43 @@ class Spin1Model:
         if R is not None:
             self.params.rf_burn_R = float(R)
             self._invalidate_branch_cache()
+            self.invalidate_rf_profile()
         try:
             _, parts = self.derivative(rf_on=False, dnp_on=self.params.dnp_enabled, breakdown=True)
-            loc = self.local_intensities(self.params.rf_burn_R)
-            Ip = loc["Iplus"]
-            Im = loc["Iminus"]
-            refill_p = parts["net"]["dIplus_R_dt"]
-            refill_m = parts["net"]["dIminus_R_dt"]
-            gp = max(0.0, refill_p / (2.0 * Ip)) if np.isfinite(Ip) and abs(Ip) > 0 else np.nan
-            gm = max(0.0, refill_m / (2.0 * Im)) if np.isfinite(Im) and abs(Im) > 0 else np.nan
+            if self._uses_physical_voigt_rf():
+                unit_term = self._rf_population_term(True, self.params.rf_burn_R, gamma_rf=1.0)
+                kp, km = self.branch_indices(self.params.rf_burn_R)
+                scale = self.display_cal / self.dR
+
+                u_plus = (
+                    np.nan
+                    if kp is None
+                    else float(scale * (unit_term[kp, PLUS] - unit_term[kp, ZERO]))
+                )
+                u_minus = (
+                    np.nan
+                    if km is None
+                    else float(scale * (unit_term[km, ZERO] - unit_term[km, MINUS]))
+                )
+                refill_plus = float(parts["net"]["dIplus_R_dt"])
+                refill_minus = float(parts["net"]["dIminus_R_dt"])
+
+                def required(refill: float, unit_slope: float) -> float:
+                    if not np.isfinite(refill) or not np.isfinite(unit_slope) or abs(unit_slope) < 1e-20:
+                        return np.nan
+                    value = -refill / unit_slope
+                    return float(max(0.0, value)) if np.isfinite(value) else np.nan
+
+                gp = required(refill_plus, u_plus)
+                gm = required(refill_minus, u_minus)
+            else:
+                loc = self.local_intensities(self.params.rf_burn_R)
+                Ip = loc["Iplus"]
+                Im = loc["Iminus"]
+                refill_p = parts["net"]["dIplus_R_dt"]
+                refill_m = parts["net"]["dIminus_R_dt"]
+                gp = max(0.0, refill_p / (2.0 * Ip)) if np.isfinite(Ip) and abs(Ip) > 0 else np.nan
+                gm = max(0.0, refill_m / (2.0 * Im)) if np.isfinite(Im) and abs(Im) > 0 else np.nan
             vals = [v for v in [gp, gm] if np.isfinite(v)]
             common = max(vals) if vals else np.nan
             return {
@@ -1138,6 +1210,7 @@ class Spin1Model:
         finally:
             self.params.rf_burn_R = old_R
             self._invalidate_branch_cache()
+            self.invalidate_rf_profile()
 
     @property
     def branch_ratio(self) -> float:
@@ -1146,5 +1219,3 @@ class Spin1Model:
     @property
     def initial_branch_ratio(self) -> float:
         return boltzmann_branch_ratio(self.params.p0)
-
-

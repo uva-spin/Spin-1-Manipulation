@@ -2,8 +2,8 @@
 Create individual ssRF / AFP / unmanipulated manipulation events for testing.
 
 Each event is one final full-spectrum manipulation saved to its own NPZ file
-(see ``manipulation_event_io.py``). Physics matches the dulya_fit_v4 training
-pipeline (Dulya equilibrium + ssrf_realtime_v2 burns / AFP + relaxation).
+(see ``manipulation_event_io.py``). Physics matches the rivanna training
+pipeline (Dulya equilibrium + ssrf_realtime burns / AFP + relaxation).
 
 Examples (from repo root):
   python Data_Creation/create_sample_manipulation_events.py
@@ -21,17 +21,15 @@ import numpy as np
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parent
-DULYA_V4 = SCRIPT_DIR / "dulya_fit_v5"
-DULYA_V2 = SCRIPT_DIR / "dulya_fit_v2"
-DULYA_PKG = DULYA_V4 if DULYA_V4.is_dir() else DULYA_V2
+RIVANNA = SCRIPT_DIR / "rivanna"
 
-if str(DULYA_PKG) not in sys.path:
-    sys.path.insert(0, str(DULYA_PKG))
+if str(RIVANNA) not in sys.path:
+    sys.path.insert(0, str(RIVANNA))
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
-from afp_bin_traj import run_one_polarization as run_afp_event  # noqa: E402
-from common import (  # noqa: E402
+from afp_bin_traj import run_one_polarization as run_afp_event
+from common import (
     AFP_N_RELAX,
     BURN_BIN_CHOICES,
     F_MAX,
@@ -43,12 +41,12 @@ from common import (  # noqa: E402
     burn_steps_grid,
     gamma_rf_grid,
 )
-from manipulation_event_io import (  # noqa: E402
+from manipulation_event_io import (
     save_manipulation_event,
     write_manifest,
 )
-from model_bridge import mirror_bin_idx  # noqa: E402
-from ssrf_bin_traj import (  # noqa: E402
+from model_bridge import mirror_bin_idx
+from ssrf_bin_traj import (
     run_one_polarization as run_ssrf_event,
     run_unmanipulated_polarization,
 )

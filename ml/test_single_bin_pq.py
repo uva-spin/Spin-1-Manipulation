@@ -1,30 +1,35 @@
 """
-Evaluate single_bin P/Q models on sample test events from create_sample_single_bin_data.py.
+Evaluate single_bin models against integrated P/Q.
+
+Two data modes:
+
+1) Spectra NPZ (same file as ``ml/spectrum_pq.py``) — default comparison path.
+   Held-out split uses the same seed / val / test fractions as spectrum_pq.
+   Writes spectrum_pq-style metrics and plots:
+     test_metrics.json, rpe_by_P_total_range.csv, rpe_by_p0_range.csv
+     plots/pred_vs_true.png
+     plots/rpe_by_polarization_range.png
+     plots/residuals_by_polarization_range.png
+     plots/example_manipulated_signals_pq.png
+     plots/examples/*.png
+
+2) Sample test events from ``create_sample_single_bin_data.py`` (``--sample-dir``).
+   Per-bin P/Q spectra plots under ``<sample-dir>/test_pq_plots/``.
 
 Supports:
-  - Combined model (default): combined_bin_model.pth from ml/combine_single_bin_models.py
-  - Per-bin checkpoints: binning_model_bin_XXXX.pth directory
+  - Combined model (default): combined_bin_model.pth
+  - Per-bin checkpoints: binning_model_bin_XXXX.pth directory (sample-dir mode only)
 
-Each test event NPZ contains a full spectrum plus ``P_bins`` / ``Q_bins`` ground truth.
-Features: ``[p0, ps[j]]`` at each spectral bin ``j``.
-
-Examples (from repo root):
-  python Data_Creation/dulya_fit_v5/create_sample_single_bin_data.py --quick
-  sbatch ml/train_single_bin_array.slurm
-  sbatch ml/combine_single_bin_models.slurm
+Examples (from repo root)::
 
   python ml/test_single_bin_pq.py \\
-      --sample-dir Data_Creation/dulya_fit_v5/sample_single_bin \\
+      --spectra Data_Creation/dae_voigt_burn_spectra/spectra.npz \\
+      --combined-model ml/models/combined_bin_model.pth \\
+      --output-dir ml/single_bin_pq_results
+
+  python ml/test_single_bin_pq.py \\
+      --sample-dir Data_Creation/rivanna/sample_single_bin \\
       --combined-model single_bin_models/combined_bin_model.pth
-
-Writes plots under ``<sample-dir>/test_pq_plots/``:
-  pq_spectrum_examples.png   true vs pred P/Q (multi-event, like test-binning)
-  residuals_heatmap_P.png / residuals_heatmap_Q.png
-  events/<event>_pq.png      per-event stacked P and Q panels
-
-Integrated lineshape totals use the same convention as ``ml/test-binning.py``:
-``mean(P_bins)`` and ``mean(Q_bins)`` over modeled bins (CC-calibrated per-bin
-targets averaged over the spectrum equals post-corrected integrated P/Q).
 """
 
 from __future__ import annotations
@@ -36,20 +41,37 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, List, Sequence
 
+import matplotlib
+
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 ML_DIR = REPO_ROOT / "ml"
+RIVANNA_DIR = REPO_ROOT / "Data_Creation" / "rivanna"
 if str(ML_DIR) not in sys.path:
     sys.path.insert(0, str(ML_DIR))
+if str(RIVANNA_DIR) not in sys.path:
+    sys.path.insert(0, str(RIVANNA_DIR))
 
-from single_bin import BinModel, load_bin_model_state_dict
+import spectrum_pq as spq
+from pq_calibration import calibrated_pq_spectrum, load_pq_calibration
+from single_bin import (
+    BinModel,
+    build_feature_row,
+    event_manipulation_features,
+    load_bin_model_state_dict,
+)
 
 DEFAULT_SAMPLE_DIR = (
-    REPO_ROOT / "Data_Creation" / "dulya_fit_v5" / "sample_single_bin"
+    REPO_ROOT / "Data_Creation" / "rivanna" / "sample_single_bin"
 )
+DEFAULT_SPECTRA_OUTPUT_DIR = ML_DIR / "single_bin_pq_results"
+DEFAULT_SEED = spq.SEED
+DEFAULT_VAL_FRAC = spq.VAL_FRAC
+DEFAULT_TEST_FRAC = spq.TEST_FRAC
 
 
 def _load_test_binning_module():
@@ -85,18 +107,6 @@ def load_bin_model(model_path: Path, device: torch.device) -> Dict[str, Any]:
         "Q_mean": float(payload["Q_mean"]),
         "Q_std": float(payload["Q_std"]),
     }
-
-
-def build_feature_row(p0: float, ps_j: float, feature_names: List[str]) -> np.ndarray:
-    columns = {
-        "p0": float(p0),
-        "ps": float(ps_j),
-        "ps_at_burn_bin": float(ps_j),
-    }
-    missing = [name for name in feature_names if name not in columns]
-    if missing:
-        raise KeyError(f"Unsupported feature names: {missing}")
-    return np.array([columns[name] for name in feature_names], dtype=np.float32)
 
 
 def _integrated_totals(
@@ -206,6 +216,14 @@ def event_from_npz(event_path: Path, tb_mod) -> tuple[Any, np.ndarray, np.ndarra
         meta = json.loads(str(np.asarray(data["meta_json"]).reshape(())))
 
     burn_bin = center_bin if meta.get("manipulation_mode") == "ssrf" else None
+    source = 0 if meta.get("manipulation_mode") == "ssrf" else (1 if meta.get("manipulation_mode") == "afp" else 2)
+    gamma_rf_val = float(np.asarray(data["gamma_rf"]).reshape(())) if "gamma_rf" in data.files else None
+    n_steps_val = float(step) if step > 0 else None
+    gamma_rf, n_steps = event_manipulation_features(
+        source=source,
+        gamma_rf=gamma_rf_val,
+        n_steps=n_steps_val,
+    )
     event = tb_mod.LineshapeEvent(
         polarization=p0,
         frequency=frequency,
@@ -213,6 +231,8 @@ def event_from_npz(event_path: Path, tb_mod) -> tuple[Any, np.ndarray, np.ndarra
         iplus=iplus,
         iminus=iminus,
         burn_bin_idx=burn_bin,
+        gamma_rf=gamma_rf,
+        n_steps=n_steps,
         burn_step_norm=float(step) / 100.0 if step > 0 else 0.0,
     )
     return event, p_bins, q_bins, p0, meta
@@ -271,6 +291,20 @@ def predict_event_per_bin(
         q_bins = np.asarray(data["Q_bins"], dtype=np.float32)
         p0 = float(np.asarray(data["p0"]).reshape(()))
         meta = json.loads(str(np.asarray(data["meta_json"]).reshape(())))
+        source = 0 if meta.get("manipulation_mode") == "ssrf" else (
+            1 if meta.get("manipulation_mode") == "afp" else 2
+        )
+        gamma_rf_val = (
+            float(np.asarray(data["gamma_rf"]).reshape(()))
+            if "gamma_rf" in data.files
+            else None
+        )
+        step = int(np.asarray(data["step"]).reshape(())) if "step" in data.files else 0
+        gamma_rf, n_steps = event_manipulation_features(
+            source=source,
+            gamma_rf=gamma_rf_val,
+            n_steps=float(step) if step > 0 else None,
+        )
 
     n_bins = int(ps.size)
     end = int(bin_end) if bin_end is not None else n_bins
@@ -282,7 +316,13 @@ def predict_event_per_bin(
         if not model_path.is_file():
             continue
         bundle = load_bin_model(model_path, device)
-        x_raw = build_feature_row(p0, float(ps[j]), bundle["feature_names"])
+        x_raw = build_feature_row(
+            bundle["feature_names"],
+            gamma_rf=gamma_rf,
+            n_steps=n_steps,
+            ps=float(ps[j]),
+            p0=p0,
+        )
         x = torch.as_tensor(x_raw, dtype=torch.float32, device=device).reshape(1, -1)
         x_norm = (x - bundle["x_mean"]) / bundle["x_std"]
         with torch.no_grad():
@@ -494,66 +534,407 @@ def write_pq_plots(
         plot_pq_spectrum_panels(per_event_dir / f"{stem}_pq.png", result)
 
 
-def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(
-        description="Evaluate single_bin P/Q models on sample test events"
-    )
-    p.add_argument(
-        "--sample-dir",
-        type=Path,
-        default=DEFAULT_SAMPLE_DIR,
-        help="Directory from create_sample_single_bin_data.py",
-    )
-    p.add_argument(
-        "--combined-model",
-        type=Path,
-        default=None,
-        help="Path to combined_bin_model.pth (default: <model-dir>/combined_bin_model.pth)",
-    )
-    p.add_argument(
-        "--model-dir",
-        type=Path,
-        default=None,
-        help="Directory with per-bin .pth files (used to locate combined model or --per-bin mode)",
-    )
-    p.add_argument(
-        "--per-bin",
-        action="store_true",
-        help="Evaluate per-bin checkpoints instead of the combined model",
-    )
-    p.add_argument("--bin-start", type=int, default=0)
-    p.add_argument("--bin-end", type=int, default=None)
-    p.add_argument(
-        "--device",
-        type=str,
-        default="cuda" if torch.cuda.is_available() else "cpu",
-    )
-    p.add_argument(
-        "--output-dir",
-        type=Path,
-        default=None,
-        help="Directory for plots (default: <sample-dir>/test_pq_plots)",
-    )
-    p.add_argument(
-        "--examples",
-        type=int,
-        default=12,
-        help="Number of events in the multi-panel pq_spectrum_examples.png",
-    )
-    p.add_argument(
-        "--example-selection",
-        choices=("stratified", "sequential", "spread"),
-        default="stratified",
-    )
-    p.add_argument("--no-plots", action="store_true")
-    return p.parse_args()
+def _split_indices(
+    n: int,
+    *,
+    val_frac: float,
+    test_frac: float,
+    seed: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Match ``spectrum_pq.prepare_datasets`` index splitting exactly."""
+    if n < 6:
+        raise ValueError(f"Need at least 6 samples for train/val/test split, got {n}")
+    rng = np.random.default_rng(int(seed))
+    perm = rng.permutation(n)
+    n_test = max(1, int(round(n * float(test_frac))))
+    n_val = max(1, int(round(n * float(val_frac))))
+    if n_test + n_val >= n - 1:
+        n_test = max(1, n // 5)
+        n_val = max(1, n // 5)
+    test_idx = perm[:n_test].astype(np.int64)
+    val_idx = perm[n_test : n_test + n_val].astype(np.int64)
+    train_idx = perm[n_test + n_val :].astype(np.int64)
+    if train_idx.size < 2:
+        raise RuntimeError("Train split too small; lower --val-frac / --test-frac")
+    return train_idx, val_idx, test_idx
 
 
-def main() -> None:
-    args = parse_args()
+def event_from_spectrum_row(
+    arrays: dict[str, np.ndarray],
+    index: int,
+    tb_mod,
+    *,
+    frequency: np.ndarray,
+) -> Any:
+    """Build a LineshapeEvent from one row of spectra.npz."""
+    i = int(index)
+    ip = np.asarray(arrays["spectra"][i, 0], dtype=np.float32)
+    im = np.asarray(arrays["spectra"][i, 1], dtype=np.float32)
+    p0 = float(np.asarray(arrays["p0"][i]).reshape(())) if "p0" in arrays else 0.0
+    source = (
+        int(np.asarray(arrays["source"][i]).reshape(()))
+        if "source" in arrays
+        else 0
+    )
+    applied = (
+        float(np.asarray(arrays["applied_power"][i]).reshape(()))
+        if "applied_power" in arrays
+        else None
+    )
+    n_steps_raw = float(np.asarray(arrays["n_steps"][i]).reshape(()))
+    gamma_rf, n_steps = event_manipulation_features(
+        source=source,
+        applied_power=applied,
+        n_steps=n_steps_raw,
+    )
+    center = (
+        int(np.asarray(arrays["center_bin"][i]).reshape(()))
+        if "center_bin" in arrays
+        else None
+    )
+    return tb_mod.LineshapeEvent(
+        polarization=p0,
+        frequency=np.asarray(frequency, dtype=np.float32),
+        ps=(ip + im).astype(np.float32, copy=False),
+        iplus=ip,
+        iminus=im,
+        burn_bin_idx=center,
+        gamma_rf=gamma_rf,
+        n_steps=n_steps,
+        burn_step_norm=float(n_steps) / 100.0 if n_steps > 0 else 0.0,
+    )
+
+
+def _integrated_from_bin_preds(
+    pred0: np.ndarray,
+    pred1: np.ndarray,
+    *,
+    p0: float,
+    target_mode: str,
+    calibration: dict[str, Any] | None,
+) -> tuple[float, float]:
+    """Convert per-bin model outputs to integrated P_total / Q_total."""
+    out0 = np.asarray(pred0, dtype=np.float64).reshape(-1)
+    out1 = np.asarray(pred1, dtype=np.float64).reshape(-1)
+    mask = np.isfinite(out0) & np.isfinite(out1)
+    if not np.any(mask):
+        return float("nan"), float("nan")
+    if target_mode == "pq":
+        return float(np.mean(out0[mask])), float(np.mean(out1[mask]))
+    ip = out0[mask]
+    im = out1[mask]
+    ps = ip + im
+    p_bins, q_bins = calibrated_pq_spectrum(
+        ps,
+        ip,
+        im,
+        float(p0),
+        calibration=calibration,
+        num_bins=int(out0.size),
+    )
+    return float(np.mean(p_bins)), float(np.mean(q_bins))
+
+
+def _scalar_metrics(pred: np.ndarray, true: np.ndarray) -> dict[str, float]:
+    pred_a = np.asarray(pred, dtype=np.float64).reshape(-1)
+    true_a = np.asarray(true, dtype=np.float64).reshape(-1)
+    err = pred_a - true_a
+    mae = float(np.mean(np.abs(err)))
+    rmse = float(np.sqrt(np.mean(err**2)))
+    ss_res = float(np.sum(err**2))
+    ss_tot = float(np.sum((true_a - np.mean(true_a)) ** 2))
+    r2 = float(1.0 - ss_res / ss_tot) if ss_tot > 1e-18 else float("nan")
+    rpe = spq.compute_rpe(pred_a, true_a)
+    rpe_s = spq._summary_stats(rpe)
+    res_s = spq._summary_stats(err)
+    return {
+        "mae": mae,
+        "rmse": rmse,
+        "r2": r2,
+        "rpe_mean": rpe_s["mean"],
+        "rpe_median": rpe_s["median"],
+        "rpe_std": rpe_s["std"],
+        "residual_mean": res_s["mean"],
+        "residual_median": res_s["median"],
+        "residual_std": res_s["std"],
+    }
+
+
+def evaluate_combined_on_spectra(
+    combined_model,
+    arrays: dict[str, np.ndarray],
+    test_idx: np.ndarray,
+    tb_mod,
+    *,
+    batch_size: int = 32,
+    max_test: int | None = None,
+) -> dict[str, Any]:
+    """Predict integrated P/Q on held-out spectra.npz rows with the combined model."""
+    test_idx = np.asarray(test_idx, dtype=np.int64).reshape(-1)
+    if max_test is not None and int(max_test) > 0:
+        test_idx = test_idx[: int(max_test)]
+    n_test = int(test_idx.size)
+    num_bins = int(np.asarray(arrays["num_bins"]).reshape(()))
+    frequency = np.linspace(-6.0, 6.0, num_bins, dtype=np.float32)
+    target_mode = str(combined_model.target_mode)
+    calibration = (
+        None
+        if target_mode == "pq"
+        else load_pq_calibration(num_bins=num_bins)
+    )
+
+    true_p = np.asarray(arrays["P_total"], dtype=np.float64).reshape(-1)[test_idx]
+    true_q = np.asarray(arrays["Q_total"], dtype=np.float64).reshape(-1)[test_idx]
+    p0_all = (
+        np.asarray(arrays["p0"], dtype=np.float64).reshape(-1)
+        if "p0" in arrays
+        else true_p.copy()
+    )
+    p0_test = p0_all[test_idx]
+
+    pred_p = np.empty(n_test, dtype=np.float64)
+    pred_q = np.empty(n_test, dtype=np.float64)
+    bs = max(1, int(batch_size))
+
+    for start in range(0, n_test, bs):
+        stop = min(start + bs, n_test)
+        batch_idx = test_idx[start:stop]
+        events = [
+            event_from_spectrum_row(arrays, int(gi), tb_mod, frequency=frequency)
+            for gi in batch_idx
+        ]
+        out0, out1 = combined_model.predict_events(events, spectrum_bins=num_bins)
+        for local, gi in enumerate(batch_idx):
+            pp, pq = _integrated_from_bin_preds(
+                out0[local],
+                out1[local],
+                p0=float(p0_all[int(gi)]),
+                target_mode=target_mode,
+                calibration=calibration,
+            )
+            pred_p[start + local] = pp
+            pred_q[start + local] = pq
+        if start == 0 or stop == n_test or (stop % max(bs * 20, 1) == 0):
+            print(f"  evaluated {stop}/{n_test}", flush=True)
+
+    p_m = _scalar_metrics(pred_p, true_p)
+    q_m = _scalar_metrics(pred_q, true_q)
+    range_by_p = spq.polarization_range_stats(
+        pred_p,
+        true_p,
+        pred_q,
+        true_q,
+        pol_ref=true_p,
+        ref_name="abs_P_total",
+    )
+    range_by_p0 = spq.polarization_range_stats(
+        pred_p,
+        true_p,
+        pred_q,
+        true_q,
+        pol_ref=p0_test,
+        ref_name="abs_p0",
+    )
+    return {
+        "P_mae": p_m["mae"],
+        "P_rmse": p_m["rmse"],
+        "P_r2": p_m["r2"],
+        "P_rpe_mean": p_m["rpe_mean"],
+        "P_rpe_median": p_m["rpe_median"],
+        "P_rpe_std": p_m["rpe_std"],
+        "P_residual_mean": p_m["residual_mean"],
+        "P_residual_median": p_m["residual_median"],
+        "P_residual_std": p_m["residual_std"],
+        "Q_mae": q_m["mae"],
+        "Q_rmse": q_m["rmse"],
+        "Q_r2": q_m["r2"],
+        "Q_rpe_mean": q_m["rpe_mean"],
+        "Q_rpe_median": q_m["rpe_median"],
+        "Q_rpe_std": q_m["rpe_std"],
+        "Q_residual_mean": q_m["residual_mean"],
+        "Q_residual_median": q_m["residual_median"],
+        "Q_residual_std": q_m["residual_std"],
+        "pred_P": pred_p,
+        "pred_Q": pred_q,
+        "true_P": true_p,
+        "true_Q": true_q,
+        "range_stats_by_P": range_by_p,
+        "range_stats_by_p0": range_by_p0,
+        "test_idx": test_idx,
+        "p0_test": p0_test.astype(np.float32),
+        "target_mode": target_mode,
+    }
+
+
+def write_spectra_eval_outputs(
+    output_dir: Path,
+    *,
+    spectra_path: Path,
+    arrays: dict[str, np.ndarray],
+    metrics: dict[str, Any],
+    stats: dict[str, Any],
+    n_examples: int,
+    seed: int,
+    no_plots: bool,
+) -> None:
+    """Write the same metric/plot artifacts as ``spectrum_pq`` test mode."""
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    plots_dir = output_dir / "plots"
+
+    metrics_path = output_dir / "test_metrics.json"
+    spq._write_metrics(
+        metrics_path,
+        spectra_path=spectra_path,
+        best_val=None,
+        metrics=metrics,
+        stats=stats,
+    )
+    spq.save_range_stats_csv(
+        list(metrics["range_stats_by_P"]),
+        output_dir / "rpe_by_P_total_range.csv",
+    )
+    if metrics.get("range_stats_by_p0"):
+        spq.save_range_stats_csv(
+            list(metrics["range_stats_by_p0"]),
+            output_dir / "rpe_by_p0_range.csv",
+        )
+    print(f"Saved metrics -> {metrics_path}", flush=True)
+
+    if no_plots:
+        return
+
+    plot_paths = spq.save_plots(None, metrics, plots_dir)
+    example_paths = spq.save_example_signal_plots(
+        arrays,
+        stats,
+        metrics,
+        plots_dir,
+        n_examples=int(n_examples),
+        seed=int(seed),
+    )
+    plot_paths.extend(example_paths)
+    print(
+        f"Wrote {len(plot_paths)} plots -> {plots_dir} "
+        f"({len(example_paths)} example signal plots)",
+        flush=True,
+    )
+
+
+def run_spectra_mode(args: argparse.Namespace) -> None:
+    """Evaluate combined single_bin model on the same spectra.npz as spectrum_pq."""
+    spectra_path = spq.resolve_spectra_path(args.spectra)
+    output_dir = (
+        Path(args.output_dir)
+        if args.output_dir is not None
+        else DEFAULT_SPECTRA_OUTPUT_DIR
+    )
+    device = torch.device(args.device)
+
+    combined_path = args.combined_model
+    if combined_path is None:
+        model_dir = (
+            Path(args.model_dir)
+            if args.model_dir is not None
+            else ML_DIR / "models"
+        )
+        combined_path = model_dir / "combined_bin_model.pth"
+    combined_path = Path(combined_path)
+    if not combined_path.is_file():
+        raise FileNotFoundError(
+            f"Combined model not found at {combined_path}; "
+            "pass --combined-model PATH"
+        )
+
+    print(f"Loading {spectra_path}", flush=True)
+    arrays = spq.load_spectrum_pq_npz(spectra_path)
+    train_idx, val_idx, test_idx = _split_indices(
+        int(arrays["P_total"].shape[0]),
+        val_frac=float(args.val_frac),
+        test_frac=float(args.test_frac),
+        seed=int(args.seed),
+    )
+
+    tb = _load_test_binning_module()
+    combined_model, _model_meta = tb.load_combined_model(str(combined_path), device)
+    print(f"combined_model={combined_path}", flush=True)
+    print(
+        f"loaded_bins={combined_model.num_models}  "
+        f"feature_names={combined_model.feature_names}  "
+        f"target_mode={combined_model.target_mode}",
+        flush=True,
+    )
+    print(
+        f"N={arrays['P_total'].shape[0]}  "
+        f"train/val/test={train_idx.size}/{val_idx.size}/{test_idx.size}  "
+        f"(same-file split as spectrum_pq, seed={args.seed})  device={device}",
+        flush=True,
+    )
+
+    metrics = evaluate_combined_on_spectra(
+        combined_model,
+        arrays,
+        test_idx,
+        tb,
+        batch_size=int(args.batch_size),
+        max_test=args.max_test,
+    )
+    used_test_idx = np.asarray(metrics["test_idx"], dtype=np.int64)
+    stats = {
+        "n_train": int(train_idx.size),
+        "n_val": int(val_idx.size),
+        "n_test": int(used_test_idx.size),
+        "test_idx": used_test_idx,
+        "p0_test": metrics["p0_test"],
+    }
+
+    print(
+        f"Test  P: MAE={float(metrics['P_mae']):.6g}  "
+        f"RMSE={float(metrics['P_rmse']):.6g}  R²={float(metrics['P_r2']):.4f}  "
+        f"RPE med/mean/std="
+        f"{float(metrics['P_rpe_median']):.3f}/"
+        f"{float(metrics['P_rpe_mean']):.3f}/"
+        f"{float(metrics['P_rpe_std']):.3f}%",
+        flush=True,
+    )
+    print(
+        f"Test  Q: MAE={float(metrics['Q_mae']):.6g}  "
+        f"RMSE={float(metrics['Q_rmse']):.6g}  R²={float(metrics['Q_r2']):.4f}  "
+        f"RPE med/mean/std="
+        f"{float(metrics['Q_rpe_median']):.3f}/"
+        f"{float(metrics['Q_rpe_mean']):.3f}/"
+        f"{float(metrics['Q_rpe_std']):.3f}%",
+        flush=True,
+    )
+    spq.print_range_stats_table(
+        list(metrics["range_stats_by_P"]),
+        title="RPE / residuals by |P_total| range",
+    )
+    if metrics.get("range_stats_by_p0"):
+        spq.print_range_stats_table(
+            list(metrics["range_stats_by_p0"]),
+            title="RPE / residuals by |p0| range",
+        )
+
+    write_spectra_eval_outputs(
+        output_dir,
+        spectra_path=spectra_path,
+        arrays=arrays,
+        metrics=metrics,
+        stats=stats,
+        n_examples=int(args.n_examples),
+        seed=int(args.seed),
+        no_plots=bool(args.no_plots),
+    )
+
+
+def run_sample_dir_mode(args: argparse.Namespace) -> None:
+    """Legacy path: evaluate on create_sample_single_bin_data.py test events."""
     sample_dir = Path(args.sample_dir)
     test_dir = sample_dir / "test_events"
-    model_dir = Path(args.model_dir) if args.model_dir is not None else sample_dir / "single_bin_models"
+    model_dir = (
+        Path(args.model_dir) if args.model_dir is not None else sample_dir / "single_bin_models"
+    )
     device = torch.device(args.device)
 
     if not test_dir.is_dir():
@@ -577,7 +958,7 @@ def main() -> None:
                 "run ml/combine_single_bin_models.py or pass --per-bin"
             )
         tb = _load_test_binning_module()
-        combined_model, model_meta = tb.load_combined_model(str(combined_path), device)
+        combined_model, _model_meta = tb.load_combined_model(str(combined_path), device)
         print(f"sample_dir={sample_dir}", flush=True)
         print(f"combined_model={combined_path}", flush=True)
         print(
@@ -587,7 +968,9 @@ def main() -> None:
             flush=True,
         )
         print(f"device={device}", flush=True)
-        predict_fn = lambda path: predict_event_combined(path, combined_model, tb, device=device)
+        predict_fn = lambda path: predict_event_combined(
+            path, combined_model, tb, device=device
+        )
     else:
         print(f"sample_dir={sample_dir}", flush=True)
         print(f"model_dir={model_dir}  (per-bin mode)", flush=True)
@@ -605,7 +988,9 @@ def main() -> None:
     for path in events:
         result = predict_fn(path)
         full_results.append(result)
-        summaries.append({k: v for k, v in result.items() if not isinstance(v, np.ndarray)})
+        summaries.append(
+            {k: v for k, v in result.items() if not isinstance(v, np.ndarray)}
+        )
         p_rpe = result.get("P_total_rpe_pct")
         q_rpe = result.get("Q_total_rpe_pct")
         p_rpe_s = f"{float(p_rpe):.2f}%" if p_rpe is not None else "n/a"
@@ -632,7 +1017,11 @@ def main() -> None:
     print(f"Wrote {out_path}", flush=True)
 
     if not args.no_plots:
-        plot_dir = Path(args.output_dir) if args.output_dir is not None else sample_dir / "test_pq_plots"
+        plot_dir = (
+            Path(args.output_dir)
+            if args.output_dir is not None
+            else sample_dir / "test_pq_plots"
+        )
         write_pq_plots(
             plot_dir,
             full_results,
@@ -644,6 +1033,112 @@ def main() -> None:
         print(f"  {plot_dir / 'residuals_heatmap_P.png'}", flush=True)
         print(f"  {plot_dir / 'residuals_heatmap_Q.png'}", flush=True)
         print(f"  {plot_dir / 'events'}/*.png", flush=True)
+
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        description=(
+            "Evaluate single_bin models on the same spectra.npz as spectrum_pq "
+            "(default), or on sample test events (--sample-events)."
+        )
+    )
+    p.add_argument(
+        "--spectra",
+        type=Path,
+        default=None,
+        help=(
+            "Path to spectra.npz (default: same candidates as spectrum_pq.py, "
+            "Data_Creation/dae_voigt_burn_spectra/spectra.npz)"
+        ),
+    )
+    p.add_argument(
+        "--sample-events",
+        action="store_true",
+        help="Use sample_single_bin test_events instead of spectra.npz",
+    )
+    p.add_argument(
+        "--sample-dir",
+        type=Path,
+        default=DEFAULT_SAMPLE_DIR,
+        help="Directory from create_sample_single_bin_data.py (--sample-events)",
+    )
+    p.add_argument(
+        "--combined-model",
+        type=Path,
+        default=None,
+        help="Path to combined_bin_model.pth",
+    )
+    p.add_argument(
+        "--model-dir",
+        type=Path,
+        default=None,
+        help="Directory with per-bin .pth / combined model",
+    )
+    p.add_argument(
+        "--per-bin",
+        action="store_true",
+        help="Evaluate per-bin checkpoints (--sample-events only)",
+    )
+    p.add_argument("--bin-start", type=int, default=0)
+    p.add_argument("--bin-end", type=int, default=None)
+    p.add_argument(
+        "--device",
+        type=str,
+        default="cuda" if torch.cuda.is_available() else "cpu",
+    )
+    p.add_argument(
+        "--output-dir",
+        type=Path,
+        default=None,
+        help=(
+            "Output directory (default: ml/single_bin_pq_results for spectra mode, "
+            "<sample-dir>/test_pq_plots for sample-events)"
+        ),
+    )
+    p.add_argument("--seed", type=int, default=DEFAULT_SEED)
+    p.add_argument("--val-frac", type=float, default=DEFAULT_VAL_FRAC)
+    p.add_argument("--test-frac", type=float, default=DEFAULT_TEST_FRAC)
+    p.add_argument(
+        "--batch-size",
+        type=int,
+        default=32,
+        help="Event batch size for spectra.npz evaluation",
+    )
+    p.add_argument(
+        "--max-test",
+        type=int,
+        default=None,
+        help="Optional cap on held-out test events (smoke / quick runs)",
+    )
+    p.add_argument(
+        "--n-examples",
+        type=int,
+        default=6,
+        help="Manipulated-signal example plots (spectra mode)",
+    )
+    p.add_argument(
+        "--examples",
+        type=int,
+        default=12,
+        help="Events in pq_spectrum_examples.png (--sample-events)",
+    )
+    p.add_argument(
+        "--example-selection",
+        choices=("stratified", "sequential", "spread"),
+        default="stratified",
+    )
+    p.add_argument("--no-plots", action="store_true")
+    return p.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    if args.sample_events:
+        run_sample_dir_mode(args)
+        return
+    if args.per_bin:
+        raise SystemExit("--per-bin requires --sample-events")
+    run_spectra_mode(args)
 
 
 if __name__ == "__main__":

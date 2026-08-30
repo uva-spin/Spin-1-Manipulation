@@ -1,5 +1,5 @@
 """
-Bin-wise Q optimization with a generic vector lineshape + ssrf_realtime_v2.
+Bin-wise Q optimization with a generic vector lineshape + ssrf_realtime.
 
 Starts from ``GenerateVectorLineshape`` at P=0.45, applies physical-Voigt (or
 single-bin) ssRF with shared spectral recovery (event-shape ``n_ref`` so
@@ -23,7 +23,7 @@ if str(REPO_ROOT) not in sys.path:
 if str(DULYA_V2) not in sys.path:
     sys.path.insert(0, str(DULYA_V2))
 
-from common import (  # noqa: E402
+from common import (
     DIFFUSION_SCALE,
     DT,
     NUM_BINS,
@@ -37,15 +37,15 @@ RF_GAUSSIAN_FWHM_R = 0.0
 RF_LORENTZIAN_FWHM_R = 0.0
 
 
-from model_bridge import (  # noqa: E402
+from model_bridge import (
     build_spin1_model,
     configure_ssrf_burn,
     euler_n_sub,
     level_pq,
 )
-from physics.lineshape.Lineshape import GenerateVectorLineshape  # noqa: E402
-from physics.ssrf_realtime_v2.model import Spin1Model  # noqa: E402
-from physics.ssrf_realtime_v2.rate_equations_realtime import (  # noqa: E402
+from physics.lineshape.Lineshape import GenerateVectorLineshape
+from physics.ssrf_realtime.model import Spin1Model
+from physics.ssrf_realtime.rate_equations_realtime import (
     burn_preserves_ps_sign,
 )
 
@@ -139,7 +139,7 @@ class BurnConfig:
 
 
 def build_model(config: BurnConfig, polarization: float) -> Spin1Model:
-    """Generic vector lineshape loaded into ssrf_realtime_v2 with shared recovery."""
+    """Generic vector lineshape loaded into ssrf_realtime with shared recovery."""
     P = float(polarization)
     _, iplus, iminus = GenerateVectorLineshape(P, config.f)
     model = build_spin1_model(
@@ -171,7 +171,7 @@ def apply_spin1_burn(
     gaussian_fwhm_R: float,
     lorentzian_fwhm_R: float,
 ) -> Spin1Model | None:
-    """Burn with ssrf_realtime_v2 + shared Dulya recovery via configure_ssrf_burn."""
+    """Burn with ssrf_realtime + shared Dulya recovery via configure_ssrf_burn."""
     if gamma_rf <= 0.0 or n_steps <= 0:
         return None
 
@@ -356,7 +356,7 @@ def optimize_binwise_incremental(
     return {
         "polarization": polarization,
         "rf_mode": config.rf_mode,
-        "physics_model": "ssrf_realtime_v2",
+        "physics_model": "ssrf_realtime",
         "lineshape_model": "GenerateVectorLineshape",
         "initial_q": initial_q,
         "final_q": current_q,
@@ -504,7 +504,7 @@ def main() -> None:
     )
 
     print(
-        f"Bin-wise Q opt (ssrf_realtime_v2 + GenerateVectorLineshape, "
+        f"Bin-wise Q opt (ssrf_realtime + GenerateVectorLineshape, "
         f"rf_mode={config.rf_mode}) at P={polarization * 100:.2f}%:"
     )
     print(

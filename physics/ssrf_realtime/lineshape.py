@@ -22,6 +22,15 @@ from __future__ import annotations
 
 import numpy as np
 
+
+def trapezoid_integral(y, x) -> float:
+    """Compatibility wrapper for NumPy < 2.0 and newer NumPy versions."""
+    trapezoid = getattr(np, "trapezoid", None)
+    if trapezoid is not None:
+        return float(trapezoid(y, x))
+    return float(np.trapz(y, x))
+
+
 def boltzmann_Q(P: float) -> float:
     """Spin-1 Boltzmann relation Q(P) = 2 - sqrt(4 - 3 P^2)."""
     return float(2.0 - np.sqrt(max(0.0, 4.0 - 3.0 * P * P)))
@@ -33,7 +42,10 @@ def boltzmann_branch_ratio(P: float) -> float:
 
     r = (sqrt(4 - 3 P^2) + P) / (2 - 2 P).
     """
-    return (np.sqrt(4.0 - 3.0 * P ** 2) + P) / (2.0 - 2.0 * P)
+    denom = 2.0 - 2.0 * P
+    if abs(denom) < 1e-15:
+        return float("inf")
+    return float((np.sqrt(max(0.0, 4.0 - 3.0 * P * P)) + P) / denom)
 
 
 def level_populations_from_PQ(P: float, Q: float | None = None) -> np.ndarray:
@@ -44,6 +56,12 @@ def level_populations_from_PQ(P: float, Q: float | None = None) -> np.ndarray:
     p_zero = (1.0 - Q) / 3.0
     p_minus = 1.0 / 3.0 - 0.5 * P + Q / 6.0
     p = np.array([p_plus, p_zero, p_minus], dtype=float)
+    if np.any(p < -1e-12):
+        raise ValueError(
+            f"Invalid spin-1 populations from P={P}, Q={Q}: {p}. "
+            "Check that P,Q are in the physically allowed triangle."
+        )
+    p = np.maximum(p, 0.0)
     return p / p.sum()
 
 
@@ -54,27 +72,32 @@ def pake_component_raw(R, epsilon: int = +1, gamma: float = 0.05, asym: float = 
     This is a vectorized, numerically guarded implementation of the formula.
     """
     eps = 1 if epsilon >= 0 else -1
-    R = np.asarray(R, dtype=float)    
+    R = np.asarray(R, dtype=float)
+    gamma = float(gamma)
+    asym = float(asym)
 
-    bigy = np.sqrt(3.0 - asym)
+    bigy = np.sqrt(max(1e-15, 3.0 - asym))
     X2 = np.sqrt(gamma * gamma + (1.0 - eps * R - asym) ** 2)
-    sqrt_X2 = np.sqrt(X2)
+    sqrt_X2 = np.sqrt(np.maximum(X2, 1e-300))
 
-    cos_alpha = (1.0 - eps * R - asym) / X2
+    cos_alpha = (1.0 - eps * R - asym) / np.maximum(X2, 1e-300)
     cos_alpha = np.clip(cos_alpha, -1.0, 1.0)
-    cos_half = np.sqrt((1.0 + cos_alpha) / 2.0)
-    sin_half = np.sqrt((1.0 - cos_alpha) / 2.0)
+    cos_half = np.sqrt(np.maximum(0.0, (1.0 + cos_alpha) / 2.0))
+    sin_half = np.sqrt(np.maximum(0.0, (1.0 - cos_alpha) / 2.0))
 
     denom1 = 2.0 * bigy * sqrt_X2 * sin_half
     numer1 = bigy * bigy - X2
-    ratio1 = numer1 / denom1
+    with np.errstate(divide="ignore", invalid="ignore"):
+        ratio1 = np.divide(numer1, denom1, out=np.full_like(numer1, np.inf), where=np.abs(denom1) > 1e-300)
     term_one = np.pi / 2.0 + np.arctan(ratio1)
 
     denom2 = bigy * bigy + X2 - 2.0 * bigy * sqrt_X2 * cos_half
     numer2 = bigy * bigy + X2 + 2.0 * bigy * sqrt_X2 * cos_half
+    denom2 = np.maximum(denom2, 1e-300)
+    numer2 = np.maximum(numer2, 1e-300)
     term_two = np.log(numer2 / denom2)
 
-    mult = 1.0 / (2.0 * np.pi * np.sqrt(X2))
+    mult = 1.0 / (2.0 * np.pi * np.sqrt(np.maximum(X2, 1e-300)))
     out = mult * (2.0 * cos_half * term_one + sin_half * term_two)
     out = np.asarray(out, dtype=float)
     out = np.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0)
@@ -86,7 +109,9 @@ def normalized_component(R, epsilon: int = +1, gamma: float = 0.05, asym: float 
     """Return the area-normalized analytic component density on grid R."""
     R = np.asarray(R, dtype=float)
     y = pake_component_raw(R, epsilon=epsilon, gamma=gamma, asym=asym)
-    area = np.trapezoid(y, R)
+    area = trapezoid_integral(y, R) if len(R) > 1 else float(np.sum(y))
+    if area <= 0 or not np.isfinite(area):
+        raise ValueError("Lineshape area is not positive; check gamma/asym/R grid.")
     return y / area
 
 

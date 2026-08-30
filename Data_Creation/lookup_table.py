@@ -41,9 +41,7 @@ def generate_vector_lineshape(polarization, x):
 
     i_plus_sign = 1
     i_minus_sign = 1
-    if polarization > 0:
-        pass
-    else:
+    if polarization <= 0:
         r = 1 / r
         i_plus_sign = -1
         i_minus_sign = -1
@@ -61,9 +59,6 @@ def generate_vector_lineshape(polarization, x):
 
 
 def main():
-    # p_negative = np.arange(0.0, -0.00001, 0.00001)
-    # p_positive = np.arange(0.00001, 0.7, 0.00001)
-    # polarizations = np.concatenate([p_negative, p_positive])
     polarizations = np.arange(-0.7, 0.70, 0.001)
     num_bins = 249
     x_grid = np.linspace(-3, 3, num_bins)
@@ -76,16 +71,6 @@ def main():
     for i, polarization in enumerate(tqdm.tqdm(polarizations, desc="Processing polarization")):
         _, iplus, iminus = generate_vector_lineshape(polarization, x_grid)
 
-        # for j in range(num_bins):
-        #     if iplus[j] > iminus[j]:
-        #         i_plus_values[i, j] = iminus[j]
-        #         i_minus_values[i, j] = iplus[j]
-        #     else:
-        #         i_plus_values[i, j] = iplus[j]
-        #         i_minus_values[i, j] = iminus[j]
-        #     ps_values[i, j] = i_plus_values[i, j] + i_minus_values[i, j]
-        #     qs_values[i, j] = i_plus_values[i, j] - i_minus_values[i, j]
-        
         i_plus_values[i, :] = iplus
         i_minus_values[i, :] = iminus
         ps_values[i, :] = iplus + iminus

@@ -189,7 +189,7 @@ def freeze_rf_profile(model: Spin1Model, profile: np.ndarray) -> Callable[[], No
     def _frozen_set_rf_profile() -> None:
         model.params.rf_profile = frozen.copy()
 
-    model.set_rf_profile = _frozen_set_rf_profile  # type: ignore[method-assign]
+    model.set_rf_profile = _frozen_set_rf_profile
     return _frozen_set_rf_profile
 
 

@@ -1,16 +1,17 @@
 """
-Tabular SARSA for sequential bin-wise ssRF burns using Data_Creation/rivanna ssrf_realtime.
+Double DQN for sequential bin-wise ssRF burns using Data_Creation/rivanna ssrf_realtime.
 
-Maximizes integrated Q polarization  Q = sum(I_+ - I_-)  by choosing a frequency
-bin and gamma_rf burn strength. Burns are only applied at bins whose initial
-spectral Q = I_+ - I_- is negative (or theta-summed Q when q_filter_use_theta);
-other bins may only be skipped.
-Burns integrate the shared rate-equation model (physical Voigt RF + spectral
-recovery) from Data_Creation/rivanna.
+Maximizes integrated tensor polarization  Q = sum(I_+ - I_-)  by choosing a
+frequency bin and gamma_rf burn strength. The Q-network sees the current
+lineshape (I_+, I_-), integrated Q, burn step, and which x-bins are already
+used. Burns are only applied at bins whose initial spectral Q = I_+ - I_- is
+negative (or theta-summed Q when q_filter_use_theta); other bins may only be
+skipped.
 """
 
 from __future__ import annotations
 
+import argparse
 import copy
 import sys
 from dataclasses import dataclass
@@ -18,6 +19,10 @@ from pathlib import Path
 
 import matplotlib.pyplot as plt
 import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
 import tqdm
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -29,6 +34,7 @@ if str(RIVANNA) not in sys.path:
 
 from common import (
     DIFFUSION_SCALE,
+    DT,
     RF_GAUSSIAN_FWHM_R,
     RF_LORENTZIAN_FWHM_R,
     RF_MODE_PHYSICAL_VOIGT,
@@ -49,18 +55,28 @@ from ssrf_realtime.rate_equations_realtime import (
     burn_preserves_ps_sign,
 )
 
-OUTPUT_DIR = REPO_ROOT / "results" / "current" / "sarsa"
-OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-SARSA_DT = 0.015
+OUTPUT_DIR = REPO_ROOT / "results" / "current" / "dqn"
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 SEED = 42
 EPISODES = 100
 POLARIZATION = 0.45
-MAX_BURNS = 20
+MAX_BURNS = 200
 FREE_BIN_SELECTION = False
+HIDDEN_DIM = 256
+REPLAY_SIZE = 10_000
+BATCH_SIZE = 64
+LEARNING_RATE = 1e-3
+GAMMA = 0.99
+EPSILON_START = 1.0
+EPSILON_END = 0.05
+TARGET_UPDATE_INTERVAL = 100
+LEARN_START = 256
+MAX_GRAD_NORM = 1.0
 
 
 def q_polarization(iplus: np.ndarray, iminus: np.ndarray) -> float:
     return float(np.sum(iplus - iminus))
+
 
 def q_at_bin(iplus: np.ndarray, iminus: np.ndarray, bin_idx: int) -> float:
     iplus_theta = iplus[bin_idx] + iplus[len(iplus) - bin_idx - 1]
@@ -244,11 +260,11 @@ class BurnConfig:
     num_bins: int = 249
     f_min: float = -3.0
     f_max: float = 3.0
-    dt: float = SARSA_DT
-    burn_steps: int = 100
+    dt: float = DT
+    burn_steps: int = 800
     gamma_min: float = 0.0
     gamma_max: float = 50.0
-    n_gamma_bins: int = 10
+    n_gamma_bins: int = 50
     max_burns: int = MAX_BURNS
     enforce_full_spectrum: bool = FREE_BIN_SELECTION
     only_negative_initial_q: bool = True
@@ -321,8 +337,6 @@ class Spin1BurnEnv:
         self.config = config
         self.f = config.f
         self._polarization: float = 0.45
-        self._q_lo: float = 0.0
-        self._q_hi: float = 1.0
         self._used_x_bins: set[int] = set()
         self._model: Spin1Model | None = None
         self._iplus = np.zeros(config.num_bins, dtype=float)
@@ -331,7 +345,30 @@ class Spin1BurnEnv:
         self._iminus0 = np.zeros(config.num_bins, dtype=float)
         self._n_ref = np.zeros(config.num_bins, dtype=float)
         self._recovery_P = 0.0
+        self._q0 = 0.0
+        self._q = 0.0
+        self._step = 0
         self.reset()
+
+    @property
+    def observation_dim(self) -> int:
+        return 2 * self.config.num_bins + 2 + len(self.config.x_values)
+
+    def observation(self) -> np.ndarray:
+        n_x = len(self.config.x_values)
+        used = np.zeros(n_x, dtype=np.float32)
+        for idx in self._used_x_bins:
+            if 0 <= idx < n_x:
+                used[idx] = 1.0
+        step_frac = float(self._step) / float(max(self.config.max_burns, 1))
+        return np.concatenate(
+            [
+                np.asarray(self._iplus, dtype=np.float32),
+                np.asarray(self._iminus, dtype=np.float32),
+                np.array([self._q, step_frac], dtype=np.float32),
+                used,
+            ]
+        )
 
     def _x_to_freq_bin(self, x: float) -> int:
         return int(np.argmin(np.abs(self.f - x)))
@@ -346,26 +383,6 @@ class Spin1BurnEnv:
         x = float(self.config.x_values[x_idx])
         gamma_rf = float(self.config.gamma_values[gamma_idx])
         return x_idx, x, gamma_rf
-
-    def _q_to_bin(self, q: float) -> int:
-        if not np.isfinite(q):
-            return 0
-        span = self._q_hi - self._q_lo
-        if span <= 0:
-            return 0
-        idx = int((q - self._q_lo) / span * self.config.n_q_bins)
-        return int(np.clip(idx, 0, self.config.n_q_bins - 1))
-
-    def _state_index(self, q_bin: int, step: int) -> int:
-        step = int(np.clip(step, 0, self.config.max_burns - 1))
-        return int(q_bin) + int(step) * self.config.n_q_bins
-
-    def state_index(self) -> int:
-        return self._state_index(self._q_bin, self._step)
-
-    def set_q_bounds(self, q_lo: float, q_hi: float) -> None:
-        self._q_lo = q_lo
-        self._q_hi = q_hi
 
     def _initial_q_at_x_idx(self, x_idx: int) -> float:
         x = float(self.config.x_values[x_idx])
@@ -400,7 +417,7 @@ class Spin1BurnEnv:
                 mask[start + 1 : start + n_gamma] = True
         return mask
 
-    def reset(self, polarization: float | None = None) -> int:
+    def reset(self, polarization: float | None = None) -> np.ndarray:
         if polarization is not None:
             self._polarization = float(polarization)
 
@@ -416,13 +433,12 @@ class Spin1BurnEnv:
         self._q = self._q0
         self._step = 0
         self._used_x_bins = set()
-        self._q_bin = self._q_to_bin(self._q0)
-        return self.state_index()
+        return self.observation()
 
-    def step(self, action: int) -> tuple[int, float, bool, dict]:
+    def step(self, action: int) -> tuple[np.ndarray, float, bool, dict]:
         x_idx, x, gamma_rf = self._action_to_burn(action)
         if (not self.config.enforce_full_spectrum) and (x_idx in self._used_x_bins):
-            return self.state_index(), -1e-6, False, {
+            return self.observation(), -1e-6, False, {
                 "repeated_x_bin": True,
                 "bin_idx": x_idx,
                 "x": x,
@@ -435,12 +451,12 @@ class Spin1BurnEnv:
         if not self.config.enforce_full_spectrum:
             self._used_x_bins.add(x_idx)
         freq_bin_idx = self._x_to_freq_bin(x)
+        q_before = self._q
 
         if gamma_rf <= 0.0:
             self._step += 1
-            self._q_bin = self._q_to_bin(self._q)
             done = self._step >= self.config.max_burns
-            return self.state_index(), 0.0, done, {
+            return self.observation(), 0.0, done, {
                 "skipped": True,
                 "bin_idx": x_idx,
                 "x": x,
@@ -453,9 +469,8 @@ class Spin1BurnEnv:
 
         if not self._burn_allowed_at_x_idx(x_idx):
             self._step += 1
-            self._q_bin = self._q_to_bin(self._q)
             done = self._step >= self.config.max_burns
-            return self.state_index(), -1e-6, done, {
+            return self.observation(), -1e-6, done, {
                 "positive_initial_q": True,
                 "bin_idx": x_idx,
                 "x": x,
@@ -479,9 +494,8 @@ class Spin1BurnEnv:
         )
         if burned is None:
             self._step += 1
-            self._q_bin = self._q_to_bin(self._q)
             done = self._step >= self.config.max_burns
-            return self.state_index(), -1e-6, done, {
+            return self.observation(), -1e-6, done, {
                 "failed_burn": True,
                 "bin_idx": x_idx,
                 "x": x,
@@ -514,10 +528,9 @@ class Spin1BurnEnv:
         self._iplus = ip_new
         self._iminus = im_new
         self._q = q_polarization(self._iplus, self._iminus)
-        reward = self._q - self._q0
+        reward = self._q - q_before
 
         self._step += 1
-        self._q_bin = self._q_to_bin(self._q)
         done = self._step >= self.config.max_burns
         info = {
             "bin_idx": x_idx,
@@ -528,7 +541,7 @@ class Spin1BurnEnv:
             "q": self._q,
             "q_gain": self._q - self._q0,
         }
-        return self.state_index(), reward, done, info
+        return self.observation(), reward, done, info
 
     @property
     def current_q(self) -> float:
@@ -539,35 +552,134 @@ class Spin1BurnEnv:
         return self._q0
 
 
-class SARSAAgent:
-    """SARSA agent for sequential bin-wise ssRF burns on a Spin1 lineshape."""
+class ReplayBuffer:
+    """Fixed-capacity circular buffer of DQN transitions."""
 
     def __init__(
         self,
-        n_states: int,
+        capacity: int,
+        state_dim: int,
         n_actions: int,
-        alpha: float = 0.1,
-        gamma: float = 0.99,
-        epsilon: float = 1.0,
         seed: int | None = 42,
     ):
-        self.n_states = n_states
-        self.n_actions = n_actions
-        self.alpha = alpha
-        self.gamma = gamma
-        self.epsilon = epsilon
+        self.capacity = int(capacity)
+        self.state_dim = int(state_dim)
+        self.n_actions = int(n_actions)
         self.rng = np.random.default_rng(seed)
-        self.q_table = np.full((n_states, n_actions), 0.0, dtype=np.float64)
+        self.ptr = 0
+        self.size = 0
+        self.states = np.zeros((self.capacity, self.state_dim), dtype=np.float32)
+        self.actions = np.zeros(self.capacity, dtype=np.int64)
+        self.rewards = np.zeros(self.capacity, dtype=np.float32)
+        self.next_states = np.zeros((self.capacity, self.state_dim), dtype=np.float32)
+        self.dones = np.zeros(self.capacity, dtype=np.float32)
+        self.next_masks = np.ones((self.capacity, self.n_actions), dtype=np.bool_)
 
-    def _masked_q_row(self, state: int, action_mask: np.ndarray | None) -> np.ndarray:
-        q_values = self.q_table[state].copy()
-        if action_mask is not None:
-            q_values[~np.asarray(action_mask, dtype=bool)] = -np.inf
-        return q_values
+    def add(
+        self,
+        state: np.ndarray,
+        action: int,
+        reward: float,
+        next_state: np.ndarray,
+        done: bool,
+        next_mask: np.ndarray | None,
+    ) -> None:
+        self.states[self.ptr] = state
+        self.actions[self.ptr] = int(action)
+        self.rewards[self.ptr] = float(reward)
+        self.next_states[self.ptr] = next_state
+        self.dones[self.ptr] = float(done)
+        if next_mask is None:
+            self.next_masks[self.ptr] = True
+        else:
+            self.next_masks[self.ptr] = np.asarray(next_mask, dtype=bool)
+        self.ptr = (self.ptr + 1) % self.capacity
+        self.size = min(self.size + 1, self.capacity)
+
+    def sample(self, batch_size: int) -> dict[str, np.ndarray]:
+        idx = self.rng.integers(0, self.size, size=int(batch_size))
+        return {
+            "states": self.states[idx],
+            "actions": self.actions[idx],
+            "rewards": self.rewards[idx],
+            "next_states": self.next_states[idx],
+            "dones": self.dones[idx],
+            "next_masks": self.next_masks[idx],
+        }
+
+
+class QNetwork(nn.Module):
+    """MLP mapping lineshape observations to per-action Q-values."""
+
+    def __init__(self, state_dim: int, n_actions: int, hidden_dim: int = HIDDEN_DIM):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(state_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, n_actions),
+        )
+        self._initialize_weights()
+
+    def _initialize_weights(self) -> None:
+        for module in self.modules():
+            if isinstance(module, nn.Linear):
+                nn.init.xavier_uniform_(module.weight)
+                if module.bias is not None:
+                    nn.init.constant_(module.bias, 0.0)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
+
+
+class DQNAgent:
+    """Double DQN agent for sequential ssRF tensor-enhancement burns."""
+
+    def __init__(
+        self,
+        state_dim: int,
+        n_actions: int,
+        *,
+        hidden_dim: int = HIDDEN_DIM,
+        lr: float = LEARNING_RATE,
+        gamma: float = GAMMA,
+        epsilon: float = EPSILON_START,
+        epsilon_min: float = EPSILON_END,
+        buffer_size: int = REPLAY_SIZE,
+        batch_size: int = BATCH_SIZE,
+        target_update_interval: int = TARGET_UPDATE_INTERVAL,
+        learn_start: int = LEARN_START,
+        device: torch.device | None = None,
+        seed: int | None = SEED,
+    ):
+        self.state_dim = int(state_dim)
+        self.n_actions = int(n_actions)
+        self.gamma = float(gamma)
+        self.epsilon = float(epsilon)
+        self.epsilon_min = float(epsilon_min)
+        self.batch_size = int(batch_size)
+        self.target_update_interval = int(target_update_interval)
+        self.learn_start = int(learn_start)
+        self.device = device if device is not None else DEVICE
+        self.rng = np.random.default_rng(seed)
+
+        self.online = QNetwork(state_dim, n_actions, hidden_dim=hidden_dim).to(self.device)
+        self.target = QNetwork(state_dim, n_actions, hidden_dim=hidden_dim).to(self.device)
+        self.target.load_state_dict(self.online.state_dict())
+        self.target.eval()
+        self.optimizer = optim.Adam(self.online.parameters(), lr=lr)
+        self.buffer = ReplayBuffer(buffer_size, state_dim, n_actions, seed=seed)
+        self.learn_steps = 0
+
+    def set_epsilon(self, epsilon: float) -> None:
+        self.epsilon = float(np.clip(epsilon, 0.0, 1.0))
 
     def select_action(
         self,
-        state: int,
+        state: np.ndarray,
         explore: bool = True,
         action_mask: np.ndarray | None = None,
     ) -> int:
@@ -583,57 +695,66 @@ class SARSAAgent:
         if explore and self.rng.random() < self.epsilon:
             return int(self.rng.choice(valid_actions))
 
-        q_values = self._masked_q_row(state, mask)
+        state_t = torch.from_numpy(np.asarray(state, dtype=np.float32)).unsqueeze(0)
+        state_t = state_t.to(self.device)
+        with torch.no_grad():
+            q_values = self.online(state_t).squeeze(0).detach().cpu().numpy()
+        q_values[~mask] = -np.inf
         return int(np.argmax(q_values))
 
-    def update(
+    def remember(
         self,
-        state: int,
+        state: np.ndarray,
         action: int,
         reward: float,
-        next_state: int,
-        next_action: int | None,
+        next_state: np.ndarray,
         done: bool,
+        next_mask: np.ndarray | None,
     ) -> None:
-        if done or next_action is None:
-            next_q = 0.0
-        else:
-            next_q = float(self.q_table[next_state, next_action])
+        self.buffer.add(state, action, reward, next_state, done, next_mask)
 
-        td_target = reward + self.gamma * next_q
-        self.q_table[state, action] += self.alpha * (
-            td_target - self.q_table[state, action]
-        )
+    def learn(self) -> float | None:
+        if self.buffer.size < max(self.learn_start, self.batch_size):
+            return None
 
-    def set_epsilon(self, epsilon: float) -> None:
-        self.epsilon = epsilon
+        batch = self.buffer.sample(self.batch_size)
+        states = torch.from_numpy(batch["states"]).to(self.device)
+        actions = torch.from_numpy(batch["actions"]).to(self.device)
+        rewards = torch.from_numpy(batch["rewards"]).to(self.device)
+        next_states = torch.from_numpy(batch["next_states"]).to(self.device)
+        dones = torch.from_numpy(batch["dones"]).to(self.device)
+        next_masks = torch.from_numpy(batch["next_masks"]).to(self.device)
 
+        q_values = self.online(states)
+        q_sa = q_values.gather(1, actions.unsqueeze(1)).squeeze(1)
 
-def estimate_q_bounds(
-    env: Spin1BurnEnv,
-    polarizations: np.ndarray,
-    seed: int = 0,
-) -> tuple[float, float]:
-    rng = np.random.default_rng(seed)
-    qs: list[float] = []
-    for p in polarizations:
-        env.reset(p)
-        qs.append(env.initial_q)
-        for _ in range(env.config.max_burns):
-            action = int(rng.integers(0, env.config.n_actions))
-            _, _, done, info = env.step(action)
-            qs.append(info["q"])
-            if done:
-                break
-    margin = 0.05 * (max(qs) - min(qs) + 1e-9)
-    return min(qs) - margin, max(qs) + margin
+        with torch.no_grad():
+            next_q_online = self.online(next_states)
+            next_q_online = next_q_online.masked_fill(~next_masks, -1e9)
+            next_actions = torch.argmax(next_q_online, dim=1)
+            next_q_target = self.target(next_states)
+            next_q = next_q_target.gather(1, next_actions.unsqueeze(1)).squeeze(1)
+            no_valid = ~next_masks.any(dim=1)
+            next_q = torch.where(no_valid, torch.zeros_like(next_q), next_q)
+            td_target = rewards + self.gamma * (1.0 - dones) * next_q
+
+        loss = F.smooth_l1_loss(q_sa, td_target)
+        self.optimizer.zero_grad(set_to_none=True)
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.online.parameters(), MAX_GRAD_NORM)
+        self.optimizer.step()
+
+        self.learn_steps += 1
+        if self.learn_steps % self.target_update_interval == 0:
+            self.target.load_state_dict(self.online.state_dict())
+        return float(loss.item())
 
 
 def epsilon_schedule(
     episode: int,
     total_episodes: int,
-    eps_start: float = 1.0,
-    eps_end: float = 0.01,
+    eps_start: float = EPSILON_START,
+    eps_end: float = EPSILON_END,
 ) -> float:
     if total_episodes <= 1:
         return eps_end
@@ -643,75 +764,70 @@ def epsilon_schedule(
 
 def train(
     config: BurnConfig,
-    episodes: int = 5000,
+    episodes: int = EPISODES,
     polarizations: np.ndarray | None = None,
-    seed: int = 0,
-    eps_start: float = 1.0,
-    eps_end: float = 0.02,
-) -> tuple[SARSAAgent, Spin1BurnEnv, dict]:
+    seed: int = SEED,
+    eps_start: float = EPSILON_START,
+    eps_end: float = EPSILON_END,
+    lr: float = LEARNING_RATE,
+    device: torch.device | None = None,
+) -> tuple[DQNAgent, Spin1BurnEnv, dict]:
     if polarizations is None:
         polarizations = np.linspace(0.40, 0.50, 20)
 
     env = Spin1BurnEnv(config)
-    q_lo, q_hi = estimate_q_bounds(env, polarizations, seed=seed)
-    env.set_q_bounds(q_lo, q_hi)
-
-    agent = SARSAAgent(config.n_states, config.n_actions, seed=seed)
+    agent = DQNAgent(
+        env.observation_dim,
+        config.n_actions,
+        lr=lr,
+        seed=seed,
+        device=device,
+    )
     rng = np.random.default_rng(seed)
     history: list[float] = []
+    losses: list[float] = []
 
-    for ep in tqdm.tqdm(range(episodes), desc="Training SARSA agent"):
-        agent.set_epsilon(
-            epsilon_schedule(ep, episodes, eps_start=eps_start, eps_end=eps_end)
-        )
+    for ep in tqdm.tqdm(range(episodes), desc="Training DQN agent"):
+        agent.set_epsilon(epsilon_schedule(ep, episodes, eps_start=eps_start, eps_end=eps_end))
         p = float(rng.choice(polarizations))
         state = env.reset(p)
         ep_return = 0.0
-        action_mask = env.valid_action_mask()
-        if not action_mask.any():
-            history.append(ep_return)
-            continue
-        action = agent.select_action(state, explore=True, action_mask=action_mask)
 
         for _ in range(config.max_burns):
+            action_mask = env.valid_action_mask()
+            if not action_mask.any():
+                break
+            action = agent.select_action(state, explore=True, action_mask=action_mask)
             next_state, reward, done, _ = env.step(action)
+            next_mask = None if done else env.valid_action_mask()
+            agent.remember(state, action, reward, next_state, done, next_mask)
+            loss = agent.learn()
+            if loss is not None:
+                losses.append(loss)
             ep_return += reward
-
-            if done:
-                agent.update(state, action, reward, next_state, None, done)
-                break
-
-            next_mask = env.valid_action_mask()
-            if not next_mask.any():
-                agent.update(state, action, reward, next_state, None, True)
-                break
-
-            next_action = agent.select_action(
-                next_state, explore=True, action_mask=next_mask
-            )
-            agent.update(state, action, reward, next_state, next_action, done)
             state = next_state
-            action = next_action
+            if done:
+                break
 
         history.append(ep_return)
 
     stats = {
-        "q_lo": q_lo,
-        "q_hi": q_hi,
         "p_lo": float(np.min(polarizations)),
         "p_hi": float(np.max(polarizations)),
         "final_q_gain": env.current_q - env.initial_q,
         "episode_returns": np.asarray(history),
+        "losses": np.asarray(losses, dtype=float),
         "physics_model": "ssrf_realtime",
         "rf_mode": config.rf_mode,
+        "n_actions": config.n_actions,
+        "observation_dim": env.observation_dim,
     }
-
     return agent, env, stats
 
 
 def greedy_episode(
     env: Spin1BurnEnv,
-    agent: SARSAAgent,
+    agent: DQNAgent,
     polarization: float,
 ) -> dict:
     state = env.reset(polarization)
@@ -768,7 +884,32 @@ def plot_training_returns(returns: np.ndarray, output_path: Path) -> None:
     )
     ax.set_xlabel("episode")
     ax.set_ylabel("sum of Q rewards")
-    ax.set_title("SARSA: ssrf_realtime bin-wise ssRF burn policy")
+    ax.set_title("DQN: ssrf_realtime bin-wise ssRF burn policy")
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(output_path, dpi=150)
+    plt.close(fig)
+
+
+def plot_losses(losses: np.ndarray, output_path: Path) -> None:
+    if losses.size == 0:
+        return
+    window = min(200, max(1, len(losses) // 20))
+    smoothed = np.convolve(losses, np.ones(window) / window, mode="valid")
+    fig, ax = plt.subplots(figsize=(8, 4))
+    ax.plot(losses, alpha=0.25, linewidth=0.8, label="TD loss")
+    ax.plot(
+        np.arange(window - 1, window - 1 + len(smoothed)),
+        smoothed,
+        color="C1",
+        linewidth=2,
+        label=f"{window}-step moving avg",
+    )
+    ax.set_xlabel("gradient step")
+    ax.set_ylabel("smooth L1 loss")
+    ax.set_title("DQN temporal-difference loss")
     ax.legend()
     ax.grid(True, alpha=0.3)
     fig.tight_layout()
@@ -853,50 +994,77 @@ def plot_greedy_burns(result: dict, output_path: Path) -> None:
     plt.close(fig)
 
 
-def plot_q_table(q_table: np.ndarray, output_path: Path) -> None:
-    q_min, q_max = float(np.min(q_table)), float(np.max(q_table))
-    span = q_max - q_min
-    normalized = (q_table - q_min) / span if span > 0 else np.zeros_like(q_table)
-
-    fig, ax = plt.subplots(figsize=(8, 4))
-    im = ax.imshow(normalized, cmap="Spectral", aspect="auto", vmin=0, vmax=1)
-    cbar = fig.colorbar(im, ax=ax, label="normalized Q")
-    cbar.set_ticks([0, 0.5, 1])
-    cbar.set_ticklabels([f"{q_min:.3g}", f"{(q_min + q_max) / 2:.3g}", f"{q_max:.3g}"])
-    ax.set_xlabel("action")
-    ax.set_ylabel("state")
-    ax.set_title("SARSA-table (min–max normalized)")
-    fig.tight_layout()
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(output_path, dpi=150)
-    plt.close(fig)
-
-
 def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Double DQN for ssRF tensor (Q) enhancement"
+    )
+    parser.add_argument("--episodes", type=int, default=EPISODES)
+    parser.add_argument("--polarization", type=float, default=POLARIZATION)
+    parser.add_argument("--max-burns", type=int, default=MAX_BURNS)
+    parser.add_argument(
+        "--full-spectrum",
+        action="store_true",
+        help="Scan bins in order; action chooses gamma_rf only. Default is free-bin selection.",
+    )
+    parser.add_argument("--seed", type=int, default=SEED)
+    parser.add_argument("--lr", type=float, default=LEARNING_RATE)
+    parser.add_argument("--output-dir", type=Path, default=OUTPUT_DIR)
+    args = parser.parse_args()
+
     config = BurnConfig(
-        max_burns=MAX_BURNS,
-        enforce_full_spectrum=FREE_BIN_SELECTION,
+        max_burns=args.max_burns,
+        enforce_full_spectrum=args.full_spectrum,
     )
     polarizations = np.linspace(0.40, 0.50, 20)
+    out_dir = Path(args.output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
 
     print(
-        "Training SARSA agent with rivanna ssrf_realtime "
-        f"({config.rf_mode}, only_Q<0 bins={config.only_negative_initial_q}, "
+        "Training Double DQN with rivanna ssrf_realtime "
+        f"({config.rf_mode}, device={DEVICE}, n_actions={config.n_actions}, "
+        f"only_Q<0 bins={config.only_negative_initial_q}, "
         f"theta_Q_filter={config.q_filter_use_theta})..."
     )
     agent, env, stats = train(
         config,
-        episodes=EPISODES,
+        episodes=args.episodes,
         polarizations=polarizations,
-        seed=SEED,
+        seed=args.seed,
+        lr=float(args.lr),
+        device=DEVICE,
     )
 
-    np.save(OUTPUT_DIR / "sarsa_table.npy", agent.q_table)
-    plot_training_returns(stats["episode_returns"], OUTPUT_DIR / "training_returns.png")
+    ckpt_path = out_dir / "dqn_policy.pt"
+    torch.save(
+        {
+            "online": agent.online.state_dict(),
+            "target": agent.target.state_dict(),
+            "observation_dim": env.observation_dim,
+            "n_actions": config.n_actions,
+            "hidden_dim": HIDDEN_DIM,
+            "config": {
+                "num_bins": config.num_bins,
+                "max_burns": config.max_burns,
+                "n_gamma_bins": config.n_gamma_bins,
+                "enforce_full_spectrum": config.enforce_full_spectrum,
+                "rf_mode": config.rf_mode,
+            },
+            "stats": {
+                "p_lo": stats["p_lo"],
+                "p_hi": stats["p_hi"],
+                "n_actions": stats["n_actions"],
+                "observation_dim": stats["observation_dim"],
+            },
+        },
+        ckpt_path,
+    )
+    np.save(out_dir / "episode_returns.npy", stats["episode_returns"])
+    plot_training_returns(stats["episode_returns"], out_dir / "training_returns.png")
+    plot_losses(stats["losses"], out_dir / "td_loss.png")
 
-    eval_p = POLARIZATION
+    eval_p = float(args.polarization)
     greedy = greedy_episode(env, agent, eval_p)
-    plot_greedy_burns(greedy, OUTPUT_DIR / f"greedy_policy_P{eval_p:.2f}.png")
+    plot_greedy_burns(greedy, out_dir / f"greedy_policy_P{eval_p:.2f}.png")
 
     print(f"Greedy policy at P={eval_p * 100:.2f}%:")
     for row in greedy["trace"]:
@@ -914,9 +1082,7 @@ def main() -> None:
                 f"Q={row['q'] * 100:.5f}%"
             )
     print(f"  total Q gain: {(greedy['final_q'] - greedy['initial_q']) * 100:.5f}%")
-    print(f"Saved artifacts to {OUTPUT_DIR}")
-
-    plot_q_table(agent.q_table, OUTPUT_DIR / "sarsa_table.png")
+    print(f"Saved artifacts to {out_dir}")
 
 
 if __name__ == "__main__":

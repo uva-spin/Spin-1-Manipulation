@@ -12,8 +12,8 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from physics.lineshape.Lineshape import GenerateVectorLineshape
-from physics.ssrf_realtime_v2 import Spin1Params
-from physics.ssrf_realtime_v2.rate_equations_realtime import (
+from physics.ssrf_realtime import Spin1Params
+from physics.ssrf_realtime.rate_equations_realtime import (
     build_model_for_intensities,
     burn_preserves_branch_order,
     burn_preserves_ps_sign,
@@ -417,7 +417,7 @@ def main() -> None:
     )
 
     print(
-        f"Bin-wise optimization (ssrf_realtime_v2, one burn per bin) at "
+        f"Bin-wise optimization (ssrf_realtime, one burn per bin) at "
         f"P={polarization * 100:.2f}%:"
     )
     print(f"  start: Q={result['initial_q'] * 100:.5f}%")

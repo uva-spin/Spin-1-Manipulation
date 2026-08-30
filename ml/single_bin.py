@@ -15,7 +15,7 @@ SEED = 42
 ### Training parameters ###
 
 TRAIN_POLARIZATION_FRACTION = 0.8
-FEATURE_SET = "p0_ps"
+FEATURE_SET = "gamma_rf_n_steps_ps"
 TARGET_MODE = "iplus_iminus"
 NUM_EPOCHS = 1000
 BATCH_SIZE = 64
@@ -156,6 +156,112 @@ def resolve_bin_npz(data_dir: Path, bin_idx: int) -> Path:
     )
 
 
+def resolve_gamma_rf_from_npz(data: Any, path: Path) -> np.ndarray:
+    """Load per-row ``gamma_rf`` (0 for unmanipulated / non-ssRF rows)."""
+    if "gamma_rf" in data.files:
+        return np.asarray(data["gamma_rf"], dtype=np.float32)
+    if "applied_power" in data.files:
+        return np.asarray(data["applied_power"], dtype=np.float32)
+    if "source" in data.files:
+        source = np.asarray(data["source"], dtype=np.int32).reshape(-1)
+        n = int(source.size)
+        if n > 0 and np.all(source == 2):
+            return np.zeros(n, dtype=np.float32)
+    raise KeyError(
+        f"{path}: missing gamma_rf/applied_power; regenerate combined train NPZs "
+        "with gamma_rf or include only unmanipulated rows"
+    )
+
+
+def resolve_n_steps_from_npz(data: Any, path: Path) -> np.ndarray:
+    """Load per-row macro-step count (matches ``spectra.npz`` ``n_steps``).
+
+    Prefers explicit ``n_steps``; otherwise uses trajectory frame index ``step``.
+    Does **not** use ``burn_steps`` (configured combo length, not steps applied).
+    """
+    if "n_steps" in data.files:
+        return np.asarray(data["n_steps"], dtype=np.float32)
+    if "step" in data.files:
+        return np.asarray(data["step"], dtype=np.float32)
+    raise KeyError(
+        f"{path}: missing n_steps/step; regenerate combined train NPZs"
+    )
+
+
+def event_manipulation_features(
+    *,
+    source: int | None = None,
+    gamma_rf: float | None = None,
+    applied_power: float | None = None,
+    n_steps: float | None = None,
+) -> Tuple[float, float]:
+    """Return ``(gamma_rf, n_steps)`` for inference, aligned with train NPZs."""
+    if source is not None and int(source) != 0:
+        return 0.0, 0.0
+    gamma = gamma_rf if gamma_rf is not None else applied_power
+    if gamma is None:
+        gamma = 0.0
+    steps = 0.0 if n_steps is None else float(n_steps)
+    return float(gamma), steps
+
+
+def build_feature_row(
+    feature_names: List[str],
+    *,
+    gamma_rf: float = 0.0,
+    n_steps: float = 0.0,
+    ps: float = 0.0,
+    p0: float | None = None,
+) -> np.ndarray:
+    """Build one normalized feature vector for a single spectral bin."""
+    columns: Dict[str, float] = {
+        "gamma_rf": float(gamma_rf),
+        "n_steps": float(n_steps),
+        "ps": float(ps),
+        "ps_at_burn_bin": float(ps),
+    }
+    if p0 is not None:
+        columns["p0"] = float(p0)
+        columns["P"] = float(p0)
+    missing = [name for name in feature_names if name not in columns]
+    if missing:
+        raise KeyError(
+            f"Unsupported feature names {missing}; supported: {sorted(columns)}"
+        )
+    return np.array([columns[name] for name in feature_names], dtype=np.float32)
+
+
+def build_event_feature_matrix(
+    ps: np.ndarray,
+    feature_names: List[str],
+    *,
+    gamma_rf: float = 0.0,
+    n_steps: float = 0.0,
+    p0: float | None = None,
+) -> np.ndarray:
+    """Per-bin feature matrix for one lineshape event (global gamma_rf / n_steps)."""
+    ps_arr = np.asarray(ps, dtype=np.float32).reshape(-1)
+    n = int(ps_arr.size)
+    columns: Dict[str, np.ndarray] = {
+        "gamma_rf": np.full(n, float(gamma_rf), dtype=np.float32),
+        "n_steps": np.full(n, float(n_steps), dtype=np.float32),
+        "ps": ps_arr,
+        "ps_at_burn_bin": ps_arr,
+    }
+    if p0 is not None:
+        p0_val = np.float32(p0)
+        columns["p0"] = np.full(n, p0_val, dtype=np.float32)
+        columns["P"] = np.full(n, p0_val, dtype=np.float32)
+    missing = [name for name in feature_names if name not in columns]
+    if missing:
+        raise KeyError(
+            f"Unsupported feature names {missing}; supported: {sorted(columns)}"
+        )
+    return np.column_stack([columns[name] for name in feature_names]).astype(
+        np.float32, copy=False
+    )
+
+
 def load_bin_npz(path: Path, target_mode: str = TARGET_MODE) -> Dict[str, np.ndarray]:
     path = Path(path)
     mode = resolve_target_mode(target_mode)
@@ -169,9 +275,13 @@ def load_bin_npz(path: Path, target_mode: str = TARGET_MODE) -> Dict[str, np.nda
                 f"{path}: missing target field(s) {missing} for "
                 f"TARGET_MODE={mode!r}; regenerate train NPZs or switch mode"
             )
+        gamma_rf = resolve_gamma_rf_from_npz(data, path)
+        n_steps = resolve_n_steps_from_npz(data, path)
         out: Dict[str, np.ndarray] = {
             "ps": ps,
             "p0": p0,
+            "gamma_rf": gamma_rf,
+            "n_steps": n_steps,
             key0: np.asarray(data[key0], dtype=np.float32),
             key1: np.asarray(data[key1], dtype=np.float32),
             "amp": (
@@ -191,7 +301,7 @@ def load_bin_npz(path: Path, target_mode: str = TARGET_MODE) -> Dict[str, np.nda
             out["center_bin"] = np.asarray(data["center_bin"], dtype=np.float32)
         elif "burn_bin" in data.files:
             out["center_bin"] = np.asarray(data["burn_bin"], dtype=np.float32)
-        if "step" in data.files:
+        if "step" in data.files and "step" not in out:
             out["step"] = np.asarray(data["step"], dtype=np.float32)
         if "meta_json" in data.files:
             out["meta_json"] = np.asarray(data["meta_json"])
@@ -207,10 +317,13 @@ def load_bin_npz(path: Path, target_mode: str = TARGET_MODE) -> Dict[str, np.nda
 
 
 def build_features(arrays: Dict[str, np.ndarray]) -> Tuple[np.ndarray, List[str], int]:
-    p0 = arrays["p0"].reshape(-1, 1).astype(np.float32, copy=False)
+    gamma_rf = arrays["gamma_rf"].reshape(-1, 1).astype(np.float32, copy=False)
+    n_steps = arrays["n_steps"].reshape(-1, 1).astype(np.float32, copy=False)
     ps = arrays["ps"].reshape(-1, 1).astype(np.float32, copy=False)
-    features = np.concatenate([p0, ps], axis=1).astype(np.float32, copy=False)
-    return features, ["p0", "ps"], 1
+    features = np.concatenate([gamma_rf, n_steps, ps], axis=1).astype(
+        np.float32, copy=False
+    )
+    return features, ["gamma_rf", "n_steps", "ps"], 2
 
 
 def clip_features_z(features: np.ndarray, clip_z: float) -> np.ndarray:
@@ -586,16 +699,20 @@ def _validate_saved_stats(
     if x_train is None:
         return
     x_mean = stats["x_mean"].reshape(-1)
-    train_p0 = np.asarray(x_train[:, 0].numpy(), dtype=np.float64)
-    if train_p0.size == 0:
+    feature_names = list(arrays.get("feature_names", []))
+    if x_train.shape[0] == 0 or x_mean.numel() == 0:
         return
-    expected_p0 = float(np.mean(train_p0))
-    saved_p0 = float(x_mean[0].item())
-    if abs(saved_p0 - expected_p0) > 1e-4:
-        raise RuntimeError(
-            f"bin {bin_idx}: X_mean[p0]={saved_p0:.6f} != train p0 mean "
-            f"{expected_p0:.6f}; refusing to save a corrupt checkpoint"
-        )
+    n_check = min(int(x_mean.numel()), int(x_train.shape[1]))
+    for col in range(n_check):
+        train_col = np.asarray(x_train[:, col].numpy(), dtype=np.float64)
+        expected = float(np.mean(train_col))
+        saved = float(x_mean[col].item())
+        if abs(saved - expected) > 1e-4:
+            name = feature_names[col] if col < len(feature_names) else f"col{col}"
+            raise RuntimeError(
+                f"bin {bin_idx}: X_mean[{name}]={saved:.6f} != train mean "
+                f"{expected:.6f}; refusing to save a corrupt checkpoint"
+            )
 
 
 def save_outputs(

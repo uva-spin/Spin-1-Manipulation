@@ -27,8 +27,8 @@ REPO_ROOT = SCRIPT_DIR.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from physics.burn_lookup_realtime import BurnTrajectoryConfig, initial_lineshape  # noqa: E402
-from physics.ssrf_realtime.rate_equations_realtime import (  # noqa: E402
+from physics.burn_lookup_realtime import BurnTrajectoryConfig, initial_lineshape
+from physics.ssrf_realtime.rate_equations_realtime import (
     burn_preserves_ps_sign,
     solve_rate_equations,
 )

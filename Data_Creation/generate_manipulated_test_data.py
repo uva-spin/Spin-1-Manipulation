@@ -16,27 +16,27 @@ REPO_ROOT = SCRIPT_DIR.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from physics.lineshape.Lineshape import GenerateVectorLineshape  # noqa: E402
-from physics.lineshape.rate_eqs_test.afp_bin_traj import (  # noqa: E402
+from physics.lineshape.Lineshape import GenerateVectorLineshape
+from physics.lineshape.rate_eqs_test.afp_bin_traj import (
     afp_touched_bins,
     afp_window_indices,
     commit_touched_bins_only,
     restore_touched_intensity_area,
 )
-from physics.lineshape.rate_eqs_test.ssrf_afp import (  # noqa: E402
+from physics.lineshape.rate_eqs_test.ssrf_afp import (
     commit_ssrf_bins_only,
     mirror_bin_idx,
     resolve_burn_bin,
     ssrf_touched_bins,
 )
-from physics.lineshape.rate_eqs_test.ssrf_bin_traj import (  # noqa: E402
+from physics.lineshape.rate_eqs_test.ssrf_bin_traj import (
     HALF_WIDTH,
     SIGMA_BINS,
     VOIGT_GAMMA_BINS,
     freeze_rf_profile,
     make_voigt_rf_profile,
 )
-from physics.ssrf_realtime.model import Spin1Model, Spin1Params  # noqa: E402
+from physics.ssrf_realtime.model import Spin1Model, Spin1Params
 
 ManipulationMode = Literal["ssrf", "afp", "both"]
 
@@ -117,7 +117,6 @@ def apply_afp_to_lineshape(
         r_min=F_MIN,
         r_max=F_MAX,
         p0=float(polarization),
-        initial_polarization=float(polarization),
         q0=0.0,
         p_dnp_sat=float(polarization),
         dnp_enabled=False,
@@ -130,7 +129,7 @@ def apply_afp_to_lineshape(
         afp_subset_indices=subset,
         gamma_rf=0.0,
     )
-    model = Spin1Model(params, initial_polarization=float(polarization))
+    model = Spin1Model(params)
     model.load_from_physical_intensities(iplus0, iminus0)
     model.params.afp_enabled = True
     model.params.afp_preserve_intensity_area = True
@@ -271,7 +270,6 @@ def _run_ssrf_burn(
         r_min=F_MIN,
         r_max=F_MAX,
         p0=float(polarization),
-        initial_polarization=float(polarization),
         q0=0.0,
         p_dnp_sat=float(polarization),
         dnp_enabled=False,

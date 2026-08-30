@@ -1,5 +1,5 @@
 """
-Bin-wise Q optimization over spectral bins with ssrf_realtime_v2.
+Bin-wise Q optimization over spectral bins with ssrf_realtime.
 
 Burn trials rollback integration steps when I± or Ps would cross zero on
 committed bins. Physical-Voigt burns commit the full RF support (center bin,
@@ -25,7 +25,7 @@ if str(REPO_ROOT) not in sys.path:
 if str(DULYA_V2) not in sys.path:
     sys.path.insert(0, str(DULYA_V2))
 
-from common import (  # noqa: E402
+from common import (
     DIFFUSION_SCALE,
     DT,
     NUM_BINS,
@@ -38,7 +38,7 @@ from common import (  # noqa: E402
 RF_GAUSSIAN_FWHM_R = 0.03
 RF_LORENTZIAN_FWHM_R = 0.015
 
-from model_bridge import (  # noqa: E402
+from model_bridge import (
     build_spin1_model,
     burn_commit_touched_bins,
     commit_touched_bins_only,
@@ -46,10 +46,10 @@ from model_bridge import (  # noqa: E402
     euler_n_sub,
     level_pq,
 )
-from physics.lineshape.Lineshape import GenerateVectorLineshape  # noqa: E402
-from physics.ssrf_realtime_v2.conversions import physical_intensities_to_packet_n  # noqa: E402
-from physics.ssrf_realtime_v2.model import Spin1Model  # noqa: E402
-from physics.ssrf_realtime_v2.rate_equations_realtime import (  # noqa: E402
+from physics.lineshape.Lineshape import GenerateVectorLineshape
+from physics.ssrf_realtime.conversions import physical_intensities_to_packet_n
+from physics.ssrf_realtime.model import Spin1Model
+from physics.ssrf_realtime.rate_equations_realtime import (
     _value_crosses_zero,
     burn_preserves_ps_sign,
 )
@@ -254,7 +254,7 @@ def gamma_search_values(
 
 
 def build_model(config: BurnConfig, polarization: float) -> Spin1Model:
-    """Generic vector lineshape loaded into ssrf_realtime_v2 with shared recovery."""
+    """Generic vector lineshape loaded into ssrf_realtime with shared recovery."""
     P = float(polarization)
     _, iplus, iminus = GenerateVectorLineshape(P, config.f)
     model = build_spin1_model(
@@ -675,7 +675,7 @@ def optimize_binwise_incremental(
     return {
         "polarization": polarization,
         "rf_mode": config.rf_mode,
-        "physics_model": "ssrf_realtime_v2",
+        "physics_model": "ssrf_realtime",
         "lineshape_model": "GenerateVectorLineshape",
         "diffusion_scale": config.diffusion_scale,
         "only_negative_initial_q": config.only_negative_initial_q,
@@ -822,7 +822,7 @@ def main() -> None:
     n_burns = sum(1 for row in result["trace"][1:] if row.get("gamma_rf", 0.0) > 0.0)
 
     print(
-        f"Bin-wise Q opt (ssrf_realtime_v2 + GenerateVectorLineshape, "
+        f"Bin-wise Q opt (ssrf_realtime + GenerateVectorLineshape, "
         f"rf_mode={config.rf_mode}, diffusion_scale={config.diffusion_scale}, "
         f"voigt_g/l_fwhm={config.gaussian_fwhm_R}/{config.lorentzian_fwhm_R}, "
         f"only_Q<0 bins={config.only_negative_initial_q}) "

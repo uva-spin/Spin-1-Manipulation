@@ -1,18 +1,39 @@
 """
-Sample random physical-Voigt ssRF burns for DAE lineshape denoising.
+Generate full-spectrum manipulated lineshapes for DAE training.
 
-Each sample:
-  - starts from a Dulya equilibrium lineshape at random vector polarization
-  - applies one Voigt burn only at a burn-window bin where initial Q < 0
-  - wider-than-default Voigt RF profile
-  - fixed RF power gamma_rf=10.0, random burn length in [10, 100] macro-steps
-  - dt=0.0015
+For each polarization on a grid:
+  - find burn-window bins where equilibrium Q < 0 (noiseless initial lineshape)
+  - ssRF: burn only at those Q < 0 centers; for each center, extract spectra at
+    burn lengths 0 .. max_burn_steps from one trajectory (noise added after)
+  - AFP: flip at each Q < 0 bin with an AFP window; then relax for
+    0 .. max_relax_steps, emitting one full-spectrum event per selected
+    relax frame (n_steps = relax steps completed after the flip)
 
-Only the final full spectra are saved (I+ / I-), with no burn metadata.
+ssRF and AFP are never combined in the same event. Toggle modes with
+``--ssrf`` / ``--no-ssrf`` and ``--afp`` / ``--no-afp``; when both are on,
+events are emitted separately.
+
+Saved NPZ fields:
+  spectra       (N, 2, num_bins)  channel0=I+, channel1=I-
+                                  one row per ssRF burn step / AFP relax step
+  p0            (N,)              initial vector polarization
+  P_total       (N,)              integrated lineshape P after this step
+                                  (CC_total * sum(I++I-) with p0 post-correction)
+  Q_total       (N,)              integrated lineshape Q after this step
+                                  (CC_total * sum(I+-I-) with p0 post-correction)
+  applied_power (N,)              gamma_rf for ssRF; 0 for AFP
+  n_steps       (N,)              ssRF: burn macro-steps so far;
+                                  AFP: relax steps completed after flip
+                                  (0 = immediately post-AFP)
+  center_bin    (N,)              RF / AFP center bin
+  source        (N,)              0=ssRF, 1=AFP
 
 Examples (from repo root):
   python Data_Creation/create_dae_voigt_burn_spectra.py --quick
-  python Data_Creation/create_dae_voigt_burn_spectra.py --num-samples 1000
+  python Data_Creation/create_dae_voigt_burn_spectra.py --ssrf --afp
+  python Data_Creation/create_dae_voigt_burn_spectra.py --ssrf --no-afp
+  python Data_Creation/create_dae_voigt_burn_spectra.py --afp --max-relax-steps 100
+  python Data_Creation/create_dae_voigt_burn_spectra.py --ssrf --max-burn-steps 150
 """
 
 from __future__ import annotations
@@ -24,39 +45,54 @@ from pathlib import Path
 import numpy as np
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-DULYA_V5 = SCRIPT_DIR / "dulya_fit_v5"
+DULYA = SCRIPT_DIR / "rivanna"
 
-if str(DULYA_V5) not in sys.path:
-    sys.path.insert(0, str(DULYA_V5))
+if str(DULYA) not in sys.path:
+    sys.path.insert(0, str(DULYA))
 
-from bin_setup import get_shape_params  # noqa: E402
-from burn_selection import equilibrium_q_profile  # noqa: E402
-from common import (  # noqa: E402
+from afp_bin_traj import run_one_polarization as run_afp_one
+from bin_setup import get_shape_params, polarization_grid
+from burn_selection import equilibrium_q_profile
+from common import (
     BURN_BIN_CHOICES,
     BURN_R_MAX,
     BURN_R_MIN,
+    FREQUENCY,
     NUM_BINS,
     RF_GAUSSIAN_FWHM_R,
     RF_LORENTZIAN_FWHM_R,
     RF_MODE_PHYSICAL_VOIGT,
+    SOURCE_AFP,
+    SOURCE_SSRF,
 )
-from ssrf_bin_traj import run_one_polarization  # noqa: E402
+from pq_calibration import (
+    integrated_pq_from_bins,
+    load_pq_calibration,
+    post_correct_ratio,
+)
+from ssrf_bin_traj import run_one_polarization as run_ssrf_one
 
 DEFAULT_OUTPUT = SCRIPT_DIR / "dae_voigt_burn_spectra" / "spectra.npz"
+DEFAULT_PLOT_DIR = SCRIPT_DIR / "dae_voigt_burn_spectra" / "plots"
 
 P_MIN = 0.2
 P_MAX = 0.6
+P_STEP = 0.05
 GAMMA_RF = 10.0
-MIN_BURN_STEPS = 10
-MAX_BURN_STEPS = 100
-DT = 0.0015
-# Wider Voigt than the dulya_fit_v5 defaults (0.030 / 0.015).
-GAUSSIAN_FWHM_R = 3*RF_GAUSSIAN_FWHM_R  # 0.090
-LORENTZIAN_FWHM_R = 3*RF_LORENTZIAN_FWHM_R  # 0.045
+MIN_BURN_STEPS = 0
+MAX_BURN_STEPS = 800
+BURN_STEPS_STEP = 1
+DT = 0.0055
+
+GAUSSIAN_FWHM_R = 3 * RF_GAUSSIAN_FWHM_R  # 0.090
+LORENTZIAN_FWHM_R = 3 * RF_LORENTZIAN_FWHM_R  # 0.045
+AFP_WINDOW = 8
+MIN_RELAX_STEPS = 0
+MAX_RELAX_STEPS = 10000
+RELAX_STEPS_STEP = 1
 STORE_DTYPE = np.float32
-DEFAULT_NUM_SAMPLES = 1000
 DEFAULT_SEED = 42
-MAX_ATTEMPTS_FACTOR = 20
+NOISE_LEVEL = 1e-4
 
 
 def _burn_window_bins() -> np.ndarray:
@@ -74,104 +110,753 @@ def q_negative_bins_for_p0(
     *,
     shape_params: dict[str, float],
 ) -> np.ndarray:
-    """Burn-window bin indices where equilibrium Q = I+ - I- is negative."""
+    """Burn-window bin indices where equilibrium Q = I+ - I- is negative.
+
+    Uses the noiseless Dulya equilibrium lineshape so center selection is
+    independent of observation noise added later to saved spectra.
+    """
     q = equilibrium_q_profile(float(p0), shape_params=shape_params)
     mask = q[burn_window] < 0.0
     return burn_window[mask]
 
 
-def sample_one_spectrum(
-    rng: np.random.Generator,
+def burn_steps_values(
+    min_steps: int,
+    max_steps: int,
+    step: int,
+) -> np.ndarray:
+    """Inclusive integer step grid from ``min_steps`` to ``max_steps``."""
+    n_min = int(min_steps)
+    n_max = int(max_steps)
+    n_step = int(step)
+    if n_step < 1:
+        raise ValueError(f"step stride must be >= 1, got {n_step}")
+    if n_max < n_min:
+        raise ValueError(f"max_steps ({n_max}) must be >= min_steps ({n_min})")
+    return np.arange(n_min, n_max + 1, n_step, dtype=np.int32)
+
+
+def _spectrum_totals(
+    iplus: np.ndarray,
+    iminus: np.ndarray,
+    p0: float,
+    *,
+    calibration: dict,
+) -> tuple[float, float]:
+    """Total integrated lineshape P and Q after a manipulation step.
+
+    Uses the full-spectrum convention:
+      P = CC_total * sum_b (I+_b + I-_b)
+      Q = CC_total * sum_b (I+_b - I-_b)
+    then applies the equilibrium p0 post-correction ratio so the scale matches
+    vector / tensor polarization (same convention as mean of CC_bin-calibrated
+    per-bin spectra).
+    """
+    ip = np.asarray(iplus, dtype=np.float64).reshape(-1)
+    im = np.asarray(iminus, dtype=np.float64).reshape(-1)
+    ps = ip + im
+    q = ip - im
+    p_int, q_int = integrated_pq_from_bins(ps, q, calibration=calibration)
+    ratio = float(post_correct_ratio(np.asarray([float(p0)]), calibration)[0])
+    return float(p_int * ratio), float(q_int * ratio)
+
+
+def _append_event(
+    rows: dict[str, list],
+    *,
+    iplus: np.ndarray,
+    iminus: np.ndarray,
+    p0: float,
+    p_total: float,
+    q_total: float,
+    applied_power: float,
+    n_steps: int,
+    center_bin: int,
+    source: int,
+) -> None:
+    rows["spectra"].append(
+        np.stack(
+            [
+                np.asarray(iplus, dtype=STORE_DTYPE).reshape(-1),
+                np.asarray(iminus, dtype=STORE_DTYPE).reshape(-1),
+            ],
+            axis=0,
+        )
+    )
+    rows["p0"].append(float(p0))
+    rows["P_total"].append(float(p_total))
+    rows["Q_total"].append(float(q_total))
+    rows["applied_power"].append(float(applied_power))
+    rows["n_steps"].append(int(n_steps))
+    rows["center_bin"].append(int(center_bin))
+    rows["source"].append(int(source))
+
+
+def _empty_rows() -> dict[str, list]:
+    return {
+        "spectra": [],
+        "p0": [],
+        "P_total": [],
+        "Q_total": [],
+        "applied_power": [],
+        "n_steps": [],
+        "center_bin": [],
+        "source": [],
+    }
+
+
+def generate_ssrf_events(
+    p_values: np.ndarray,
     burn_window: np.ndarray,
+    steps_grid: np.ndarray,
     *,
     shape_params: dict[str, float],
-) -> np.ndarray | None:
-    """Return final spectrum as float32 array shaped (2, num_bins), or None if skipped."""
-    p0 = float(rng.uniform(P_MIN, P_MAX))
-    qneg_bins = q_negative_bins_for_p0(p0, burn_window, shape_params=shape_params)
-    if qneg_bins.size == 0:
-        return None
+    calibration: dict,
+    gamma_rf: float,
+    max_centers_per_p: int | None = None,
+) -> dict[str, list]:
+    """ssRF Voigt burns; save the full I+/I- spectrum at every requested burn step.
 
-    bin_idx = int(rng.choice(qneg_bins))
-    n_steps = int(rng.integers(MIN_BURN_STEPS, MAX_BURN_STEPS + 1))
+    Centers are burn-window bins with equilibrium (pre-noise) Q < 0. Runs one
+    trajectory of length ``max(steps_grid)`` per (P, center) with
+    ``capture_spectrum=True``, then writes a separate event for each macro-step
+    index in ``steps_grid`` (index 0 = pre-burn equilibrium). Observation noise
+    is added only when saving spectra, after P/Q totals are computed.
+    """
+    rows = _empty_rows()
+    if steps_grid.size == 0:
+        return rows
+    max_burn = int(np.max(steps_grid))
+    step_set = {int(s) for s in steps_grid}
 
-    traj = run_one_polarization(
-        bin_idx,
-        p0,
-        dt=float(DT),
-        gamma_rf=float(GAMMA_RF),
-        n_steps=n_steps,
-        rf_mode=RF_MODE_PHYSICAL_VOIGT,
-        gaussian_fwhm_R=float(GAUSSIAN_FWHM_R),
-        lorentzian_fwhm_R=float(LORENTZIAN_FWHM_R),
-        shape_params=shape_params,
-        capture_spectrum=True,
-    )
-    if bool(traj.get("skipped", False)):
-        return None
-
-    iplus = np.asarray(traj["ip_spectrum"], dtype=STORE_DTYPE).reshape(-1)
-    iminus = np.asarray(traj["im_spectrum"], dtype=STORE_DTYPE).reshape(-1)
-    if iplus.size != NUM_BINS or iminus.size != NUM_BINS:
-        raise ValueError(
-            f"Unexpected spectrum length: I+={iplus.size}, I-={iminus.size}, "
-            f"expected {NUM_BINS}"
+    for ip, p0 in enumerate(np.asarray(p_values, dtype=float)):
+        centers = q_negative_bins_for_p0(
+            float(p0), burn_window, shape_params=shape_params
         )
-    return np.stack([iplus, iminus], axis=0)
+        if max_centers_per_p is not None and centers.size > int(max_centers_per_p):
+            centers = centers[: int(max_centers_per_p)]
+        print(
+            f"  ssRF P={float(p0):.3f} ({ip + 1}/{len(p_values)}): "
+            f"{centers.size} Q<0 centers × {steps_grid.size} step spectra",
+            flush=True,
+        )
+        for bin_idx in centers:
+            traj = run_ssrf_one(
+                int(bin_idx),
+                float(p0),
+                dt=float(DT),
+                gamma_rf=float(gamma_rf),
+                n_steps=max_burn,
+                rf_mode=RF_MODE_PHYSICAL_VOIGT,
+                gaussian_fwhm_R=float(GAUSSIAN_FWHM_R),
+                lorentzian_fwhm_R=float(LORENTZIAN_FWHM_R),
+                shape_params=shape_params,
+                capture_spectrum=True,
+            )
+            if bool(traj.get("skipped", False)):
+                continue
+
+            iplus_full = traj.get("iplus_full")
+            iminus_full = traj.get("iminus_full")
+            if iplus_full is None or iminus_full is None:
+                raise RuntimeError(
+                    f"ssRF traj missing per-step spectra for bin={bin_idx}, P={p0}"
+                )
+            iplus_full = np.asarray(iplus_full, dtype=float)
+            iminus_full = np.asarray(iminus_full, dtype=float)
+            if iplus_full.ndim != 2 or iminus_full.ndim != 2:
+                raise ValueError(
+                    f"Expected full-spectrum traj (t, bins) for bin {bin_idx}, P={p0}; "
+                    f"got I+={iplus_full.shape}, I-={iminus_full.shape}"
+                )
+            if int(iplus_full.shape[0]) < max_burn + 1:
+                raise RuntimeError(
+                    f"ssRF traj too short for bin={bin_idx}, P={p0}: "
+                    f"got {iplus_full.shape[0]} frames, need {max_burn + 1}"
+                )
+
+            for burn_steps in sorted(step_set):
+                k = int(burn_steps)
+                ip_spec = np.asarray(iplus_full[k], dtype=float).copy()
+                im_spec = np.asarray(iminus_full[k], dtype=float).copy()
+                if ip_spec.size != NUM_BINS or im_spec.size != NUM_BINS:
+                    raise ValueError(
+                        f"Unexpected spectrum length at step {burn_steps}: "
+                        f"I+={ip_spec.size}, I-={im_spec.size}, expected {NUM_BINS}"
+                    )
+                p_total, q_total = _spectrum_totals(
+                    ip_spec, im_spec, float(p0), calibration=calibration
+                )
+                ip_spec += np.random.normal(0, NOISE_LEVEL, ip_spec.shape)
+                im_spec += np.random.normal(0, NOISE_LEVEL, im_spec.shape)
+                _append_event(
+                    rows,
+                    iplus=ip_spec,
+                    iminus=im_spec,
+                    p0=float(p0),
+                    p_total=p_total,
+                    q_total=q_total,
+                    applied_power=float(gamma_rf),
+                    n_steps=int(burn_steps),
+                    center_bin=int(bin_idx),
+                    source=int(SOURCE_SSRF),
+                )
+    return rows
+
+
+def generate_afp_events(
+    p_values: np.ndarray,
+    burn_window: np.ndarray,
+    relax_steps_grid: np.ndarray,
+    *,
+    shape_params: dict[str, float],
+    calibration: dict,
+    afp_window: int,
+    max_centers_per_p: int | None = None,
+) -> dict[str, list]:
+    """AFP flip + relaxation; save the full I+/I- spectrum at each relax step.
+
+    Runs one trajectory of length ``max(relax_steps_grid)`` per (P, center) with
+    ``capture_spectrum=True``. Frame 0 is immediately post-flip; later frames are
+    after each relax macro-step. Emits a separate event for each index in
+    ``relax_steps_grid`` with ``n_steps`` equal to that index.
+    """
+    rows = _empty_rows()
+    if relax_steps_grid.size == 0:
+        return rows
+    max_relax = int(np.max(relax_steps_grid))
+    step_set = {int(s) for s in relax_steps_grid}
+
+    for ip, p0 in enumerate(np.asarray(p_values, dtype=float)):
+        centers = q_negative_bins_for_p0(
+            float(p0), burn_window, shape_params=shape_params
+        )
+        if max_centers_per_p is not None and centers.size > int(max_centers_per_p):
+            centers = centers[: int(max_centers_per_p)]
+        print(
+            f"  AFP P={float(p0):.3f} ({ip + 1}/{len(p_values)}): "
+            f"{centers.size} Q<0 centers × {relax_steps_grid.size} relax spectra "
+            f"(window={int(afp_window)}, n_relax={max_relax})",
+            flush=True,
+        )
+        for bin_idx in centers:
+            traj = run_afp_one(
+                int(bin_idx),
+                float(p0),
+                dt=float(DT),
+                n_relax=max_relax,
+                afp_window=int(afp_window),
+                shape_params=shape_params,
+                capture_spectrum=True,
+            )
+            if bool(traj.get("skipped", False)):
+                continue
+
+            iplus_full = traj.get("iplus_full")
+            iminus_full = traj.get("iminus_full")
+            if iplus_full is None or iminus_full is None:
+                raise RuntimeError(
+                    f"AFP traj missing per-step spectra for bin={bin_idx}, P={p0}"
+                )
+            iplus_full = np.asarray(iplus_full, dtype=float)
+            iminus_full = np.asarray(iminus_full, dtype=float)
+            if iplus_full.ndim != 2 or iminus_full.ndim != 2:
+                raise ValueError(
+                    f"Expected full-spectrum AFP traj (t, bins) for bin {bin_idx}, "
+                    f"P={p0}; got I+={iplus_full.shape}, I-={iminus_full.shape}"
+                )
+            if int(iplus_full.shape[0]) < max_relax + 1:
+                raise RuntimeError(
+                    f"AFP traj too short for bin={bin_idx}, P={p0}: "
+                    f"got {iplus_full.shape[0]} frames, need {max_relax + 1}"
+                )
+
+            for relax_steps in sorted(step_set):
+                k = int(relax_steps)
+                ip_spec = np.asarray(iplus_full[k], dtype=float).copy()
+                im_spec = np.asarray(iminus_full[k], dtype=float).copy()
+                if ip_spec.size != NUM_BINS or im_spec.size != NUM_BINS:
+                    raise ValueError(
+                        f"Unexpected AFP spectrum length at relax step {relax_steps}: "
+                        f"I+={ip_spec.size}, I-={im_spec.size}, expected {NUM_BINS}"
+                    )
+                p_total, q_total = _spectrum_totals(
+                    ip_spec, im_spec, float(p0), calibration=calibration
+                )
+                ip_spec += np.random.normal(0, NOISE_LEVEL, ip_spec.shape)
+                im_spec += np.random.normal(0, NOISE_LEVEL, im_spec.shape)
+                _append_event(
+                    rows,
+                    iplus=ip_spec,
+                    iminus=im_spec,
+                    p0=float(p0),
+                    p_total=p_total,
+                    q_total=q_total,
+                    applied_power=0.0,
+                    n_steps=int(relax_steps),
+                    center_bin=int(bin_idx),
+                    source=int(SOURCE_AFP),
+                )
+    return rows
+
+
+def _merge_rows(*row_groups: dict[str, list]) -> dict[str, np.ndarray]:
+    merged = _empty_rows()
+    for rows in row_groups:
+        for key in merged:
+            merged[key].extend(rows[key])
+
+    n = len(merged["spectra"])
+    if n == 0:
+        return {
+            "spectra": np.empty((0, 2, NUM_BINS), dtype=STORE_DTYPE),
+            "p0": np.empty(0, dtype=STORE_DTYPE),
+            "P_total": np.empty(0, dtype=STORE_DTYPE),
+            "Q_total": np.empty(0, dtype=STORE_DTYPE),
+            "applied_power": np.empty(0, dtype=STORE_DTYPE),
+            "n_steps": np.empty(0, dtype=np.int32),
+            "center_bin": np.empty(0, dtype=np.int32),
+            "source": np.empty(0, dtype=np.uint8),
+        }
+
+    return {
+        "spectra": np.stack(merged["spectra"], axis=0).astype(STORE_DTYPE, copy=False),
+        "p0": np.asarray(merged["p0"], dtype=STORE_DTYPE),
+        "P_total": np.asarray(merged["P_total"], dtype=STORE_DTYPE),
+        "Q_total": np.asarray(merged["Q_total"], dtype=STORE_DTYPE),
+        "applied_power": np.asarray(merged["applied_power"], dtype=STORE_DTYPE),
+        "n_steps": np.asarray(merged["n_steps"], dtype=np.int32),
+        "center_bin": np.asarray(merged["center_bin"], dtype=np.int32),
+        "source": np.asarray(merged["source"], dtype=np.uint8),
+    }
+
+
+def _event_mask(
+    data: dict[str, np.ndarray],
+    *,
+    source: int | None = None,
+    p0: float | None = None,
+    center_bin: int | None = None,
+    n_steps: int | None = None,
+) -> np.ndarray:
+    n = int(data["spectra"].shape[0])
+    mask = np.ones(n, dtype=bool)
+    if source is not None:
+        mask &= data["source"] == int(source)
+    if p0 is not None:
+        mask &= np.isclose(data["p0"], float(p0), atol=1e-5, rtol=0.0)
+    if center_bin is not None:
+        mask &= data["center_bin"] == int(center_bin)
+    if n_steps is not None:
+        mask &= data["n_steps"] == int(n_steps)
+    return mask
+
+
+def _pick_ssrf_example_keys(
+    data: dict[str, np.ndarray],
+    *,
+    max_examples: int = 2,
+) -> list[tuple[float, int]]:
+    """Select a few (p0, center_bin) pairs with the most ssRF step coverage."""
+    mask = data["source"] == SOURCE_SSRF
+    if not np.any(mask):
+        return []
+    p0s = data["p0"][mask]
+    bins = data["center_bin"][mask]
+    steps = data["n_steps"][mask]
+    pairs: dict[tuple[float, int], set[int]] = {}
+    for p0, b, s in zip(p0s.tolist(), bins.tolist(), steps.tolist()):
+        key = (round(float(p0), 5), int(b))
+        pairs.setdefault(key, set()).add(int(s))
+    ranked = sorted(pairs.items(), key=lambda kv: (-len(kv[1]), kv[0][0], kv[0][1]))
+    return [k for k, _ in ranked[: max(0, int(max_examples))]]
+
+
+def _pick_afp_example_keys(
+    data: dict[str, np.ndarray],
+    *,
+    max_examples: int = 2,
+) -> list[tuple[float, int]]:
+    """Select a few (p0, center_bin) pairs with the most AFP relax-step coverage."""
+    mask = data["source"] == SOURCE_AFP
+    if not np.any(mask):
+        return []
+    p0s = data["p0"][mask]
+    bins = data["center_bin"][mask]
+    steps = data["n_steps"][mask]
+    pairs: dict[tuple[float, int], set[int]] = {}
+    for p0, b, s in zip(p0s.tolist(), bins.tolist(), steps.tolist()):
+        key = (round(float(p0), 5), int(b))
+        pairs.setdefault(key, set()).add(int(s))
+    ranked = sorted(pairs.items(), key=lambda kv: (-len(kv[1]), kv[0][0], kv[0][1]))
+    return [k for k, _ in ranked[: max(0, int(max_examples))]]
+
+
+def save_example_plots(
+    data: dict[str, np.ndarray],
+    plot_dir: Path,
+    *,
+    frequency: np.ndarray | None = None,
+    max_ssrf_examples: int = 2,
+    max_afp_examples: int = 2,
+) -> list[Path]:
+    """Write a few diagnostic PNGs for ssRF burn and AFP relax evolution."""
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    plot_dir = Path(plot_dir)
+    plot_dir.mkdir(parents=True, exist_ok=True)
+    f = np.asarray(
+        FREQUENCY if frequency is None else frequency,
+        dtype=float,
+    ).reshape(-1)
+    saved: list[Path] = []
+
+    for p0, center in _pick_ssrf_example_keys(data, max_examples=max_ssrf_examples):
+        mask = _event_mask(data, source=SOURCE_SSRF, p0=p0, center_bin=center)
+        idx = np.flatnonzero(mask)
+        if idx.size == 0:
+            continue
+        order = np.argsort(data["n_steps"][idx])
+        idx = idx[order]
+        steps = data["n_steps"][idx]
+        spectra = data["spectra"][idx]
+        p_tot = data["P_total"][idx]
+        q_tot = data["Q_total"][idx]
+        power = float(data["applied_power"][idx[0]])
+
+        fig, axes = plt.subplots(2, 1, figsize=(10.5, 7.5), sharex=True)
+        ax_ps, ax_q = axes
+        n_show = min(6, int(idx.size))
+        show_i = np.unique(
+            np.round(np.linspace(0, int(idx.size) - 1, n_show)).astype(int)
+        )
+        cmap = plt.cm.viridis(np.linspace(0.15, 0.9, len(show_i)))
+        for color, j in zip(cmap, show_i):
+            ip = spectra[j, 0]
+            im = spectra[j, 1]
+            ps = ip + im
+            q = ip - im
+            step = int(steps[j])
+            ax_ps.plot(f, ps, color=color, lw=1.4, label=f"n={step}")
+            ax_q.plot(f, q, color=color, lw=1.2, label=f"n={step}")
+        for ax in axes:
+            ax.axvline(float(f[center]), color="0.35", ls=":", lw=1.0, label="center")
+            ax.grid(True, alpha=0.3)
+        ax_ps.set_ylabel(r"$P_s = I_+ + I_-$")
+        ax_ps.set_title(
+            f"ssRF Voigt burn  P0={p0:.3f}  center={center}  "
+            f"γ_rf={power:.1f}  P_tot∈[{p_tot.min():.3f},{p_tot.max():.3f}]"
+        )
+        ax_ps.legend(fontsize=8, ncols=3, loc="upper right")
+        ax_q.set_xlabel("R")
+        ax_q.set_ylabel(r"$Q = I_+ - I_-$")
+        ax_q.legend(fontsize=8, ncols=3, loc="upper right")
+        fig.tight_layout()
+        path = plot_dir / f"ssrf_ps_q_steps_P{p0:.2f}_bin{center:04d}.png"
+        fig.savefig(path, dpi=140)
+        plt.close(fig)
+        saved.append(path)
+
+        fig, ax = plt.subplots(figsize=(10.5, 4.8))
+        j0, j1 = 0, int(idx.size) - 1
+        ax.plot(f, spectra[j0, 0], color="tab:red", ls="--", alpha=0.55, label=rf"$I_+$ n={int(steps[j0])}")
+        ax.plot(f, spectra[j0, 1], color="tab:blue", ls="--", alpha=0.55, label=rf"$I_-$ n={int(steps[j0])}")
+        ax.plot(f, spectra[j0, 0] + spectra[j0, 1], color="tab:green", ls="--", alpha=0.55, label=rf"$P_s$ n={int(steps[j0])}")
+        ax.plot(f, spectra[j1, 0], color="tab:red", lw=1.5, label=rf"$I_+$ n={int(steps[j1])}")
+        ax.plot(f, spectra[j1, 1], color="tab:blue", lw=1.5, label=rf"$I_-$ n={int(steps[j1])}")
+        ax.plot(f, spectra[j1, 0] + spectra[j1, 1], color="tab:green", lw=1.5, label=rf"$P_s$ n={int(steps[j1])}")
+        ax.axvline(float(f[center]), color="0.35", ls=":", lw=1.0)
+        ax.set_xlabel("R")
+        ax.set_ylabel("intensity (fit scale)")
+        ax.set_title(
+            f"ssRF I+/I−  P0={p0:.3f}  bin={center}  "
+            f"P_tot={float(p_tot[j1]):.4f}  Q_tot={float(q_tot[j1]):.4f}"
+        )
+        ax.legend(fontsize=8, ncols=2, loc="upper right")
+        ax.grid(True, alpha=0.3)
+        fig.tight_layout()
+        path = plot_dir / f"ssrf_ip_im_P{p0:.2f}_bin{center:04d}.png"
+        fig.savefig(path, dpi=140)
+        plt.close(fig)
+        saved.append(path)
+
+    for p0, center in _pick_afp_example_keys(data, max_examples=max_afp_examples):
+        mask = _event_mask(data, source=SOURCE_AFP, p0=p0, center_bin=center)
+        idx = np.flatnonzero(mask)
+        if idx.size == 0:
+            continue
+        order = np.argsort(data["n_steps"][idx])
+        idx = idx[order]
+        steps = data["n_steps"][idx]
+        spectra = data["spectra"][idx]
+        p_tot = data["P_total"][idx]
+        q_tot = data["Q_total"][idx]
+
+        eq_mask = _event_mask(
+            data, source=SOURCE_SSRF, p0=p0, center_bin=center, n_steps=0
+        )
+        if not np.any(eq_mask):
+            eq_mask = _event_mask(data, source=SOURCE_SSRF, p0=p0, n_steps=0)
+        eq_idx = np.flatnonzero(eq_mask)
+
+        if int(idx.size) > 1:
+            fig, axes = plt.subplots(2, 1, figsize=(10.5, 7.5), sharex=True)
+            ax_ps, ax_q = axes
+            n_show = min(6, int(idx.size))
+            show_i = np.unique(
+                np.round(np.linspace(0, int(idx.size) - 1, n_show)).astype(int)
+            )
+            cmap = plt.cm.plasma(np.linspace(0.15, 0.9, len(show_i)))
+            for color, j in zip(cmap, show_i):
+                ip = spectra[j, 0]
+                im = spectra[j, 1]
+                step = int(steps[j])
+                ax_ps.plot(f, ip + im, color=color, lw=1.4, label=f"n={step}")
+                ax_q.plot(f, ip - im, color=color, lw=1.2, label=f"n={step}")
+            if eq_idx.size:
+                e = int(eq_idx[0])
+                ip0 = data["spectra"][e, 0]
+                im0 = data["spectra"][e, 1]
+                ax_ps.plot(
+                    f, ip0 + im0, color="0.45", ls="--", lw=1.2, label="eq $P_s$"
+                )
+                ax_q.plot(
+                    f, ip0 - im0, color="0.45", ls="--", lw=1.0, label="eq $Q$"
+                )
+            for ax in axes:
+                ax.axvline(
+                    float(f[center]), color="green", ls=":", lw=1.1, label="center"
+                )
+                ax.grid(True, alpha=0.3)
+            ax_ps.set_ylabel(r"$P_s = I_+ + I_-$")
+            ax_ps.set_title(
+                f"AFP + relax  P0={p0:.3f}  center={center}  "
+                f"window={AFP_WINDOW}  "
+                f"P_tot∈[{p_tot.min():.3f},{p_tot.max():.3f}]"
+            )
+            ax_ps.legend(fontsize=8, ncols=3, loc="upper right")
+            ax_q.set_xlabel("R")
+            ax_q.set_ylabel(r"$Q = I_+ - I_-$")
+            ax_q.legend(fontsize=8, ncols=3, loc="upper right")
+            fig.tight_layout()
+            path = plot_dir / f"afp_ps_q_relax_P{p0:.2f}_bin{center:04d}.png"
+            fig.savefig(path, dpi=140)
+            plt.close(fig)
+            saved.append(path)
+
+            fig, ax = plt.subplots(figsize=(10.5, 4.8))
+            j0, j1 = 0, int(idx.size) - 1
+            ax.plot(
+                f,
+                spectra[j0, 0],
+                color="tab:red",
+                ls="--",
+                alpha=0.55,
+                label=rf"$I_+$ n={int(steps[j0])}",
+            )
+            ax.plot(
+                f,
+                spectra[j0, 1],
+                color="tab:blue",
+                ls="--",
+                alpha=0.55,
+                label=rf"$I_-$ n={int(steps[j0])}",
+            )
+            ax.plot(
+                f,
+                spectra[j1, 0],
+                color="tab:red",
+                lw=1.5,
+                label=rf"$I_+$ n={int(steps[j1])}",
+            )
+            ax.plot(
+                f,
+                spectra[j1, 1],
+                color="tab:blue",
+                lw=1.5,
+                label=rf"$I_-$ n={int(steps[j1])}",
+            )
+            ax.axvline(float(f[center]), color="green", ls=":", lw=1.1)
+            ax.set_xlabel("R")
+            ax.set_ylabel("intensity (fit scale)")
+            ax.set_title(
+                f"AFP I+/I−  P0={p0:.3f}  bin={center}  "
+                f"P_tot={float(p_tot[j1]):.4f}  Q_tot={float(q_tot[j1]):.4f}"
+            )
+            ax.legend(fontsize=8, ncols=2, loc="upper right")
+            ax.grid(True, alpha=0.3)
+            fig.tight_layout()
+            path = plot_dir / f"afp_ip_im_relax_P{p0:.2f}_bin{center:04d}.png"
+            fig.savefig(path, dpi=140)
+            plt.close(fig)
+            saved.append(path)
+        else:
+            j = int(idx[0])
+            ip = spectra[0, 0]
+            im = spectra[0, 1]
+            ps = ip + im
+            q = ip - im
+
+            fig, axes = plt.subplots(2, 1, figsize=(10.5, 7.5), sharex=True)
+            ax_ps, ax_ip = axes
+            if eq_idx.size:
+                e = int(eq_idx[0])
+                ip0 = data["spectra"][e, 0]
+                im0 = data["spectra"][e, 1]
+                ax_ps.plot(
+                    f, ip0 + im0, color="0.45", ls="--", lw=1.2, label="eq $P_s$"
+                )
+                ax_ip.plot(
+                    f, ip0, color="tab:red", ls="--", alpha=0.5, label=r"eq $I_+$"
+                )
+                ax_ip.plot(
+                    f, im0, color="tab:blue", ls="--", alpha=0.5, label=r"eq $I_-$"
+                )
+            ax_ps.plot(f, ps, color="black", lw=1.5, label="AFP $P_s$")
+            ax_ps.plot(f, q, color="tab:orange", lw=1.2, label="AFP $Q$")
+            ax_ip.plot(f, ip, color="tab:red", lw=1.5, label=r"AFP $I_+$")
+            ax_ip.plot(f, im, color="tab:blue", lw=1.5, label=r"AFP $I_-$")
+            for ax in axes:
+                ax.axvline(
+                    float(f[center]), color="green", ls=":", lw=1.1, label="center"
+                )
+                ax.grid(True, alpha=0.3)
+            ax_ps.set_ylabel(r"$P_s$, $Q$")
+            ax_ps.set_title(
+                f"AFP post-flip (n_relax=0)  P0={p0:.3f}  center={center}  "
+                f"window={AFP_WINDOW}  P_tot={float(p_tot[0]):.4f}  "
+                f"Q_tot={float(q_tot[0]):.4f}"
+            )
+            ax_ps.legend(fontsize=8, ncols=3, loc="upper right")
+            ax_ip.set_xlabel("R")
+            ax_ip.set_ylabel("intensity (fit scale)")
+            ax_ip.legend(fontsize=8, ncols=2, loc="upper right")
+            fig.tight_layout()
+            path = plot_dir / f"afp_apply_P{p0:.2f}_bin{center:04d}.png"
+            fig.savefig(path, dpi=140)
+            plt.close(fig)
+            saved.append(path)
+
+    return saved
 
 
 def generate_spectra(
-    num_samples: int,
     *,
-    seed: int = DEFAULT_SEED,
-) -> np.ndarray:
-    """Generate ``num_samples`` spectra with shape (N, 2, NUM_BINS)."""
-    n = int(num_samples)
-    if n < 1:
-        raise ValueError(f"num_samples must be >= 1, got {n}")
+    do_ssrf: bool,
+    do_afp: bool,
+    p_min: float = P_MIN,
+    p_max: float = P_MAX,
+    p_step: float = P_STEP,
+    min_burn_steps: int = MIN_BURN_STEPS,
+    max_burn_steps: int = MAX_BURN_STEPS,
+    burn_steps_step: int = BURN_STEPS_STEP,
+    min_relax_steps: int = MIN_RELAX_STEPS,
+    max_relax_steps: int = MAX_RELAX_STEPS,
+    relax_steps_step: int = RELAX_STEPS_STEP,
+    gamma_rf: float = GAMMA_RF,
+    afp_window: int = AFP_WINDOW,
+    max_centers_per_p: int | None = None,
+    p_values: np.ndarray | None = None,
+) -> dict[str, np.ndarray]:
+    """Build full-spectrum manipulated events for the requested modes."""
+    if not do_ssrf and not do_afp:
+        raise ValueError("Enable at least one of do_ssrf / do_afp")
 
     burn_window = _burn_window_bins()
     shape_params = get_shape_params()
-    rng = np.random.default_rng(int(seed))
-    out = np.empty((n, 2, NUM_BINS), dtype=STORE_DTYPE)
+    calibration = load_pq_calibration(num_bins=NUM_BINS)
+    if p_values is None:
+        p_values = polarization_grid(float(p_min), float(p_max), float(p_step))
+        p_values = p_values[p_values > 0.0]
+    else:
+        p_values = np.asarray(p_values, dtype=float).reshape(-1)
+    if p_values.size == 0:
+        raise ValueError("polarization grid is empty")
 
-    max_attempts = max(n * MAX_ATTEMPTS_FACTOR, n + 10)
-    filled = 0
-    attempts = 0
-    while filled < n and attempts < max_attempts:
-        attempts += 1
-        spectrum = sample_one_spectrum(
-            rng,
-            burn_window,
-            shape_params=shape_params,
+    groups: list[dict[str, list]] = []
+    if do_ssrf:
+        steps_grid = burn_steps_values(min_burn_steps, max_burn_steps, burn_steps_step)
+        groups.append(
+            generate_ssrf_events(
+                p_values,
+                burn_window,
+                steps_grid,
+                shape_params=shape_params,
+                calibration=calibration,
+                gamma_rf=float(gamma_rf),
+                max_centers_per_p=max_centers_per_p,
+            )
         )
-        if spectrum is None:
-            continue
-        out[filled] = spectrum
-        filled += 1
-        if filled == 1 or filled % 50 == 0 or filled == n:
-            print(f"  sampled {filled}/{n} spectra ({attempts} attempts)", flush=True)
+    if do_afp:
+        relax_grid = burn_steps_values(
+            min_relax_steps, max_relax_steps, relax_steps_step
+        )
+        groups.append(
+            generate_afp_events(
+                p_values,
+                burn_window,
+                relax_grid,
+                shape_params=shape_params,
+                calibration=calibration,
+                afp_window=int(afp_window),
+                max_centers_per_p=max_centers_per_p,
+            )
+        )
+    return _merge_rows(*groups)
 
-    if filled < n:
-        raise RuntimeError(
-            f"Only collected {filled}/{n} spectra after {attempts} attempts "
-            "(too many skipped burns)"
-        )
-    return out
+
+def _resolve_modes(
+    *,
+    ssrf: bool | None,
+    afp: bool | None,
+    quick: bool,
+) -> tuple[bool, bool]:
+    """Resolve ``--ssrf/--no-ssrf`` and ``--afp/--no-afp`` into concrete booleans.
+
+    Defaults when no mode flag is given:
+      - ``--quick`` → both on
+      - otherwise → ssRF on, AFP off
+    When any mode flag is given, unspecified modes default to off.
+    """
+    ssrf_set = ssrf is not None
+    afp_set = afp is not None
+    if not ssrf_set and not afp_set:
+        if quick:
+            return True, True
+        return True, False
+    return (bool(ssrf) if ssrf_set else False), (bool(afp) if afp_set else False)
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Sample random Voigt-burned full spectra (I+/I- only) for DAE training. "
-            "Burns only where initial Q < 0, with a widened Voigt RF profile."
+            "Generate full-spectrum ssRF and/or AFP manipulated lineshapes "
+            "centered only at burn-window bins where initial (equilibrium) Q < 0. "
+            "AFP emits one event per selected post-flip relax step. "
+            "ssRF and AFP are never applied in the same event."
         )
     )
     parser.add_argument(
-        "--num-samples",
-        type=int,
-        default=DEFAULT_NUM_SAMPLES,
-        help=f"Number of burned spectra to save (default: {DEFAULT_NUM_SAMPLES})",
+        "--ssrf",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Enable/disable ssRF Voigt-burn events "
+            "(--ssrf / --no-ssrf; default: on if no mode flags, else off)"
+        ),
+    )
+    parser.add_argument(
+        "--afp",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Enable/disable AFP + relax events "
+            "(--afp / --no-afp; default: off unless --quick with no mode flags). "
+            "When on: 0 .. max-relax-steps; n_steps = relax steps after flip"
+        ),
     )
     parser.add_argument(
         "--output",
@@ -180,41 +865,197 @@ def parse_args() -> argparse.Namespace:
         help=f"Output .npz path (default: {DEFAULT_OUTPUT})",
     )
     parser.add_argument(
+        "--plot-dir",
+        type=Path,
+        default=None,
+        help=(
+            "Directory for example PNGs "
+            f"(default: <output-parent>/plots, e.g. {DEFAULT_PLOT_DIR})"
+        ),
+    )
+    parser.add_argument(
+        "--no-plots",
+        action="store_true",
+        help="Skip writing example diagnostic plots",
+    )
+    parser.add_argument(
+        "--p-min",
+        type=float,
+        default=P_MIN,
+        help=f"Minimum polarization (default: {P_MIN})",
+    )
+    parser.add_argument(
+        "--p-max",
+        type=float,
+        default=P_MAX,
+        help=f"Maximum polarization (default: {P_MAX})",
+    )
+    parser.add_argument(
+        "--p-step",
+        type=float,
+        default=P_STEP,
+        help=f"Polarization grid step (default: {P_STEP})",
+    )
+    parser.add_argument(
+        "--min-burn-steps",
+        type=int,
+        default=MIN_BURN_STEPS,
+        help=f"Minimum ssRF burn length (default: {MIN_BURN_STEPS})",
+    )
+    parser.add_argument(
+        "--max-burn-steps",
+        type=int,
+        default=MAX_BURN_STEPS,
+        help=f"Maximum ssRF burn length (default: {MAX_BURN_STEPS})",
+    )
+    parser.add_argument(
+        "--burn-steps-step",
+        type=int,
+        default=BURN_STEPS_STEP,
+        help=f"ssRF burn-length stride (default: {BURN_STEPS_STEP})",
+    )
+    parser.add_argument(
+        "--min-relax-steps",
+        type=int,
+        default=MIN_RELAX_STEPS,
+        help=f"Minimum AFP relax steps after flip (default: {MIN_RELAX_STEPS})",
+    )
+    parser.add_argument(
+        "--max-relax-steps",
+        type=int,
+        default=MAX_RELAX_STEPS,
+        help=f"Maximum AFP relax steps after flip (default: {MAX_RELAX_STEPS})",
+    )
+    parser.add_argument(
+        "--relax-steps-step",
+        type=int,
+        default=RELAX_STEPS_STEP,
+        help=f"AFP relax-step stride (default: {RELAX_STEPS_STEP})",
+    )
+    parser.add_argument(
+        "--gamma-rf",
+        type=float,
+        default=GAMMA_RF,
+        help=f"ssRF applied power gamma_rf (default: {GAMMA_RF})",
+    )
+    parser.add_argument(
+        "--afp-window",
+        type=int,
+        default=AFP_WINDOW,
+        help=f"AFP subset window width in bins (default: {AFP_WINDOW})",
+    )
+    parser.add_argument(
         "--seed",
         type=int,
         default=DEFAULT_SEED,
-        help=f"RNG seed (default: {DEFAULT_SEED})",
+        help=f"RNG seed reserved for future stochastic options (default: {DEFAULT_SEED})",
     )
     parser.add_argument(
         "--quick",
         action="store_true",
-        help="Generate 8 spectra for a local smoke run",
+        help=(
+            "Smoke run: 2 polarizations, few centers, short ssRF burn + AFP "
+            "relax grids, both modes"
+        ),
     )
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
-    num_samples = 8 if args.quick else int(args.num_samples)
+    do_ssrf, do_afp = _resolve_modes(
+        ssrf=args.ssrf,
+        afp=args.afp,
+        quick=bool(args.quick),
+    )
+
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
 
+    if args.quick:
+        p_values = np.asarray([0.30, 0.50], dtype=float)
+        min_burn_steps = 0
+        max_burn_steps = 10
+        burn_steps_step = 5
+        min_relax_steps = 0
+        max_relax_steps = 10
+        relax_steps_step = 5
+        max_centers_per_p = 3
+        print(
+            "Quick smoke: P={0.30, 0.50}, 3 centers/P, "
+            "ssRF steps {0,5,10}, AFP relax {0,5,10}",
+            flush=True,
+        )
+    else:
+        p_values = None
+        min_burn_steps = int(args.min_burn_steps)
+        max_burn_steps = int(args.max_burn_steps)
+        burn_steps_step = int(args.burn_steps_step)
+        min_relax_steps = int(args.min_relax_steps)
+        max_relax_steps = int(args.max_relax_steps)
+        relax_steps_step = int(args.relax_steps_step)
+        max_centers_per_p = None
+
+    modes = []
+    if do_ssrf:
+        modes.append("ssRF")
+    if do_afp:
+        modes.append("AFP")
     print(
-        f"Sampling {num_samples} Voigt-burn spectra | "
-        f"P in [{P_MIN}, {P_MAX}] | gamma_rf={GAMMA_RF} | "
-        f"steps in [{MIN_BURN_STEPS}, {MAX_BURN_STEPS}] | dt={DT} | "
-        f"burn R in ({BURN_R_MIN}, {BURN_R_MAX}) | Q<0 centers only | "
+        f"Generating {'+'.join(modes)} full spectra | "
+        f"P in [{args.p_min}, {args.p_max}] step {args.p_step} | "
+        f"ssRF gamma_rf={args.gamma_rf} steps "
+        f"[{min_burn_steps}, {max_burn_steps}] stride {burn_steps_step} | "
+        f"ssRF centers: equilibrium Q<0 only | "
+        f"AFP window={args.afp_window} relax "
+        f"[{min_relax_steps}, {max_relax_steps}] stride {relax_steps_step} | "
+        f"dt={DT} | "
+        f"burn R in ({BURN_R_MIN}, {BURN_R_MAX}) | "
         f"Voigt FWHM G={GAUSSIAN_FWHM_R:.3f} L={LORENTZIAN_FWHM_R:.3f}",
         flush=True,
     )
-    spectra = generate_spectra(num_samples, seed=int(args.seed))
 
-    # Channel 0 = I+, channel 1 = I-. No metadata by design.
-    np.savez_compressed(output, spectra=spectra)
+    data = generate_spectra(
+        do_ssrf=do_ssrf,
+        do_afp=do_afp,
+        p_min=float(args.p_min),
+        p_max=float(args.p_max),
+        p_step=float(args.p_step),
+        min_burn_steps=min_burn_steps,
+        max_burn_steps=max_burn_steps,
+        burn_steps_step=burn_steps_step,
+        min_relax_steps=min_relax_steps,
+        max_relax_steps=max_relax_steps,
+        relax_steps_step=relax_steps_step,
+        gamma_rf=float(args.gamma_rf),
+        afp_window=int(args.afp_window),
+        max_centers_per_p=max_centers_per_p,
+        p_values=p_values,
+    )
+
+    np.savez_compressed(output, **data)
+    n = int(data["spectra"].shape[0])
+    n_ssrf = int(np.sum(data["source"] == SOURCE_SSRF))
+    n_afp = int(np.sum(data["source"] == SOURCE_AFP))
     print(
-        f"Saved spectra array shape={spectra.shape} dtype={spectra.dtype} -> {output}",
+        f"Saved N={n} events (ssRF={n_ssrf}, AFP={n_afp}) "
+        f"spectra={data['spectra'].shape} dtype={data['spectra'].dtype} -> {output}",
         flush=True,
     )
+
+    if not args.no_plots and n > 0:
+        plot_dir = (
+            Path(args.plot_dir)
+            if args.plot_dir is not None
+            else output.parent / "plots"
+        )
+        paths = save_example_plots(data, plot_dir)
+        if paths:
+            print(f"Wrote {len(paths)} example plots -> {plot_dir}", flush=True)
+            for p in paths:
+                print(f"  {p.name}", flush=True)
+        else:
+            print(f"No example plots produced (empty selection) -> {plot_dir}", flush=True)
 
 
 if __name__ == "__main__":

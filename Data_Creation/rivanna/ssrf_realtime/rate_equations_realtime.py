@@ -1,5 +1,5 @@
 """
-Headless spin-1 ss-RF model.
+Headless spin-1 ss-RF model (v2).
 
 Convenience entry point for the capacity-weighted packet-population model in
 ``physics/ssrf_realtime/``.

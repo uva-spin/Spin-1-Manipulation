@@ -68,7 +68,7 @@ def load_train_bin(path: Path) -> dict[str, np.ndarray]:
         meta = {}
         if "meta_json" in data.files:
             meta = json.loads(str(data["meta_json"]))
-        out["_meta"] = meta  # type: ignore[assignment]
+        out["_meta"] = meta
         return out
 
 

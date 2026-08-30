@@ -1,16 +1,20 @@
 """
 Denoising Autoencoder (DAE) for 500-point NMR signals.
 
-Uses Ps (Iplus + Iminus) at each bin as the training target. Loads Voigt-burn
-spectra from ``dae_voigt_burn_spectra/spectra.npz`` (shape N×2×500: I+, I-),
+Uses Ps (Iplus + Iminus) at each bin as the training target. Loads the same
+Voigt-burn ``spectra.npz`` as ``spectrum_pq.py`` (shape N×2×500: I+, I-),
 forms Ps, applies noise BEFORE normalizing, then trains a simple DAE to denoise.
+
+Default NPZ search order matches spectrum_pq:
+  Data_Creation/dae_voigt_burn_spectra/spectra.npz
+  ml/dae_voigt_burn_spectra/spectra.npz
 
 For use with the DAE+combined pipeline (dae_combined_pipeline.py), train with
 --no-scale-01 so the DAE output is in raw Ps scale compatible with the combined model.
 
 Usage:
   python ml/dae.py
-  python ml/dae.py --data-dir ml/dae_voigt_burn_spectra --noise-std 0.1
+  python ml/dae.py --spectra Data_Creation/dae_voigt_burn_spectra/spectra.npz --noise-std 0.1
   python ml/dae.py --test-only --checkpoint dae_denoise_results/dae_denoise_500.pth
 """
 
@@ -19,6 +23,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+from pathlib import Path
 from typing import List, Optional, Tuple
 
 import matplotlib.pyplot as plt
@@ -29,9 +34,13 @@ import torch.nn as nn
 import torch.optim as optim
 import torch.utils.data as data
 
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-DEFAULT_DATA_DIR = os.path.join(SCRIPT_DIR, "dae_voigt_burn_spectra")
-DEFAULT_SPECTRA_NAME = "spectra.npz"
+SCRIPT_DIR = Path(__file__).resolve().parent
+REPO_ROOT = SCRIPT_DIR.parent
+DEFAULT_SPECTRA_CANDIDATES = (
+    REPO_ROOT / "Data_Creation" / "dae_voigt_burn_spectra" / "spectra.npz",
+    SCRIPT_DIR / "dae_voigt_burn_spectra" / "spectra.npz",
+)
+DEFAULT_OUTPUT_DIR = SCRIPT_DIR / "dae_denoise_results"
 
 
 # =============================================================================
@@ -150,70 +159,81 @@ def _minmax_scale_01(x: np.ndarray) -> np.ndarray:
     return (x - x_min) / span
 
 
-def _resolve_spectra_path(data_dir: str, spectra_file: Optional[str] = None) -> str:
-    """Resolve NPZ path under data_dir (default: spectra.npz)."""
-    if spectra_file is not None:
-        path = spectra_file
-        if not os.path.isabs(path):
-            candidate = os.path.join(data_dir, path)
-            path = candidate if os.path.isfile(candidate) else path
-    else:
-        path = os.path.join(data_dir, DEFAULT_SPECTRA_NAME)
-    if not os.path.isfile(path):
-        raise FileNotFoundError(
-            f"Spectra NPZ not found: {path}. "
-            "Generate with Data_Creation/create_dae_voigt_burn_spectra.py "
-            "or set --data-dir / --spectra-file."
-        )
-    return path
+def resolve_spectra_path(spectra: Optional[str | Path] = None) -> Path:
+    """Resolve spectra.npz path (same search order as spectrum_pq.py)."""
+    if spectra is not None:
+        path = Path(spectra)
+        if path.is_file():
+            return path
+        raise FileNotFoundError(f"Spectra NPZ not found: {path}")
+    for candidate in DEFAULT_SPECTRA_CANDIDATES:
+        if candidate.is_file():
+            return candidate
+    tried = ", ".join(str(p) for p in DEFAULT_SPECTRA_CANDIDATES)
+    raise FileNotFoundError(
+        "Spectra NPZ not found. Pass --spectra PATH. Tried: " + tried
+    )
 
 
 def load_voigt_burn_ps(
-    data_dir: str,
+    spectra: Optional[str | Path] = None,
     num_points: int = 500,
-    spectra_file: Optional[str] = None,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """Load Voigt-burn NPZ spectra and return (Ps, P_proxy).
 
     NPZ key 'spectra' has shape (N, 2, num_points): channel0=Iplus, channel1=Iminus.
-    Ps is Iplus+Iminus. P_proxy is integrated (Iplus-Iminus)/(Iplus+Iminus).
+    Ps is Iplus+Iminus. Prefers NPZ ``P_total`` when present; otherwise computes
+    integrated (Iplus-Iminus)/(Iplus+Iminus).
     """
-    path = _resolve_spectra_path(data_dir, spectra_file=spectra_file)
+    path = resolve_spectra_path(spectra)
     loaded = np.load(path, allow_pickle=False)
     try:
         if "spectra" not in loaded.files:
             raise KeyError(f"{path}: missing 'spectra' array; found {loaded.files}")
-        spectra = np.asarray(loaded["spectra"], dtype=np.float64)
+        spectra_arr = np.asarray(loaded["spectra"], dtype=np.float32)
+        p_total = (
+            np.asarray(loaded["P_total"], dtype=np.float32).reshape(-1)
+            if "P_total" in loaded.files
+            else None
+        )
     finally:
         loaded.close()
 
-    if spectra.ndim != 3 or spectra.shape[1] != 2 or spectra.shape[2] != num_points:
+    if (
+        spectra_arr.ndim != 3
+        or spectra_arr.shape[1] != 2
+        or spectra_arr.shape[2] != num_points
+    ):
         raise ValueError(
-            f"{path}: expected spectra shape (N, 2, {num_points}), got {spectra.shape}"
+            f"{path}: expected spectra shape (N, 2, {num_points}), got {spectra_arr.shape}"
         )
 
-    iplus = spectra[:, 0, :]
-    iminus = spectra[:, 1, :]
-    ps = (iplus + iminus).astype(np.float64)
-    total = np.sum(ps, axis=1)
-    diff = np.sum(iplus - iminus, axis=1)
-    p_proxy = np.divide(
-        diff,
-        total,
-        out=np.zeros_like(diff),
-        where=np.abs(total) > 1e-12,
-    )
+    iplus = spectra_arr[:, 0, :]
+    iminus = spectra_arr[:, 1, :]
+    ps = (iplus + iminus).astype(np.float32, copy=False)
+    if p_total is not None and p_total.shape[0] == ps.shape[0]:
+        p_proxy = p_total
+        p_src = "P_total"
+    else:
+        total = np.sum(ps, axis=1)
+        diff = np.sum(iplus - iminus, axis=1)
+        p_proxy = np.divide(
+            diff,
+            total,
+            out=np.zeros_like(diff),
+            where=np.abs(total) > 1e-12,
+        )
+        p_src = "I+/I- proxy"
     print(
         f"Loaded Voigt-burn spectra: {path}  N={ps.shape[0]}  "
-        f"Ps shape={ps.shape} (from Iplus/Iminus)",
+        f"Ps shape={ps.shape} (from Iplus/Iminus; P from {p_src})",
         flush=True,
     )
-    return ps, p_proxy.astype(np.float64)
-
+    return ps, p_proxy.astype(np.float32, copy=False)
 
 
 def load_and_prepare_data(
-    data_dir: str,
+    spectra: Optional[str | Path] = None,
     num_points: int = 500,
     noise_std: float = 0.1,
     val_frac: float = 0.2,
@@ -221,7 +241,6 @@ def load_and_prepare_data(
     seed: int = 42,
     scale_01: bool = True,
     override_stats: dict = None,
-    spectra_file: Optional[str] = None,
 ):
     """
     Load Voigt-burn spectra, form Ps, add noise before normalizing.
@@ -234,9 +253,8 @@ def load_and_prepare_data(
     """
     rng = np.random.default_rng(seed)
     ps_all, p_all = load_voigt_burn_ps(
-        data_dir,
+        spectra=spectra,
         num_points=num_points,
-        spectra_file=spectra_file,
     )
 
     n_total = int(ps_all.shape[0])
@@ -727,16 +745,13 @@ def parse_args():
         description="Train DAE to denoise 500-point NMR signals."
     )
     parser.add_argument(
-        "--data-dir",
-        type=str,
-        default=DEFAULT_DATA_DIR,
-        help="Directory containing Voigt-burn spectra.npz (default: ml/dae_voigt_burn_spectra)",
-    )
-    parser.add_argument(
-        "--spectra-file",
+        "--spectra",
         type=str,
         default=None,
-        help="NPZ filename or path (default: <data-dir>/spectra.npz)",
+        help=(
+            "Path to spectra.npz (same file as spectrum_pq.py). "
+            "Default: search Data_Creation/ then ml/ dae_voigt_burn_spectra/"
+        ),
     )
     parser.add_argument(
         "--test-frac",
@@ -747,8 +762,8 @@ def parse_args():
     parser.add_argument(
         "--output-dir",
         type=str,
-        default="dae_denoise_results",
-        help="Directory for model and plots",
+        default=str(DEFAULT_OUTPUT_DIR),
+        help=f"Directory for model and plots (default: {DEFAULT_OUTPUT_DIR})",
     )
     parser.add_argument(
         "--noise-std",
@@ -818,12 +833,11 @@ def main():
         print(f"Scale to [0,1] (from checkpoint): {scale_01_ckpt}")
         # Prepare test data exactly as at training: same noise_std, scale_01, and normalization stats
         train_dataset, val_dataset, test_dataset, stats, P_test = load_and_prepare_data(
-            data_dir=args.data_dir,
+            spectra=args.spectra,
             noise_std=noise_std_ckpt,
             seed=args.seed,
             scale_01=scale_01_ckpt,
             override_stats=ckpt_stats if not scale_01_ckpt else None,
-            spectra_file=args.spectra_file,
             test_frac=float(args.test_frac),
         )
         hidden_dims = tuple(ckpt["hidden_dims"])
@@ -852,11 +866,10 @@ def main():
     print(f"Scale to [0,1]: {not args.no_scale_01}")
     # Load data: noise applied before normalizing; scale to [0,1] by default
     train_dataset, val_dataset, test_dataset, stats, P_test = load_and_prepare_data(
-        data_dir=args.data_dir,
+        spectra=args.spectra,
         noise_std=args.noise_std,
         seed=args.seed,
         scale_01=not args.no_scale_01,
-        spectra_file=args.spectra_file,
         test_frac=float(args.test_frac),
     )
 

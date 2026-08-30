@@ -1,8 +1,7 @@
 """
 Evaluate the combined per-bin model on test lineshapes.
 
-Test data must include pre-calibrated per-bin ``P``/``Q`` (or ``P_bins``/``Q_bins``)
-and optionally integrated ``true_P``/``true_Q`` — same convention as train NPZs.
+Loads Voigt-burn ``spectra.npz`` (N×2×bins I+/I−, plus p0 / P_total / Q_total).
 
 Run:
   python ml/test-binning.py
@@ -12,7 +11,6 @@ from __future__ import annotations
 
 import json
 import os
-import pickle
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -31,18 +29,29 @@ if str(REPO_ROOT) not in sys.path:
 if str(ML_DIR) not in sys.path:
     sys.path.insert(0, str(ML_DIR))
 
-from single_bin import BinModel as LinearBinModel, load_bin_model_state_dict
+from single_bin import (
+    BinModel as LinearBinModel,
+    build_event_feature_matrix,
+    event_manipulation_features,
+    load_bin_model_state_dict,
+)
+
+# Floor used when combining per-bin X_std; dims at this scale never varied in training.
+_DEGENERATE_X_STD = 1e-6
+# spectra.npz source codes (Data_Creation/rivanna/common.py)
+SOURCE_SSRF = 0
+SOURCE_AFP = 1
 
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
 
 MODEL_PATH = "models/combined_bin_model.pth"
-TEST_FILE = "../data/manipulated_test_10000.pkl"
+TEST_FILE = "data/spectra.npz"
 OUTPUT_DIR = "results/test_binning"
 SCALING_FILE = None
 
-DEVICE = "mps"
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 NUM_BINS = 500
 FEATURE_CLIP_Z = 0.0
 EXAMPLES = 12
@@ -59,33 +68,6 @@ BURN_CONTEXT_FEATURES = (
 
 
 # ---------------------------------------------------------------------------
-# I/O
-# ---------------------------------------------------------------------------
-
-
-class _NumpyCompatUnpickler(pickle.Unpickler):
-    _MODULE_REMAP = {
-        "numpy._core": "numpy.core",
-        "numpy._core.multiarray": "numpy.core.multiarray",
-        "numpy._core.numeric": "numpy.core.numeric",
-    }
-
-    def find_class(self, module: str, name: str):
-        return super().find_class(self._MODULE_REMAP.get(module, module), name)
-
-
-def read_pickle_compat(path: str) -> pd.DataFrame:
-    try:
-        return pd.read_pickle(path)
-    except ModuleNotFoundError as exc:
-        if "numpy._core" not in str(exc):
-            raise
-        print("Retrying pickle load with NumPy compatibility shim...")
-        with open(path, "rb") as f:
-            return _NumpyCompatUnpickler(f).load()
-
-
-# ---------------------------------------------------------------------------
 # Lineshape events
 # ---------------------------------------------------------------------------
 
@@ -98,6 +80,8 @@ class LineshapeEvent:
     iplus: np.ndarray
     iminus: np.ndarray
     burn_bin_idx: Optional[int] = None
+    gamma_rf: float = 0.0
+    n_steps: float = 0.0
     burn_step_norm: float = 0.0
     ps_ratio: float = 1.0
     burn_progress: float = 0.0
@@ -115,7 +99,15 @@ class LineshapeEvent:
         return int(self.ps.shape[0])
 
     def feature_matrix(self, feature_names: Optional[List[str]] = None) -> np.ndarray:
-        """Row j: Ps[j], burn context at j only if j == burn_bin_idx."""
+        """Per-bin features; ``gamma_rf`` / ``n_steps`` are global event parameters."""
+        names = feature_names or list(BURN_CONTEXT_FEATURES)
+        if set(names).issubset({"gamma_rf", "n_steps", "ps"}):
+            return build_event_feature_matrix(
+                self.ps,
+                names,
+                gamma_rf=self.gamma_rf,
+                n_steps=self.n_steps,
+            )
         n = self.num_bins
         burn_step_norm = np.zeros(n, dtype=np.float32)
         ps_ratio = np.ones(n, dtype=np.float32)
@@ -127,6 +119,8 @@ class LineshapeEvent:
             burn_progress[b] = np.float32(self.burn_progress)
 
         columns = {
+            "gamma_rf": np.full(n, np.float32(self.gamma_rf), dtype=np.float32),
+            "n_steps": np.full(n, np.float32(self.n_steps), dtype=np.float32),
             "ps": self.ps,
             "ps_at_burn_bin": self.ps,
             "p0": np.full(n, self.polarization, dtype=np.float32),
@@ -136,7 +130,6 @@ class LineshapeEvent:
             "ps_ratio": ps_ratio,
             "burn_progress": burn_progress,
         }
-        names = feature_names or list(BURN_CONTEXT_FEATURES)
         missing = [name for name in names if name not in columns]
         if missing:
             raise KeyError(
@@ -167,17 +160,123 @@ def event_from_row(row: pd.Series, n_bins: int) -> LineshapeEvent:
         iplus=np.asarray(row["Iplus"], dtype=np.float32),
         iminus=np.asarray(row["Iminus"], dtype=np.float32),
         burn_bin_idx=burn_bin_idx,
+        gamma_rf=float(row.get("gamma_rf", row.get("applied_power", 0.0))),
+        n_steps=float(row.get("n_steps", row.get("burn_step_norm", 0.0) * 100.0)),
         burn_step_norm=float(row.get("burn_step_norm", 0.0)),
         ps_ratio=float(row.get("ps_ratio", 1.0)),
         burn_progress=float(row.get("burn_progress", 0.0)),
     )
 
 
-def load_test_events(path: str) -> Tuple[List[LineshapeEvent], pd.DataFrame]:
-    df = read_pickle_compat(path)
+def _npz_1d(data, key: str, n: int, default: float = 0.0) -> np.ndarray:
+    if key not in data.files:
+        return np.full(n, default, dtype=np.float32)
+    return np.asarray(data[key]).reshape(-1)
+
+
+def load_test_npz(path: str, *, ssrf_only: bool = True) -> pd.DataFrame:
+    """Load Voigt-burn ``spectra.npz`` (N×2×bins I+/I−) into the row table used below.
+
+    By default keeps only ssRF rows (``source==0``). AFP flips can drive local Ps
+    negative at positive p0 and are out of scope for this I+/I− bin model eval.
+    """
+    with np.load(path, allow_pickle=False) as raw:
+        if "spectra" not in raw.files:
+            raise KeyError(f"{path}: missing 'spectra'; found {raw.files}")
+        spectra = np.asarray(raw["spectra"], dtype=np.float32)
+        if spectra.ndim != 3 or spectra.shape[1] != 2:
+            raise ValueError(
+                f"{path}: expected spectra shape (N, 2, num_bins), got {spectra.shape}"
+            )
+        iplus = spectra[:, 0, :]
+        iminus = spectra[:, 1, :]
+        n, n_bins = int(iplus.shape[0]), int(iplus.shape[1])
+        p0 = _npz_1d(raw, "p0", n)
+        applied = _npz_1d(raw, "applied_power", n)
+        n_steps_raw = _npz_1d(raw, "n_steps", n)
+        center = _npz_1d(raw, "center_bin", n, default=np.nan)
+        source = _npz_1d(raw, "source", n, default=float(SOURCE_SSRF))
+        p_total = _npz_1d(raw, "P_total", n) if "P_total" in raw.files else None
+        q_total = _npz_1d(raw, "Q_total", n) if "Q_total" in raw.files else None
+        freq = (
+            np.asarray(raw["frequency"], dtype=np.float32)
+            if "frequency" in raw.files
+            else np.arange(n_bins, dtype=np.float32)
+        )
+        if freq.ndim == 1:
+            freq_rows = np.stack([freq] * n, axis=0)
+        else:
+            freq_rows = np.asarray(freq, dtype=np.float32)
+
+    if ssrf_only:
+        keep = source.astype(np.int32) == SOURCE_SSRF
+        if not np.any(keep):
+            raise ValueError(f"{path}: no ssRF events (source=={SOURCE_SSRF}) to evaluate")
+        n_drop = int((~keep).sum())
+        if n_drop:
+            print(
+                f"Keeping {int(keep.sum())} ssRF events; "
+                f"dropped {n_drop} non-ssRF (AFP/other) rows",
+                flush=True,
+            )
+        iplus = iplus[keep]
+        iminus = iminus[keep]
+        p0 = p0[keep]
+        applied = applied[keep]
+        n_steps_raw = n_steps_raw[keep]
+        center = center[keep]
+        source = source[keep]
+        freq_rows = freq_rows[keep]
+        if p_total is not None:
+            p_total = p_total[keep]
+        if q_total is not None:
+            q_total = q_total[keep]
+        n = int(iplus.shape[0])
+
+    # Match train NPZ encoding: AFP / non-ssRF → gamma_rf=0, n_steps=0.
+    gamma_rf = np.empty(n, dtype=np.float32)
+    n_steps = np.empty(n, dtype=np.float32)
+    for i in range(n):
+        g, s = event_manipulation_features(
+            source=int(source[i]),
+            applied_power=float(applied[i]),
+            n_steps=float(n_steps_raw[i]),
+        )
+        gamma_rf[i] = g
+        n_steps[i] = s
+
+    ps = iplus + iminus
+    df = pd.DataFrame(
+        {
+            "P_initial": p0,
+            "gamma_rf": gamma_rf,
+            "applied_power": applied,
+            "n_steps": n_steps,
+            "burn_step_norm": n_steps / 100.0,
+            "burn_bin_idx": center,
+            "source": source.astype(np.int32),
+            "Ps": list(ps),
+            "Iplus": list(iplus),
+            "Iminus": list(iminus),
+            "frequency": list(freq_rows),
+        }
+    )
+    if p_total is not None:
+        df["true_P"] = p_total
+    if q_total is not None:
+        df["true_Q"] = q_total
+    return df
+
+
+def load_test_events(
+    path: str, *, ssrf_only: bool = True
+) -> Tuple[List[LineshapeEvent], pd.DataFrame]:
+    df = load_test_npz(path, ssrf_only=ssrf_only)
     missing = {"Ps", "Iplus", "Iminus"} - set(df.columns)
     if missing:
         raise KeyError(f"Test file missing columns: {sorted(missing)}")
+    if not (df["source"].to_numpy(dtype=np.int32) == SOURCE_SSRF).all():
+        raise RuntimeError("Non-ssRF rows present after filter; aborting.")
     n_bins = int(np.asarray(df["Ps"].iloc[0]).shape[0])
     return [event_from_row(row, n_bins) for _, row in df.iterrows()], df
 
@@ -208,14 +307,29 @@ def _resolve_input_stats(
 
 
 def _resolve_output_stats(
-    stats: Dict[str, np.ndarray], num_models: int
+    stats: Dict[str, np.ndarray],
+    num_models: int,
+    target_mode: Optional[str] = None,
 ) -> Tuple[str, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    if "P_mean" in stats and "Q_mean" in stats:
+    mode_hint = (target_mode or "").strip().lower()
+    has_pq = "P_mean" in stats and "Q_mean" in stats
+    has_i = "Iplus_mean" in stats and "Iminus_mean" in stats
+    if mode_hint in ("iplus_iminus", "i+", "iplus") and has_i:
+        keys = ("Iplus_mean", "Iplus_std", "Iminus_mean", "Iminus_std")
+        mode = "iplus_iminus"
+    elif mode_hint in ("pq", "p_q") and has_pq:
+        keys = ("P_mean", "P_std", "Q_mean", "Q_std")
+        mode = "pq"
+    elif has_i and not has_pq:
+        keys = ("Iplus_mean", "Iplus_std", "Iminus_mean", "Iminus_std")
+        mode = "iplus_iminus"
+    elif has_pq:
         keys = ("P_mean", "P_std", "Q_mean", "Q_std")
         mode = "pq"
     else:
-        keys = ("Iplus_mean", "Iplus_std", "Iminus_mean", "Iminus_std")
-        mode = "iplus_iminus"
+        raise KeyError(
+            "Stats need Iplus_mean/Iminus_mean or P_mean/Q_mean for output denormalization."
+        )
     out = {}
     for key in keys:
         arr = np.asarray(stats[key], dtype=np.float32)
@@ -237,6 +351,7 @@ class Combined500BinModel(nn.Module):
         feature_names: List[str],
         feature_clip_z: float = FEATURE_CLIP_Z,
         loaded_bin_indices: Optional[List[int]] = None,
+        target_mode: Optional[str] = None,
     ):
         super().__init__()
         self.num_models = len(bin_models)
@@ -252,19 +367,26 @@ class Combined500BinModel(nn.Module):
 
         x_mean, x_std = _resolve_input_stats(stats, self.num_models, self.input_dim)
         self.target_mode, out0_m, out0_s, out1_m, out1_s = _resolve_output_stats(
-            stats, self.num_models
+            stats, self.num_models, target_mode=target_mode
         )
         self._X_mean = torch.from_numpy(x_mean).float()
         self._X_std = torch.from_numpy(x_std).float()
+        # Dims that never varied in that bin's training data (std floored to ~1e-12).
+        self._X_std_degenerate = self._X_std <= _DEGENERATE_X_STD
         self._Out0_mean = torch.from_numpy(out0_m).float()
         self._Out0_std = torch.from_numpy(out0_s).float()
         self._Out1_mean = torch.from_numpy(out1_m).float()
         self._Out1_std = torch.from_numpy(out1_s).float()
 
     def _predict_bin(self, model_idx: int, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Normalize with checkpoint X_mean/X_std, then denormalize outputs."""
         mean = self._X_mean[model_idx].to(x.device)
         std = self._X_std[model_idx].to(x.device)
-        x_norm = (x - mean) / (std + 1e-12)
+        degenerate = self._X_std_degenerate[model_idx].to(x.device)
+        # Edge bins never saw non-zero gamma_rf/n_steps in training; forcing those
+        # dims to the train mean keeps z=0 instead of (10-0)/1e-12 explosions.
+        x_aligned = torch.where(degenerate, mean.expand_as(x), x)
+        x_norm = (x_aligned - mean) / (std + 1e-12)
         if self.feature_clip_z > 0:
             x_norm = torch.clamp(x_norm, -self.feature_clip_z, self.feature_clip_z)
         out0_n, out1_n = self.bin_models[model_idx](x_norm)
@@ -328,7 +450,8 @@ def load_combined_model(
         stats = {k: np.asarray(data[k], dtype=np.float32) for k in data.files}
 
     _resolve_input_stats(stats, num_bins, input_dim)
-    _resolve_output_stats(stats, num_bins)
+    target_mode = str(payload.get("target_mode", "")).strip() or None
+    _resolve_output_stats(stats, num_bins, target_mode=target_mode)
 
     models = []
     for i in range(num_bins):
@@ -342,12 +465,13 @@ def load_combined_model(
         stats,
         feature_names,
         loaded_bin_indices=payload.get("loaded_bin_indices"),
+        target_mode=target_mode,
     )
-    combined.target_mode = str(payload.get("target_mode", combined.target_mode))
     meta = {
         "pq_post_correct": bool(payload.get("pq_post_correct", True)),
         "targets_precalibrated": bool(payload.get("targets_precalibrated", False)),
         "target_mode": combined.target_mode,
+        "feature_names": list(feature_names),
     }
     return combined.to(device).eval(), meta
 
@@ -378,9 +502,16 @@ def pq_truth_from_dataframe(
     if "P_bins" in df.columns and "Q_bins" in df.columns:
         p_bins = _stack_spectrum_column(df, "P_bins")
         q_bins = _stack_spectrum_column(df, "Q_bins")
-    elif "P" in df.columns and "Q" in df.columns:
+    elif "P" in df.columns and "Q" in df.columns and isinstance(
+        df["P"].iloc[0], (np.ndarray, list, tuple)
+    ):
         p_bins = _stack_spectrum_column(df, "P")
         q_bins = _stack_spectrum_column(df, "Q")
+    elif "Iplus" in df.columns and "Iminus" in df.columns:
+        ip = _stack_spectrum_column(df, "Iplus")
+        im = _stack_spectrum_column(df, "Iminus")
+        p_bins = ip + im
+        q_bins = ip - im
     else:
         raise KeyError(
             "Test file must include pre-calibrated per-bin truth: "
@@ -390,6 +521,9 @@ def pq_truth_from_dataframe(
     if "true_P" in df.columns and "true_Q" in df.columns:
         p_int = df["true_P"].to_numpy(dtype=np.float64)
         q_int = df["true_Q"].to_numpy(dtype=np.float64)
+    elif "P_total" in df.columns and "Q_total" in df.columns:
+        p_int = df["P_total"].to_numpy(dtype=np.float64)
+        q_int = df["Q_total"].to_numpy(dtype=np.float64)
     elif "P_int" in df.columns and "Q_int" in df.columns:
         p_int = df["P_int"].to_numpy(dtype=np.float64)
         q_int = df["Q_int"].to_numpy(dtype=np.float64)
@@ -423,12 +557,14 @@ def print_results_table(stats: Dict[str, float]) -> None:
         ]),
         ("Vector polarization P", [
             ("Mean RPE", stats["mean_RPE_P"], "%"),
+            ("Median RPE", stats["median_RPE_P_int"], "%"),
             ("Std RPE", stats["std_RPE_P"], "%"),
             ("Mean residual", stats["mean_residual_P"], ""),
             ("Std residual", stats["std_residual_P"], ""),
         ]),
         ("Tensor polarization Q", [
             ("Mean RPE", stats["mean_RPE_Q"], "%"),
+            ("Median RPE", stats["median_RPE_Q_int"], "%"),
             ("Std RPE", stats["std_RPE_Q"], "%"),
             ("Mean residual", stats["mean_residual_Q"], ""),
             ("Std residual", stats["std_residual_Q"], ""),
@@ -517,6 +653,11 @@ def main() -> None:
 
     model, model_meta = load_combined_model(MODEL_PATH, device, SCALING_FILE)
     events, df = load_test_events(TEST_FILE)
+    print(
+        f"Features={model.feature_names}  target_mode={model.target_mode}  "
+        f"(using checkpoint X_mean/X_std)",
+        flush=True,
+    )
 
     if bool(model_meta.get("targets_precalibrated", True)):
         print("Evaluating against pre-calibrated NPZ/P/Q test targets", flush=True)
@@ -539,17 +680,18 @@ def main() -> None:
 
     if model.target_mode == "pq":
         p_true_bins, q_true_bins, p_true, q_true = pq_truth_from_dataframe(df)
-    elif "true_P" in df.columns and "true_Q" in df.columns:
-        p_true, q_true = df["true_P"].to_numpy(float), df["true_Q"].to_numpy(float)
-        p_true_bins = ps
-        q_true_bins = ip_true - im_true
+        p_pred_bins, q_pred_bins = p_pred, q_pred
     else:
-        p_true, q_true = integrated_polarization(ip_true, im_true)
+        # Checkpoint target_mode=iplus_iminus: raw heads are I+/I-.
+        p_pred_bins = ip_pred + im_pred
+        q_pred_bins = ip_pred - im_pred
         p_true_bins = ps
         q_true_bins = ip_true - im_true
+        # P_total/Q_total in spectra.npz are CC-calibrated integrals (different scale
+        # than nanmean(Ps)). Keep integrated metrics on the same Ps/Qs-mean scale.
+        p_true = np.nanmean(p_true_bins, axis=1)
+        q_true = np.nanmean(q_true_bins, axis=1)
 
-    p_pred_bins = p_pred
-    q_pred_bins = q_pred
     p_pred_int = np.nanmean(p_pred_bins, axis=1)
     q_pred_int = np.nanmean(q_pred_bins, axis=1)
 
@@ -591,8 +733,10 @@ def main() -> None:
         "median_RPE_Iplus": float(np.nanmedian(ip_rpe[ip_mask])),
         "median_RPE_Iminus": float(np.nanmedian(im_rpe[im_mask])),
         "mean_RPE_P": float(np.nanmean(p_rpe)),
+        "median_RPE_P_int": float(np.nanmedian(p_rpe)),
         "std_RPE_P": float(np.nanstd(p_rpe)),
         "mean_RPE_Q": float(np.nanmean(q_rpe)),
+        "median_RPE_Q_int": float(np.nanmedian(q_rpe)),
         "std_RPE_Q": float(np.nanstd(q_rpe)),
         "mean_residual_P": float(np.mean(res_p)),
         "std_residual_P": float(np.std(res_p)),

@@ -23,7 +23,7 @@ REPO_ROOT = SCRIPT_DIR.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from physics.lineshape.Lineshape import GenerateVectorLineshape  # noqa: E402
+from physics.lineshape.Lineshape import GenerateVectorLineshape
 
 NUM_SAMPLES = 1000
 SEED = 42
