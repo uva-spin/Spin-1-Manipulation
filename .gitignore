@@ -233,3 +233,8 @@ models/
 
 *.pkl
 *.npz
+
+spectrum_pq_results/
+spectrum_pq_results_*/
+single_bin_pq_results/
+single_bin_pq_results_*/
