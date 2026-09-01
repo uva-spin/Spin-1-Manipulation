@@ -4,7 +4,7 @@ Evaluate the combined per-bin model on test lineshapes.
 Loads Voigt-burn ``spectra.npz`` (N×2×bins I+/I−, plus p0 / P_total / Q_total).
 
 Run:
-  python ml/test-binning.py
+  python ml/rivanna/test-binning.py
 """
 
 from __future__ import annotations
@@ -22,12 +22,12 @@ import pandas as pd
 import torch
 import torch.nn as nn
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
-ML_DIR = REPO_ROOT / "ml"
+RIVANNA_DIR = Path(__file__).resolve().parent
+REPO_ROOT = RIVANNA_DIR.parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
-if str(ML_DIR) not in sys.path:
-    sys.path.insert(0, str(ML_DIR))
+if str(RIVANNA_DIR) not in sys.path:
+    sys.path.insert(0, str(RIVANNA_DIR))
 
 from single_bin import (
     BinModel as LinearBinModel,
@@ -36,7 +36,6 @@ from single_bin import (
     load_bin_model_state_dict,
 )
 
-# Floor used when combining per-bin X_std; dims at this scale never varied in training.
 _DEGENERATE_X_STD = 1e-6
 # spectra.npz source codes (Data_Creation/rivanna/common.py)
 SOURCE_SSRF = 0
@@ -233,7 +232,7 @@ def load_test_npz(path: str, *, ssrf_only: bool = True) -> pd.DataFrame:
             q_total = q_total[keep]
         n = int(iplus.shape[0])
 
-    # Match train NPZ encoding: AFP / non-ssRF → gamma_rf=0, n_steps=0.
+    # AFP / non-ssRF rows use gamma_rf=0, n_steps=0 in train NPZs.
     gamma_rf = np.empty(n, dtype=np.float32)
     n_steps = np.empty(n, dtype=np.float32)
     for i in range(n):
@@ -282,7 +281,7 @@ def load_test_events(
 
 
 # ---------------------------------------------------------------------------
-# Model (must match ml/single_bin.py + ml/combine_single_bin_models.py)
+# Model (must match rivanna/single_bin.py + combine_single_bin_models.py)
 # ---------------------------------------------------------------------------
 
 
@@ -371,7 +370,6 @@ class Combined500BinModel(nn.Module):
         )
         self._X_mean = torch.from_numpy(x_mean).float()
         self._X_std = torch.from_numpy(x_std).float()
-        # Dims that never varied in that bin's training data (std floored to ~1e-12).
         self._X_std_degenerate = self._X_std <= _DEGENERATE_X_STD
         self._Out0_mean = torch.from_numpy(out0_m).float()
         self._Out0_std = torch.from_numpy(out0_s).float()
@@ -383,8 +381,6 @@ class Combined500BinModel(nn.Module):
         mean = self._X_mean[model_idx].to(x.device)
         std = self._X_std[model_idx].to(x.device)
         degenerate = self._X_std_degenerate[model_idx].to(x.device)
-        # Edge bins never saw non-zero gamma_rf/n_steps in training; forcing those
-        # dims to the train mean keeps z=0 instead of (10-0)/1e-12 explosions.
         x_aligned = torch.where(degenerate, mean.expand_as(x), x)
         x_norm = (x_aligned - mean) / (std + 1e-12)
         if self.feature_clip_z > 0:
@@ -682,13 +678,10 @@ def main() -> None:
         p_true_bins, q_true_bins, p_true, q_true = pq_truth_from_dataframe(df)
         p_pred_bins, q_pred_bins = p_pred, q_pred
     else:
-        # Checkpoint target_mode=iplus_iminus: raw heads are I+/I-.
         p_pred_bins = ip_pred + im_pred
         q_pred_bins = ip_pred - im_pred
         p_true_bins = ps
         q_true_bins = ip_true - im_true
-        # P_total/Q_total in spectra.npz are CC-calibrated integrals (different scale
-        # than nanmean(Ps)). Keep integrated metrics on the same Ps/Qs-mean scale.
         p_true = np.nanmean(p_true_bins, axis=1)
         q_true = np.nanmean(q_true_bins, axis=1)
 

@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 import sys
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -29,7 +27,6 @@ def q_at_bin(iplus: np.ndarray, iminus: np.ndarray, bin_idx: int) -> float:
     iplus_theta = iplus[bin_idx] + iplus[len(iplus) - bin_idx - 1]
     iminus_theta = iminus[bin_idx] + iminus[len(iminus) - bin_idx - 1]
     return float(iplus_theta - iminus_theta)
-    # return float(abs(iplus[bin_idx] - iminus[bin_idx]))
 
 
 def total_signal_area(iplus: np.ndarray, iminus: np.ndarray) -> float:
@@ -175,12 +172,7 @@ def find_best_rf_amp_for_bin(
             continue
         ps_try, iplus_try, iminus_try = burned
         q_try_bin = q_at_bin(iplus_try, iminus_try, bin_idx)
-        print(f"rf_amp: {rf_amp}, q_try_bin: {q_try_bin}, best_q_bin: {best_q_bin}")
         if q_try_bin > best_q_bin:
-            print(
-                f"New best RF amp: {rf_amp:.6e}, "
-                f"delta_q_bin: {q_try_bin - baseline_q_bin:.6e}"
-            )
             best_q_bin = q_try_bin
             best_rf_amp = float(rf_amp)
             best_ps = ps_try
