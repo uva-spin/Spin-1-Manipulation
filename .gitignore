@@ -233,6 +233,7 @@ models/
 
 *.pkl
 *.npz
+*.out
 
 spectrum_pq_results/
 spectrum_pq_results_*/
