@@ -364,7 +364,7 @@ def main():
     num_bins = args.num_bins
     max_bins = args.max_bins if args.max_bins is not None else num_bins
     max_bins = min(max_bins, num_bins)
-    # Load data: prefer binning data (Ps -> Iplus, Iminus) from ssRFData
+    # Load data: prefer binning data (Ps -> Iplus, Iminus)
     train_path = os.path.join(args.data_dir, "binning_training.pkl")
     test_path = os.path.join(args.data_dir, "binning_testing.pkl")
 

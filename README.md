@@ -14,8 +14,8 @@ The typical workflow is: **simulate physics → generate training data → train
 | [`physics/`](physics/README.md) | NMR lineshape math and the realtime spin-1 rate-equation model |
 | [`Data_Creation/`](Data_Creation/README.md) | Scripts that generate labeled spectra for ML training |
 | [`Data_Creation/rivanna/`](Data_Creation/rivanna/README.md) | **Primary data pipeline** — self-contained, cluster-ready |
-| [`ml/`](ml/README.md) | Per-bin MLPs, full-spectrum models, RL burn policies |
-| [`ml/rivanna/`](ml/rivanna/README.md) | Cluster training and evaluation for per-bin models |
+| [`ml/`](ml/README.md) | Per-bin MLPs, full-spectrum models, RL burn policies, Seq2Seq models |
+| [`ml/rivanna/`](ml/rivanna/README.md) | Cluster training and evaluation of models on supercomputing cluster |
 | [`analysis/`](analysis/README.md) | Small visualization utilities (optional) |
 
 ## Quick start
@@ -93,7 +93,7 @@ On the Rivanna cluster, submit the SLURM scripts in `Data_Creation/rivanna/` and
 | Denoising autoencoder on Ps | [`ml/README.md`](ml/README.md) → `dae.py` |
 | RL burn policy (DQN) | `python ml/dqn.py --episodes 100 --polarization 0.45` |
 | Greedy incremental Q optimizer | `python ml/opt_q.py` |
-| Legacy lookup-table data | [`Data_Creation/README.md`](Data_Creation/README.md) |
+| Legacy lookup-table for previous iteration of predicting P and Q (doesn't work in regions where I- > I+ initially) | [`Data_Creation/lookup_table.py`](Data_Creation/lookup_table.py) |
 
 ## Glossary
 
@@ -115,5 +115,4 @@ On the Rivanna cluster, submit the SLURM scripts in `Data_Creation/rivanna/` and
 ## Notes
 
 - Large artifacts (`*.npz`, `*.pth`, `results/`, `data/`) are gitignored. Generate them locally or on the cluster.
-- The repo is mid-reorganization: **`Data_Creation/rivanna/`** and **`ml/rivanna/`** are the current production paths. Older scripts at the `Data_Creation/` and `ml/` roots remain for experiments.
-- Some legacy scripts reference modules that are no longer in the tree (for example `physics/afp.py`). Prefer the rivanna pipeline for new work.
+- **`Data_Creation/rivanna/`** and **`ml/rivanna/`** are the production paths.

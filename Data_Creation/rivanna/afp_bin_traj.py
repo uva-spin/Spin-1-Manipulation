@@ -1,11 +1,10 @@
 import argparse
-import random
 from pathlib import Path
 
 import numpy as np
 
-from bin_paths import afp_shard_path, afp_spectrum_shard_path
-from shard_store import save_afp_shard, save_afp_spectrum_shard
+from bin_paths import afp_shard_path
+from shard_store import save_afp_shard
 from train_bins import organize_afp_shards
 from burn_selection import (
     is_manipulation_shard_bin,
@@ -25,7 +24,6 @@ from common import (
     AFP_EFFICIENCY,
     AFP_N_RELAX,
     AFP_SHARD_DIR,
-    AFP_STEP_SUBSAMPLE,
     AFP_TRAIN_DIR,
     AFP_WINDOW,
     BURN_R_MAX,
@@ -38,12 +36,6 @@ from common import (
     P_MAX,
     P_MIN,
     P_STEP,
-    SEED,
-    SPECTRUM_AFP_SHARD_DIR,
-    SOURCE_AFP,
-    SOURCE_UNMANIP,
-    UNMANIP_TRAIN_FRACTION,
-    effective_afp_step_subsample,
     is_burn_bin,
 )
 from model_bridge import (
@@ -60,15 +52,12 @@ from model_bridge import (
     restore_touched_intensity_area,
 )
 
-from ssrf_bin_traj import run_unmanipulated_polarization
-
 R_MIN = F_MIN
 R_MAX = F_MAX
 N_RELAX = AFP_N_RELAX
 
 DEFAULT_SHARD_DIR = AFP_SHARD_DIR
 DEFAULT_TRAIN_DIR = AFP_TRAIN_DIR
-DEFAULT_SPECTRUM_SHARD_DIR = SPECTRUM_AFP_SHARD_DIR
 
 
 def run_one_polarization(
@@ -358,78 +347,9 @@ def run_one_bin(
     return out
 
 
-def run_one_bin_spectrum(
-    bin_idx: int,
-    *,
-    p_values: np.ndarray,
-    num_bins: int = NUM_BINS,
-    dt: float = DT,
-    n_relax: int = N_RELAX,
-    afp_window: int = AFP_WINDOW,
-    afp_efficiency: float = AFP_EFFICIENCY,
-    step_subsample: int = AFP_STEP_SUBSAMPLE,
-    unmanip_fraction: float = UNMANIP_TRAIN_FRACTION,
-    seed: int = SEED,
-) -> dict:
-    """Full-spectrum AFP trajectories with step subsampling metadata."""
-    rng = random.Random(int(seed))
-    effective_sub = effective_afp_step_subsample(int(n_relax), int(step_subsample))
-    base = run_one_bin(
-        bin_idx,
-        p_values=p_values,
-        num_bins=num_bins,
-        dt=dt,
-        n_relax=n_relax,
-        afp_window=afp_window,
-        afp_efficiency=afp_efficiency,
-        capture_spectrum=True,
-        step_subsample=effective_sub,
-    )
-    n_base = int(base["p_values"].size)
-    n_unmanip = 0
-    if float(unmanip_fraction) > 0.0 and n_base > 0:
-        n_unmanip = max(1, int(round(float(unmanip_fraction) * n_base / max(1e-12, 1.0 - float(unmanip_fraction)))))
-        for _ in range(n_unmanip):
-            p0 = float(rng.choice(np.asarray(p_values, dtype=float)))
-            traj = run_unmanipulated_polarization(p0, num_bins=num_bins)
-            old_n = int(base["p_values"].size)
-            t_max_old = int(base["ps"].shape[1])
-            n = 1
-            t_max_new = max(t_max_old, n)
-            num_b = int(base["num_bins"])
-
-            def _pad2(arr: np.ndarray) -> np.ndarray:
-                out = np.full((old_n + 1, t_max_new), np.nan, dtype=float)
-                out[:old_n, : arr.shape[1]] = arr
-                return out
-
-            def _pad3(arr: np.ndarray) -> np.ndarray:
-                out = np.full((old_n + 1, t_max_new, num_b), np.nan, dtype=float)
-                out[:old_n, : arr.shape[1]] = arr
-                return out
-
-            base["p_values"] = np.concatenate([base["p_values"], [p0]])
-            base["n_steps"] = np.concatenate([base["n_steps"], [n]])
-            base["skipped"] = np.concatenate([base["skipped"], [False]])
-            for key in ("ps", "iplus", "iminus", "ps_m", "iplus_m", "iminus_m"):
-                base[key] = _pad2(base[key])
-                base[key][old_n, :n] = np.asarray(traj[key], dtype=float)
-            for key in ("ps_full", "iplus_full", "iminus_full"):
-                if key in base:
-                    padded = _pad3(base[key])
-                    padded[old_n, :n] = np.asarray(traj[key], dtype=float)[:n]
-                    base[key] = padded
-
-    base["dataset"] = "afp_spectrum_bin_v2"
-    base["n_unmanip_samples"] = n_unmanip
-    base["source_unmanip"] = SOURCE_UNMANIP
-    base["source_afp"] = SOURCE_AFP
-    return base
-
-
 def build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
-        description="Per-bin AFP + relaxation trajectory worker / organizer (v2)"
+        description="Per-bin AFP + relaxation worker (writes afp_bin_XXXX.npz shards)"
     )
     p.add_argument("--bin-idx", type=int, default=None)
     p.add_argument(
@@ -448,30 +368,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--n-relax", type=int, default=N_RELAX)
     p.add_argument("--afp-window", type=int, default=AFP_WINDOW)
     p.add_argument("--afp-efficiency", type=float, default=AFP_EFFICIENCY)
-    p.add_argument(
-        "--spectrum-mode",
-        action="store_true",
-        help="Store full 500-bin spectra at each timestep",
-    )
-    p.add_argument(
-        "--step-subsample",
-        type=int,
-        default=AFP_STEP_SUBSAMPLE,
-        help=(
-            "Keep every Nth AFP relax step when combining (spectrum mode). "
-            "Forced to 1 when --n-relax is 0 (instant flip only)."
-        ),
-    )
-    p.add_argument(
-        "--unmanip-fraction",
-        type=float,
-        default=UNMANIP_TRAIN_FRACTION,
-        help=(
-            "Fraction of unmanipulated equilibrium samples injected into spectrum "
-            "shards (default 0; prefer combine_spectrum_train --unmanip-dir)"
-        ),
-    )
-    p.add_argument("--seed", type=int, default=SEED)
     p.add_argument("--skip-if-exists", action="store_true")
     p.add_argument("--strict", action="store_true")
     return p
@@ -501,11 +397,7 @@ def main(argv: list[str] | None = None) -> None:
             "Provide --bin-idx <int>, or set SLURM_ARRAY_TASK_ID, or pass --organize"
         )
 
-    out = (
-        afp_spectrum_shard_path(args.shard_dir, bin_idx)
-        if args.spectrum_mode
-        else afp_shard_path(args.shard_dir, bin_idx)
-    )
+    out = afp_shard_path(args.shard_dir, bin_idx)
     if args.skip_if_exists and out.is_file():
         print(f"Skipping existing shard {out}", flush=True)
         return
@@ -532,41 +424,23 @@ def main(argv: list[str] | None = None) -> None:
         )
         return
 
-    effective_sub = effective_afp_step_subsample(int(args.n_relax), int(args.step_subsample))
     print(
-        f"bin_idx={bin_idx}  n_P={p_values.size}  spectrum_mode={bool(args.spectrum_mode)}  "
-        f"step_subsample={effective_sub} (requested={int(args.step_subsample)})  "
-        f"unmanip_fraction={float(args.unmanip_fraction):.3f}  "
+        f"bin_idx={bin_idx}  n_P={p_values.size}  "
         f"P=[{args.p_min},{args.p_max}] step={args.p_step}  "
         f"dt={args.dt}  n_relax={args.n_relax}  "
         f"afp_window={args.afp_window}  eff={args.afp_efficiency}",
         flush=True,
     )
-    if args.spectrum_mode:
-        result = run_one_bin_spectrum(
-            bin_idx,
-            p_values=p_values,
-            num_bins=args.num_bins,
-            dt=args.dt,
-            n_relax=args.n_relax,
-            afp_window=args.afp_window,
-            afp_efficiency=args.afp_efficiency,
-            step_subsample=effective_sub,
-            unmanip_fraction=float(args.unmanip_fraction),
-            seed=int(args.seed),
-        )
-        save_afp_spectrum_shard(result, out, extra_meta=shape_meta(shape))
-    else:
-        result = run_one_bin(
-            bin_idx,
-            p_values=p_values,
-            num_bins=args.num_bins,
-            dt=args.dt,
-            n_relax=args.n_relax,
-            afp_window=args.afp_window,
-            afp_efficiency=args.afp_efficiency,
-        )
-        save_afp_shard(result, out, extra_meta=shape_meta(shape))
+    result = run_one_bin(
+        bin_idx,
+        p_values=p_values,
+        num_bins=args.num_bins,
+        dt=args.dt,
+        n_relax=args.n_relax,
+        afp_window=args.afp_window,
+        afp_efficiency=args.afp_efficiency,
+    )
+    save_afp_shard(result, out, extra_meta=shape_meta(shape))
     print(
         f"Wrote {out}  mirror={result['mirror_idx']}  "
         f"afp_subset={list(result['afp_subset'])}  "

@@ -11,7 +11,7 @@
 #   sbatch afp_traj_array.slurm
 #   sbatch combine_all_train.slurm
 
-#SBATCH --job-name=dulya-v2-combine-all
+#SBATCH --job-name=combine-all-train
 #SBATCH --partition=standard
 #SBATCH -A spinquest_standard
 #SBATCH --nodes=1
@@ -54,7 +54,7 @@ n_ssrf="$(find "${SSRF_SHARD_DIR}" -maxdepth 1 -name 'ssrf_bin_*.npz' 2>/dev/nul
 n_afp="$(find "${AFP_SHARD_DIR}" -maxdepth 1 -name 'afp_bin_*.npz' 2>/dev/null | wc -l | tr -d ' ')"
 n_unmanip="$(find "${UNMANIP_DIR}" -maxdepth 1 -name 'unmanip_bin_*.npz' 2>/dev/null | wc -l | tr -d ' ')"
 
-echo "Combining Dulya v2 ssRF + AFP + unmanip -> ${OUTPUT_DIR}"
+echo "Combining ssRF + AFP + unmanip -> ${OUTPUT_DIR}"
 echo "ssRF shards: ${SSRF_SHARD_DIR} (${n_ssrf})"
 echo "AFP shards:  ${AFP_SHARD_DIR} (${n_afp})"
 echo "Unmanip:     ${UNMANIP_DIR} (${n_unmanip})"

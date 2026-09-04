@@ -1,4 +1,4 @@
-"""Shared constants for Dulya-fit v2 data generation."""
+"""Shared constants for data generation."""
 
 from pathlib import Path
 from typing import Optional
@@ -113,28 +113,8 @@ SSRF_TRAIN_DIR = DATA_DIR / "ssrf_train"
 AFP_SHARD_DIR = DATA_DIR / "afp_shards"
 AFP_TRAIN_DIR = DATA_DIR / "afp_train"
 UNMANIP_TRAIN_DIR = DATA_DIR / "unmanip_train"
-# Full-spectrum shards (ssrf_spectrum_bin_*.npz) live alongside trajectory shards.
-SPECTRUM_SSRF_SHARD_DIR = SSRF_SHARD_DIR
-SPECTRUM_AFP_SHARD_DIR = AFP_SHARD_DIR
-SPECTRUM_TRAIN_DIR = DATA_DIR / "spectrum_train"
-SPECTRUM_TRAIN_NPZ = SPECTRUM_TRAIN_DIR / "spectrum_train.npz"
-SSRF_SPECTRUM_ROWS_DIR = DATA_DIR / "ssrf_spectrum_rows"
-AFP_SPECTRUM_ROWS_DIR = DATA_DIR / "afp_spectrum_rows"
-UNMANIP_SPECTRUM_ROWS_DIR = DATA_DIR / "unmanip_spectrum_rows"
-# Unified per-bin train files (source 0=ssrf, 1=afp, 2=unmanipulated).
 COMBINED_TRAIN_ALL_DIR = DATA_DIR / "combined_train_all"
-# Full-spectrum training coverage defaults.
-MULTI_BURN_MIN = 2
-MULTI_BURN_MAX = 5
 AFP_STEP_SUBSAMPLE = 50
-# Authoritative unmanip rows come from unmanip_bin_XXXX.npz at combine time.
-UNMANIP_TRAIN_FRACTION = 0.0
-DEFAULT_RANDOM_SSRF_SAMPLES = 0
-# Hybrid spectrum sampling: dense Cartesian on every Nth burn bin; MC elsewhere.
-SPECTRUM_DENSE_BIN_STRIDE = 5
-SPECTRUM_MC_DRAWS_PER_BIN = 2
-SPECTRUM_MAX_TRAIN_ROWS = 5_000_000
-SPECTRUM_MIN_BURN_BIN_COVERAGE = 0.95
 
 
 def effective_afp_step_subsample(
@@ -145,9 +125,8 @@ def effective_afp_step_subsample(
     if int(n_relax) <= 0:
         return 1
     return max(1, int(step_subsample))
-# Spectrum mode: small batches (full (t, bins) cubes). Trajectory mode: larger OK.
-DEFAULT_SSRF_COMBO_BATCH_SIZE = 64
-DEFAULT_SSRF_TRAJ_COMBO_BATCH_SIZE = 2048
+
+
 SOURCE_SSRF = 0
 SOURCE_AFP = 1
 SOURCE_UNMANIP = 2
@@ -159,7 +138,6 @@ BURN_BIN_CHOICES = np.flatnonzero(
 ).astype(int)
 # Burn-window bins that must not be ssRF/AFP manipulation centers (R≈0).
 EXCLUDED_MANIPULATION_BURN_BINS = frozenset({250})
-# Inclusive SLURM array bounds for burn-window spectrum jobs (R in (BURN_R_MIN, BURN_R_MAX)).
 BURN_BIN_ARRAY_START = int(BURN_BIN_CHOICES[0]) if BURN_BIN_CHOICES.size else 0
 BURN_BIN_ARRAY_END = int(BURN_BIN_CHOICES[-1]) if BURN_BIN_CHOICES.size else -1
 
@@ -177,18 +155,6 @@ def burn_bin_position(bin_idx: int) -> Optional[int]:
 
 def is_burn_bin(bin_idx: int) -> bool:
     return burn_bin_position(bin_idx) is not None
-
-
-def is_dense_spectrum_bin(
-    bin_idx: int,
-    *,
-    stride: int = SPECTRUM_DENSE_BIN_STRIDE,
-) -> bool:
-    """True for every ``stride``-th burn-window bin (Cartesian γ×steps coverage)."""
-    pos = burn_bin_position(bin_idx)
-    if pos is None:
-        return False
-    return (int(pos) % max(1, int(stride))) == 0
 
 
 def intensity_pq(

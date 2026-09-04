@@ -1,20 +1,14 @@
 """
-Per-bin Dulya-fit v2 MC data (unmanipulated / ssRF / AFP).
+Local dispatcher for unmanipulated / ssRF / AFP workers.
 
-Thin dispatcher — prefer the standalone workers for parallel runs:
+Prefer the standalone workers for parallel runs:
   ssrf_bin_traj.py, afp_bin_traj.py, unmanipulated_bin_lineshape.py
 
 Examples (from this directory):
   python generate_bins.py --mode unmanipulated
   python generate_bins.py --mode ssrf --bin-idx 172
   python generate_bins.py --mode afp --bin-idx 172
-  python generate_bins.py --mode ssrf --organize
   python generate_bins.py --mode all --smoke --bin-idx 208
-
-SLURM (submit from this directory):
-  sbatch ssrf_traj_array.slurm
-  sbatch afp_traj_array.slurm
-  sbatch unmanipulated_bin_array.slurm
 """
 
 from __future__ import annotations
@@ -23,7 +17,6 @@ import argparse
 from pathlib import Path
 from typing import Literal
 
-import _bootstrap
 from afp_bin_traj import main as afp_main
 from common import (
     AFP_N_RELAX,
@@ -49,7 +42,7 @@ ModeName = Literal["unmanipulated", "ssrf", "afp", "all"]
 
 def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="Per-bin Dulya-fit v2 MC data dispatcher (see mode-specific scripts)"
+        description="Per-bin data dispatcher (see mode-specific scripts)"
     )
     p.add_argument(
         "--mode",

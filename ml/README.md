@@ -7,7 +7,8 @@ Models and reinforcement-learning agents for predicting NMR spectra after manipu
 | Script | What it learns | Input data |
 |--------|----------------|------------|
 | [`rivanna/single_bin.py`](rivanna/README.md) | One small MLP **per spectral bin** | `train_bin_XXXX.npz` from data pipeline |
-| `spectrum_pq.py` | Full-spectrum P/Q prediction | `spectra.npz` (N × 2 × 500) |
+| `spectrum_pq.py` | Full-spectrum → scalar P/Q totals | `spectra.npz` (N × 2 × 500) |
+| `seq2seq_pq.py` | LSTM over Ps sequence → scalar P/Q totals | `spectra.npz` (N × 2 × 500) |
 | `dae.py` | Denoising autoencoder on Ps | `spectra.npz` |
 | `binning_model.py` | All 500 bins in one script (local) | Combined NPZ directory |
 
@@ -69,6 +70,20 @@ python ml/spectrum_pq.py \
   --out-dir ml/spectrum_pq_results
 ```
 
+## Seq2seq P/Q (totals)
+
+BiLSTM encoder that reads the manipulated Ps spectrum (plus burn
+power / steps) and predicts integrated **P_total** and **Q_total**,
+matching the targets used by ``spectrum_pq.py``.
+
+```bash
+python ml/seq2seq_pq.py \
+  --spectra ml/data/spectra.npz \
+  --max-samples 20000 \
+  --epochs 30 \
+  --out-dir ml/seq2seq_pq_results
+```
+
 ## Denoising autoencoder
 
 ```bash
@@ -103,7 +118,8 @@ pip install numpy scipy matplotlib pandas torch tqdm
 ml/
 ├── rivanna/                  Cluster training + evaluation (start here)
 ├── combine_single_bin_models.py   Merge per-bin checkpoints
-├── spectrum_pq.py            Full-spectrum model
+├── spectrum_pq.py            Full-spectrum → P/Q totals
+├── seq2seq_pq.py             LSTM sequence → P/Q totals
 ├── dae.py                    Denoising autoencoder
 ├── dqn.py, sarsa.py, q-learning.py, opt_q.py   RL / optimization
 ├── binning_model.py          Monolithic local trainer (all bins)

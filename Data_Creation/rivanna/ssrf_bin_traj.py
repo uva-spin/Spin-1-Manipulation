@@ -1,16 +1,10 @@
 import argparse
-import random
 from pathlib import Path
 
 import numpy as np
 
-from bin_paths import (
-    ssrf_shard_complete,
-    ssrf_shard_path,
-    ssrf_spectrum_shard_complete,
-    ssrf_spectrum_shard_path,
-)
-from shard_store import save_ssrf_shard, save_ssrf_spectrum_shard
+from bin_paths import ssrf_shard_complete, ssrf_shard_path
+from shard_store import save_ssrf_shard
 from train_bins import organize_ssrf_shards
 from bin_setup import (
     equilibrium_lineshape,
@@ -23,7 +17,6 @@ from common import (
     BURN_R_MAX,
     BURN_R_MIN,
     BURN_STEPS_STEP,
-    DEFAULT_RANDOM_SSRF_SAMPLES,
     DIFFUSION_SCALE,
     DT,
     F_MAX,
@@ -33,8 +26,6 @@ from common import (
     GAMMA_RF_STEP,
     MAX_BURN_STEPS,
     MIN_BURN_STEPS,
-    MULTI_BURN_MAX,
-    MULTI_BURN_MIN,
     NUM_BINS,
     P_MAX,
     P_MIN,
@@ -45,17 +36,11 @@ from common import (
     RF_MODE,
     RF_MODE_PHYSICAL_VOIGT,
     RF_MODE_SINGLE_BIN,
-    SEED,
-    SPECTRUM_DENSE_BIN_STRIDE,
-    SPECTRUM_MC_DRAWS_PER_BIN,
-    SPECTRUM_SSRF_SHARD_DIR,
     SSRF_SHARD_DIR,
     SSRF_TRAIN_DIR,
-    UNMANIP_TRAIN_FRACTION,
     burn_steps_grid,
     gamma_rf_grid,
     is_burn_bin,
-    is_dense_spectrum_bin,
 )
 from burn_selection import (
     is_manipulation_shard_bin,
@@ -79,30 +64,6 @@ R_MAX = F_MAX
 
 DEFAULT_SHARD_DIR = SSRF_SHARD_DIR
 DEFAULT_TRAIN_DIR = SSRF_TRAIN_DIR
-DEFAULT_SPECTRUM_SHARD_DIR = SPECTRUM_SSRF_SHARD_DIR
-
-def _build_mc_combos(
-    p_values: np.ndarray,
-    gamma_values: np.ndarray,
-    steps_values: np.ndarray,
-    *,
-    draws_per_p: int,
-    seed: int,
-    bin_idx: int,
-    ):
-
-    rng = random.Random(int(seed) + 1_000_003 * int(bin_idx))
-    n_draws = max(1, int(draws_per_p))
-    combos = np.array([
-    (float(p0), float(g), int(n_burn))
-    for p0 in np.asarray(p_values, dtype=float)
-    for g, n_burn in zip(
-        rng.choice(gamma_values, size=n_draws, replace=False),
-        rng.choice(steps_values, size=n_draws, replace=False),
-        )
-    ])
-    return combos
-
 
 
 def run_one_polarization(
@@ -292,137 +253,6 @@ def run_one_polarization(
     return out
 
 
-def run_multi_burn_polarization(
-    polarization: float,
-    burn_bins: list[int],
-    gamma_values: list[float],
-    n_steps_values: list[int],
-    *,
-    num_bins: int = NUM_BINS,
-    dt: float = DT,
-    rf_mode: str = RF_MODE,
-    gaussian_fwhm_R: float = RF_GAUSSIAN_FWHM_R,
-    lorentzian_fwhm_R: float = RF_LORENTZIAN_FWHM_R,
-    diffusion_scale: float = DIFFUSION_SCALE,
-    shape_params: dict[str, float] | None = None,
-    capture_spectrum: bool = True,
-) -> dict:
-    """Apply a sequence of ssRF burns and record the full spectrum each macro-step."""
-    if len(burn_bins) != len(gamma_values) or len(burn_bins) != len(n_steps_values):
-        raise ValueError("burn_bins, gamma_values, and n_steps_values must match")
-    if not burn_bins:
-        raise ValueError("burn_bins must be non-empty")
-
-    P = float(polarization)
-    shape = shape_params if shape_params is not None else get_shape_params()
-    f = np.linspace(float(F_MIN), float(F_MAX), int(num_bins))
-    _, ip_fit, im_fit = equilibrium_lineshape(P, f, shape)
-    ip_fit = np.asarray(ip_fit, dtype=float)
-    im_fit = np.asarray(im_fit, dtype=float)
-    to_spin1, from_spin1 = spin1_scale_factors(P, ip_fit, im_fit)
-    iplus0 = ip_fit * to_spin1
-    iminus0 = im_fit * to_spin1
-    primary_bin = int(burn_bins[0])
-    mirror_idx = mirror_bin_idx(int(num_bins), primary_bin)
-
-    model = build_spin1_model(
-        iplus0,
-        iminus0,
-        polarization=P,
-        num_bins=num_bins,
-        dt=dt,
-        rf_enabled=True,
-        relax_enabled=True,
-        diffusion_scale=diffusion_scale,
-        rf_gaussian_fwhm_R=gaussian_fwhm_R,
-        rf_lorentzian_fwhm_R=lorentzian_fwhm_R,
-    )
-    p_initial, q_initial = level_pq(model)
-
-    total_steps = int(sum(int(n) for n in n_steps_values))
-    t_len = total_steps + 1
-    ps = np.empty(t_len, dtype=float)
-    iplus = np.empty(t_len, dtype=float)
-    iminus = np.empty(t_len, dtype=float)
-    ps_m = np.empty(t_len, dtype=float)
-    iplus_m = np.empty(t_len, dtype=float)
-    iminus_m = np.empty(t_len, dtype=float)
-    ps_full = iplus_full = iminus_full = None
-    if capture_spectrum:
-        ps_full = np.empty((t_len, int(num_bins)), dtype=float)
-        iplus_full = np.empty((t_len, int(num_bins)), dtype=float)
-        iminus_full = np.empty((t_len, int(num_bins)), dtype=float)
-
-    def _record_step(k: int) -> None:
-        ip, im, ps_k, ip_m, im_m, ps_mk = intensities_at_bins(
-            model, primary_bin, mirror_idx
-        )
-        iplus[k], iminus[k], ps[k] = ip, im, ps_k
-        iplus_m[k], iminus_m[k], ps_m[k] = ip_m, im_m, ps_mk
-        if capture_spectrum and ps_full is not None:
-            ip_s, im_s, ps_s = full_spectrum_intensities(model)
-            iplus_full[k] = ip_s
-            iminus_full[k] = im_s
-            ps_full[k] = ps_s
-
-    _record_step(0)
-    k = 1
-    used_mode = str(rf_mode)
-    for burn_idx, gamma_rf, n_burn in zip(burn_bins, gamma_values, n_steps_values):
-        used_mode = configure_ssrf_burn(
-            model,
-            int(burn_idx),
-            float(gamma_rf),
-            rf_mode=rf_mode,
-            gaussian_fwhm_R=gaussian_fwhm_R,
-            lorentzian_fwhm_R=lorentzian_fwhm_R,
-        )
-        n_sub, dt_sub = euler_n_sub(float(gamma_rf), float(dt))
-        for _ in range(int(n_burn)):
-            for _ in range(n_sub):
-                model.step_once(dt=dt_sub, rf_on=True, dnp_on=False, copy=False)
-            _record_step(k)
-            k += 1
-
-    p_final, q_final = level_pq(model)
-    return traj_to_fit_scale(
-        {
-            "polarization": float(polarization),
-            "skipped": False,
-            "n_steps": t_len,
-            "burn_steps": int(total_steps),
-            "gamma_rf": float(gamma_values[-1]),
-            "ps": ps,
-            "iplus": iplus,
-            "iminus": iminus,
-            "ps_m": ps_m,
-            "iplus_m": iplus_m,
-            "iminus_m": iminus_m,
-            "ps0": float(ps[0]),
-            "stop_reason": "multi_burn",
-            "rf_mode": used_mode,
-            "ip_spectrum0": None if iplus_full is None else iplus_full[0].copy(),
-            "im_spectrum0": None if iminus_full is None else iminus_full[0].copy(),
-            "ip_spectrum": None if iplus_full is None else iplus_full[-1].copy(),
-            "im_spectrum": None if iminus_full is None else iminus_full[-1].copy(),
-            "ps_full": ps_full,
-            "iplus_full": iplus_full,
-            "iminus_full": iminus_full,
-            "frequency": f,
-            "p_initial": float(p_initial),
-            "q_initial": float(q_initial),
-            "p_final": float(p_final),
-            "q_final": float(q_final),
-            "center_bin": primary_bin,
-            "n_burns": int(len(burn_bins)),
-            "burn_bins": [int(b) for b in burn_bins],
-            "gamma_values": [float(g) for g in gamma_values],
-            "steps_values": [int(n) for n in n_steps_values],
-        },
-        from_spin1,
-    )
-
-
 def run_unmanipulated_polarization(
     polarization: float,
     *,
@@ -485,16 +315,12 @@ def _run_one_bin_combos(
     gaussian_fwhm_R: float,
     lorentzian_fwhm_R: float,
     diffusion_scale: float,
-    capture_spectrum: bool,
-    spectrum_only: bool = False,
-    combo_offset: int = 0,
-    combo_total: int | None = None,
+    capture_spectrum: bool = False,
 ) -> dict:
     """Run ssRF for an explicit combo list (one bin)."""
     bin_idx = int(bin_idx)
     mirror_idx = mirror_bin_idx(int(num_bins), bin_idx)
     n_samples = len(combos)
-    total = int(combo_total) if combo_total is not None else n_samples
 
     p_out = np.empty(n_samples, dtype=float)
     gamma_out = np.empty(n_samples, dtype=float)
@@ -502,15 +328,12 @@ def _run_one_bin_combos(
     n_steps = np.zeros(n_samples, dtype=np.int32)
     skipped = np.zeros(n_samples, dtype=bool)
 
-    ps = iplus = iminus = ps_m = iplus_m = iminus_m = None
-    if (capture_spectrum and not spectrum_only) or not capture_spectrum:
-        ps = np.full((n_samples, t_max), np.nan)
-        iplus = np.full((n_samples, t_max), np.nan)
-        iminus = np.full((n_samples, t_max), np.nan)
-        ps_m = np.full((n_samples, t_max), np.nan)
-        iplus_m = np.full((n_samples, t_max), np.nan)
-        iminus_m = np.full((n_samples, t_max), np.nan)
-
+    ps = np.full((n_samples, t_max), np.nan)
+    iplus = np.full((n_samples, t_max), np.nan)
+    iminus = np.full((n_samples, t_max), np.nan)
+    ps_m = np.full((n_samples, t_max), np.nan)
+    iplus_m = np.full((n_samples, t_max), np.nan)
+    iminus_m = np.full((n_samples, t_max), np.nan)
     ps_full = iplus_full = iminus_full = None
     if capture_spectrum:
         ps_full = np.full((n_samples, t_max, int(num_bins)), np.nan)
@@ -519,20 +342,16 @@ def _run_one_bin_combos(
 
     track_lo = np.zeros(n_samples, dtype=bool)
     track_hi = np.zeros(n_samples, dtype=bool)
-    ps_lo = iplus_lo = iminus_lo = None
-    ps_hi = iplus_hi = iminus_hi = None
-    if (capture_spectrum and not spectrum_only) or not capture_spectrum:
-        ps_lo = np.full((n_samples, t_max), np.nan)
-        iplus_lo = np.full((n_samples, t_max), np.nan)
-        iminus_lo = np.full((n_samples, t_max), np.nan)
-        ps_hi = np.full((n_samples, t_max), np.nan)
-        iplus_hi = np.full((n_samples, t_max), np.nan)
-        iminus_hi = np.full((n_samples, t_max), np.nan)
+    ps_lo = np.full((n_samples, t_max), np.nan)
+    iplus_lo = np.full((n_samples, t_max), np.nan)
+    iminus_lo = np.full((n_samples, t_max), np.nan)
+    ps_hi = np.full((n_samples, t_max), np.nan)
+    iplus_hi = np.full((n_samples, t_max), np.nan)
+    iminus_hi = np.full((n_samples, t_max), np.nan)
 
     for j, (p0, g, n_burn) in enumerate(combos):
-        global_j = int(combo_offset) + j
         print(
-            f"  [{global_j + 1}/{total}] P={p0:+.3f}  gamma={g:.3f}  n_steps={n_burn}",
+            f"  [{j + 1}/{n_samples}] P={p0:+.3f}  gamma={g:.3f}  n_steps={n_burn}",
             flush=True,
         )
         traj = run_one_polarization(
@@ -556,20 +375,19 @@ def _run_one_bin_combos(
         n_steps[j] = n
         if n <= 0:
             continue
-        if ps is not None:
-            ps[j, :n] = traj["ps"]
-            iplus[j, :n] = traj["iplus"]
-            iminus[j, :n] = traj["iminus"]
-            ps_m[j, :n] = traj["ps_m"]
-            iplus_m[j, :n] = traj["iplus_m"]
-            iminus_m[j, :n] = traj["iminus_m"]
+        ps[j, :n] = traj["ps"]
+        iplus[j, :n] = traj["iplus"]
+        iminus[j, :n] = traj["iminus"]
+        ps_m[j, :n] = traj["ps_m"]
+        iplus_m[j, :n] = traj["iplus_m"]
+        iminus_m[j, :n] = traj["iminus_m"]
         track_lo[j] = bool(traj.get("track_lo", False))
         track_hi[j] = bool(traj.get("track_hi", False))
-        if track_lo[j] and ps_lo is not None and traj.get("ps_lo") is not None:
+        if track_lo[j] and traj.get("ps_lo") is not None:
             ps_lo[j, :n] = traj["ps_lo"]
             iplus_lo[j, :n] = traj["iplus_lo"]
             iminus_lo[j, :n] = traj["iminus_lo"]
-        if track_hi[j] and ps_hi is not None and traj.get("ps_hi") is not None:
+        if track_hi[j] and traj.get("ps_hi") is not None:
             ps_hi[j, :n] = traj["ps_hi"]
             iplus_hi[j, :n] = traj["iplus_hi"]
             iminus_hi[j, :n] = traj["iminus_hi"]
@@ -592,26 +410,21 @@ def _run_one_bin_combos(
         "burn_steps": burn_steps_out,
         "n_steps": n_steps,
         "skipped": skipped,
+        "ps": ps,
+        "iplus": iplus,
+        "iminus": iminus,
+        "ps_m": ps_m,
+        "iplus_m": iplus_m,
+        "iminus_m": iminus_m,
+        "track_lo": track_lo,
+        "track_hi": track_hi,
+        "ps_lo": ps_lo,
+        "iplus_lo": iplus_lo,
+        "iminus_lo": iminus_lo,
+        "ps_hi": ps_hi,
+        "iplus_hi": iplus_hi,
+        "iminus_hi": iminus_hi,
     }
-    if ps is not None:
-        out.update(
-            {
-                "ps": ps,
-                "iplus": iplus,
-                "iminus": iminus,
-                "ps_m": ps_m,
-                "iplus_m": iplus_m,
-                "iminus_m": iminus_m,
-                "track_lo": track_lo,
-                "track_hi": track_hi,
-                "ps_lo": ps_lo,
-                "iplus_lo": iplus_lo,
-                "iminus_lo": iminus_lo,
-                "ps_hi": ps_hi,
-                "iplus_hi": iplus_hi,
-                "iminus_hi": iminus_hi,
-            }
-        )
     if capture_spectrum:
         out["ps_full"] = ps_full
         out["iplus_full"] = iplus_full
@@ -625,7 +438,6 @@ def run_one_bin(
     p_values: np.ndarray,
     gamma_values: np.ndarray | None = None,
     steps_values: np.ndarray | None = None,
-    combos: list[tuple[float, float, int]] | np.ndarray | None = None,
     num_bins: int = NUM_BINS,
     dt: float = DT,
     rf_mode: str = RF_MODE,
@@ -633,9 +445,8 @@ def run_one_bin(
     lorentzian_fwhm_R: float = RF_LORENTZIAN_FWHM_R,
     diffusion_scale: float = DIFFUSION_SCALE,
     capture_spectrum: bool = False,
-    spectrum_only: bool = False,
 ) -> dict:
-    """Run ssRF for one burn bin (Cartesian grid or explicit combo list)."""
+    """Run ssRF for one burn bin on a Cartesian P × gamma × n_steps grid."""
     bin_idx = int(bin_idx)
     if bin_idx < 0 or bin_idx >= int(num_bins):
         raise ValueError(f"bin_idx={bin_idx} out of range for num_bins={num_bins}")
@@ -654,10 +465,7 @@ def run_one_bin(
     if gamma_values.size == 0 or steps_values.size == 0 or p_values.size == 0:
         raise ValueError("p_values, gamma_values, and steps_values must be non-empty")
 
-    if combos is None:
-        combo_list = _build_combos(p_values, gamma_values, steps_values)
-    else:
-        combo_list = list(combos)
+    combo_list = _build_combos(p_values, gamma_values, steps_values)
     t_max = int(np.max(steps_values)) + 1
     out = _run_one_bin_combos(
         combo_list,
@@ -670,7 +478,6 @@ def run_one_bin(
         lorentzian_fwhm_R=lorentzian_fwhm_R,
         diffusion_scale=diffusion_scale,
         capture_spectrum=capture_spectrum,
-        spectrum_only=spectrum_only,
     )
     out["gamma_values"] = np.asarray(gamma_values, dtype=float)
     out["steps_values"] = np.asarray(steps_values, dtype=np.int32)
@@ -682,128 +489,9 @@ def run_one_bin(
     return out
 
 
-def run_one_bin_spectrum(
-    bin_idx: int,
-    *,
-    p_values: np.ndarray,
-    gamma_values: np.ndarray | None = None,
-    steps_values: np.ndarray | None = None,
-    num_bins: int = NUM_BINS,
-    dt: float = DT,
-    rf_mode: str = RF_MODE,
-    gaussian_fwhm_R: float = RF_GAUSSIAN_FWHM_R,
-    lorentzian_fwhm_R: float = RF_LORENTZIAN_FWHM_R,
-    diffusion_scale: float = DIFFUSION_SCALE,
-    random_samples: int = DEFAULT_RANDOM_SSRF_SAMPLES,
-    multi_burn: bool = False,
-    seed: int | None = None,
-    gamma_min: float = GAMMA_RF_MIN,
-    gamma_max: float = GAMMA_RF_MAX,
-    steps_min: int = MIN_BURN_STEPS,
-    steps_max: int = MAX_BURN_STEPS,
-    unmanip_fraction: float = 0.0,
-) -> dict:
-    """Generate full-spectrum ssRF trajectories with optional random/multi-burn samples."""
-    _ = float(unmanip_fraction)
-    rng = random.Random(seed)
-    base = run_one_bin(
-        bin_idx,
-        p_values=p_values,
-        gamma_values=gamma_values,
-        steps_values=steps_values,
-        num_bins=num_bins,
-        dt=dt,
-        rf_mode=rf_mode,
-        gaussian_fwhm_R=gaussian_fwhm_R,
-        lorentzian_fwhm_R=lorentzian_fwhm_R,
-        diffusion_scale=diffusion_scale,
-        capture_spectrum=True,
-    )
-
-    n_random = int(random_samples)
-    for _ in range(n_random):
-        p0 = float(rng.choice(np.asarray(p_values, dtype=float)))
-        g, n_burn = random.uniform(gamma_min, gamma_max), random.randint(steps_min, steps_max)
-        if multi_burn:
-            n_burns = rng.randint(MULTI_BURN_MIN, MULTI_BURN_MAX)
-            burn_bins = np.array([bin_idx] * n_burns)
-            gammas = np.array([random.uniform(gamma_min, gamma_max) for _ in range(n_burns)])
-            steps = np.array([random.randint(steps_min, steps_max) for _ in range(n_burns)])
-            traj = run_multi_burn_polarization(
-                p0,
-                burn_bins,
-                gammas,
-                steps,
-                num_bins=num_bins,
-                dt=dt,
-                rf_mode=rf_mode,
-                gaussian_fwhm_R=gaussian_fwhm_R,
-                lorentzian_fwhm_R=lorentzian_fwhm_R,
-                diffusion_scale=diffusion_scale,
-                capture_spectrum=True,
-            )
-        else:
-            traj = run_one_polarization(
-                bin_idx,
-                p0,
-                num_bins=num_bins,
-                dt=dt,
-                gamma_rf=g,
-                n_steps=n_burn,
-                rf_mode=rf_mode,
-                gaussian_fwhm_R=gaussian_fwhm_R,
-                lorentzian_fwhm_R=lorentzian_fwhm_R,
-                diffusion_scale=diffusion_scale,
-                capture_spectrum=True,
-            )
-
-        n = int(traj["n_steps"])
-        if n <= 0 or bool(traj.get("skipped", False)):
-            continue
-        old_n = int(base["p_values"].size)
-        t_max_old = int(base["ps"].shape[1])
-        t_max_new = max(t_max_old, n)
-        num_b = int(base["num_bins"])
-
-        if t_max_new > t_max_old:
-            for key in ("ps", "iplus", "iminus", "ps_m", "iplus_m", "iminus_m"):
-                widened = np.full((old_n, t_max_new), np.nan, dtype=float)
-                widened[:, :t_max_old] = base[key]
-                base[key] = widened
-            for key in ("ps_full", "iplus_full", "iminus_full"):
-                if key in base and base[key] is not None:
-                    widened = np.full((old_n, t_max_new, num_b), np.nan, dtype=float)
-                    widened[:, :t_max_old, :] = base[key]
-                    base[key] = widened
-
-        base["p_values"] = np.concatenate([base["p_values"], [float(traj["polarization"])]])
-        base["gamma_rf"] = np.concatenate(
-            [base["gamma_rf"], [float(traj.get("gamma_rf", 0.0))]]
-        )
-        base["burn_steps"] = np.concatenate(
-            [base["burn_steps"], [int(traj.get("burn_steps", 0))]]
-        )
-        base["n_steps"] = np.concatenate([base["n_steps"], [n]])
-        base["skipped"] = np.concatenate([base["skipped"], [False]])
-        for key in ("ps", "iplus", "iminus", "ps_m", "iplus_m", "iminus_m"):
-            row = np.full((1, t_max_new), np.nan, dtype=float)
-            row[0, :n] = np.asarray(traj[key], dtype=float)
-            base[key] = np.concatenate([base[key], row], axis=0)
-        for key in ("ps_full", "iplus_full", "iminus_full"):
-            if key in base and traj.get(key) is not None:
-                row = np.full((1, t_max_new, num_b), np.nan, dtype=float)
-                row[0, :n] = np.asarray(traj[key], dtype=float)[:n]
-                base[key] = np.concatenate([base[key], row], axis=0)
-
-    base["dataset"] = "ssrf_spectrum_bin_v2"
-    base["n_random_samples"] = n_random
-    base["multi_burn"] = bool(multi_burn)
-    return base
-
-
 def build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
-        description="Per-bin ssRF discrete (gamma, n_steps) burn worker / organizer (v2)"
+        description="Per-bin ssRF burn worker (writes ssrf_bin_XXXX.npz shards)"
     )
     p.add_argument("--bin-idx", type=int, default=None)
     p.add_argument(
@@ -835,57 +523,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--gauss-fwhm", type=float, default=RF_GAUSSIAN_FWHM_R)
     p.add_argument("--lorentz-fwhm", type=float, default=RF_LORENTZIAN_FWHM_R)
     p.add_argument("--diffusion-scale", type=float, default=DIFFUSION_SCALE)
-    p.add_argument(
-        "--spectrum-mode",
-        action="store_true",
-        help="Store full 500-bin spectra at each timestep (spectrum shard format)",
-    )
-    p.add_argument(
-        "--random-samples",
-        type=int,
-        default=DEFAULT_RANDOM_SSRF_SAMPLES,
-        help="Extra random (gamma_rf, n_steps) trajectories per bin (spectrum mode)",
-    )
-    p.add_argument(
-        "--multi-burn",
-        action="store_true",
-        help="Generate multi-burn (2-5 burns) random trajectories (spectrum mode)",
-    )
-    p.add_argument(
-        "--dense-bin-stride",
-        type=int,
-        default=SPECTRUM_DENSE_BIN_STRIDE,
-        help=(
-            "In --spectrum-mode, every Nth burn-window bin gets full Cartesian "
-            "P×gamma×steps; others use --mc-draws-per-bin on-grid MC samples"
-        ),
-    )
-    p.add_argument(
-        "--mc-draws-per-bin",
-        type=int,
-        default=SPECTRUM_MC_DRAWS_PER_BIN,
-        help="On-grid (gamma, n_steps) draws per polarization for non-dense spectrum bins",
-    )
-    p.add_argument(
-        "--force-dense",
-        action="store_true",
-        help="Force Cartesian P×gamma×steps for this bin (ignore dense-bin stride)",
-    )
-    p.add_argument(
-        "--force-mc",
-        action="store_true",
-        help="Force MC sampling for this bin (ignore dense-bin stride)",
-    )
-    p.add_argument(
-        "--unmanip-fraction",
-        type=float,
-        default=UNMANIP_TRAIN_FRACTION,
-        help=(
-            "Fraction of unmanipulated equilibrium samples injected into spectrum "
-            "shards (default 0; prefer combine_spectrum_train --unmanip-dir)"
-        ),
-    )
-    p.add_argument("--seed", type=int, default=SEED)
     p.add_argument("--skip-if-exists", action="store_true")
     p.add_argument("--strict", action="store_true")
     return p
@@ -895,7 +532,7 @@ def main(argv: list[str] | None = None) -> None:
     args = build_arg_parser().parse_args(argv)
 
     if args.organize:
-        result = organize_ssrf_shards(
+        organize_ssrf_shards(
             args.shard_dir,
             args.output_dir,
             num_bins=args.num_bins,
@@ -909,16 +546,9 @@ def main(argv: list[str] | None = None) -> None:
             "Provide --bin-idx <int>, or set SLURM_ARRAY_TASK_ID, or pass --organize"
         )
 
-    out = (
-        ssrf_spectrum_shard_path(args.shard_dir, bin_idx)
-        if args.spectrum_mode
-        else ssrf_shard_path(args.shard_dir, bin_idx)
-    )
-    if args.skip_if_exists:
-        if args.spectrum_mode and ssrf_spectrum_shard_complete(args.shard_dir, bin_idx):
-            return
-        if not args.spectrum_mode and ssrf_shard_complete(args.shard_dir, bin_idx):
-            return
+    out = ssrf_shard_path(args.shard_dir, bin_idx)
+    if args.skip_if_exists and ssrf_shard_complete(args.shard_dir, bin_idx):
+        return
 
     if not is_burn_bin(bin_idx):
         print(
@@ -929,7 +559,6 @@ def main(argv: list[str] | None = None) -> None:
         return
 
     shape = get_shape_params()
-
     p_values = positive_polarization_grid(args.p_min, args.p_max, args.p_step)
     if int(p_values.size) == 0:
         raise SystemExit("No positive polarization values in the requested P grid")
@@ -941,120 +570,39 @@ def main(argv: list[str] | None = None) -> None:
         )
         return
 
-    g_values = gamma_rf_grid(args.gamma_min, args.gamma_max, args.gamma_step)
-    s_values = burn_steps_grid(args.steps_min, args.steps_max, args.steps_step)
-    if bool(args.force_dense) and bool(args.force_mc):
-        raise SystemExit("Pass at most one of --force-dense / --force-mc")
-    mc_combos: list[tuple[float, float, int]] | np.ndarray | None = None
-    if args.spectrum_mode:
-        if bool(args.force_dense):
-            dense_mode = True
-        elif bool(args.force_mc):
-            dense_mode = False
-        else:
-            dense_mode = is_dense_spectrum_bin(
-                bin_idx, stride=int(args.dense_bin_stride)
-            )
-        if dense_mode:
-            sample_mode = "dense_cartesian"
-        else:
-            mc_combos = _build_mc_combos(
-                p_values,
-                g_values,
-                s_values,
-                draws_per_p=int(args.mc_draws_per_bin),
-                seed=int(args.seed),
-                bin_idx=int(bin_idx),
-            )
-            sample_mode = "mc_on_grid"
-    else:
-        dense_mode = True
-        sample_mode = "traj_cartesian"
-    extra_meta = shape_meta(
+    result = run_one_bin(
+        bin_idx,
+        p_values=p_values,
+        gamma_values=gamma_rf_grid(args.gamma_min, args.gamma_max, args.gamma_step),
+        steps_values=burn_steps_grid(args.steps_min, args.steps_max, args.steps_step),
+        num_bins=args.num_bins,
+        dt=args.dt,
+        rf_mode=str(args.rf_mode),
+        gaussian_fwhm_R=float(args.gauss_fwhm),
+        lorentzian_fwhm_R=float(args.lorentz_fwhm),
+        diffusion_scale=float(args.diffusion_scale),
+    )
+    if not np.any(~np.asarray(result["skipped"], dtype=bool)):
+        print(
+            f"No samples at bin_idx={bin_idx}: all polarizations skipped; "
+            "not writing shard",
+            flush=True,
+        )
+        return
+    burn_meta = shape_meta(
         shape,
         rf_mode=str(args.rf_mode),
         gaussian_fwhm_R=float(args.gauss_fwhm),
         lorentzian_fwhm_R=float(args.lorentz_fwhm),
         diffusion_scale=float(args.diffusion_scale),
     )
-    extra_meta["spectrum_sample_mode"] = sample_mode
-    extra_meta["dense_bin_stride"] = int(args.dense_bin_stride)
-    extra_meta["mc_draws_per_bin"] = int(args.mc_draws_per_bin)
-    if args.spectrum_mode:
-        if dense_mode:
-            result = run_one_bin_spectrum(
-                bin_idx,
-                p_values=p_values,
-                gamma_values=g_values,
-                steps_values=s_values,
-                num_bins=args.num_bins,
-                dt=args.dt,
-                rf_mode=str(args.rf_mode),
-                gaussian_fwhm_R=float(args.gauss_fwhm),
-                lorentzian_fwhm_R=float(args.lorentz_fwhm),
-                diffusion_scale=float(args.diffusion_scale),
-                random_samples=int(args.random_samples),
-                multi_burn=bool(args.multi_burn),
-                unmanip_fraction=float(args.unmanip_fraction),
-                seed=int(args.seed),
-                gamma_min=float(args.gamma_min),
-                gamma_max=float(args.gamma_max),
-                steps_min=int(args.steps_min),
-                steps_max=int(args.steps_max),
-            )
-        else:
-            result = run_one_bin(
-                bin_idx,
-                p_values=p_values,
-                gamma_values=g_values,
-                steps_values=s_values,
-                combos=mc_combos,
-                num_bins=args.num_bins,
-                dt=args.dt,
-                rf_mode=str(args.rf_mode),
-                gaussian_fwhm_R=float(args.gauss_fwhm),
-                lorentzian_fwhm_R=float(args.lorentz_fwhm),
-                diffusion_scale=float(args.diffusion_scale),
-                capture_spectrum=True,
-                spectrum_only=True,
-            )
-            result["dataset"] = "ssrf_spectrum_bin_v2"
-        save_ssrf_spectrum_shard(
-            result,
-            out,
-            extra_meta=extra_meta,
-        )
-    else:
-        result = run_one_bin(
-            bin_idx,
-            p_values=p_values,
-            gamma_values=g_values,
-            steps_values=s_values,
-            num_bins=args.num_bins,
-            dt=args.dt,
-            rf_mode=str(args.rf_mode),
-            gaussian_fwhm_R=float(args.gauss_fwhm),
-            lorentzian_fwhm_R=float(args.lorentz_fwhm),
-            diffusion_scale=float(args.diffusion_scale),
-        )
-        if not np.any(~np.asarray(result["skipped"], dtype=bool)):
-            print(
-                f"No samples at bin_idx={bin_idx}: all polarizations skipped; "
-                "not writing shard",
-                flush=True,
-            )
-            return
-        burn_meta = shape_meta(
-            shape,
-            rf_mode=str(args.rf_mode),
-            gaussian_fwhm_R=float(args.gauss_fwhm),
-            lorentzian_fwhm_R=float(args.lorentz_fwhm),
-            diffusion_scale=float(args.diffusion_scale),
-        )
-        burn_meta["burn_selection"] = "all_burn_window_bins"
-        burn_meta["polarization_grid"] = "positive_only"
-        save_ssrf_shard(result, out, extra_meta=burn_meta)
+    burn_meta["burn_selection"] = "all_burn_window_bins"
+    burn_meta["polarization_grid"] = "positive_only"
+    save_ssrf_shard(result, out, extra_meta=burn_meta)
 
 
 if __name__ == "__main__":
     main()
+
+
+

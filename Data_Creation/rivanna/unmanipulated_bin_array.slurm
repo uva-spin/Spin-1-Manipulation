@@ -1,13 +1,13 @@
 #!/bin/bash
-# Dulya-fit v2 unmanipulated lineshape array — one spectral bin per task.
+# Unmanipulated lineshape array — one spectral bin per task.
 #
-# Submit from THIS directory (dulya_fit_v2/):
+# Submit from THIS directory:
 #   sbatch unmanipulated_bin_array.slurm
 #
-# Then flatten to row NPZ for combine_spectrum_rows.slurm:
-#   sbatch --dependency=afterok:${ARRAY_JOB_ID} flatten_unmanip_spectrum_rows.slurm
+# Merge with ssRF/AFP shards:
+#   sbatch combine_all_train.slurm
 
-#SBATCH --job-name=dulya-v2-unmanip-bin
+#SBATCH --job-name=unmanip-bin
 #SBATCH --array=0-499
 #SBATCH --partition=standard
 #SBATCH -A spinquest_standard
@@ -51,7 +51,7 @@ if [[ -z "${SLURM_ARRAY_TASK_ID:-}" ]]; then
   exit 1
 fi
 
-echo "Dulya v2 unmanipulated bin ${SLURM_ARRAY_TASK_ID} on $(hostname)"
+echo "Unmanipulated bin ${SLURM_ARRAY_TASK_ID} on $(hostname)"
 echo "Pkg dir: ${PKG_DIR}"
 
 apptainer run --bind "${PKG_DIR}:${PKG_DIR}" --pwd "${PKG_DIR}" \

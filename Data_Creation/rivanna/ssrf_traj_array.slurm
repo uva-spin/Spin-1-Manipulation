@@ -1,6 +1,5 @@
 #!/bin/bash
-# Dulya-fit v4 ssRF per-bin burn array (burn-window bins only, R in (-3,3)).
-# Each task sweeps P at fixed gamma_rf=50 and n_steps=50 (lineshape on R in [-6,6]).
+# ssRF per-bin burn array (burn-window bins, R in (-3, 3)).
 #
 # Submit from THIS directory:
 #   sbatch ssrf_traj_array.slurm
@@ -10,7 +9,7 @@
 #
 # Throttle concurrency: --array=125-374%64
 
-#SBATCH --job-name=dulya-v4-ssrf-traj
+#SBATCH --job-name=ssrf-traj
 #SBATCH --array=125-374
 #SBATCH --partition=standard
 #SBATCH -A spinquest_standard
@@ -62,7 +61,7 @@ if [[ -z "${SLURM_ARRAY_TASK_ID:-}" ]]; then
   exit 1
 fi
 
-echo "Dulya v4 ssRF traj bin ${SLURM_ARRAY_TASK_ID} on $(hostname)"
+echo "ssRF traj bin ${SLURM_ARRAY_TASK_ID} on $(hostname)"
 echo "Pkg dir: ${PKG_DIR}"
 echo "Shard dir: ${SHARD_DIR}"
 echo "P: [${P_MIN}, ${P_MAX}] step=${P_STEP}"
