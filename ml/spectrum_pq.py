@@ -15,10 +15,7 @@ import torch.utils.data as data
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parent
-DEFAULT_SPECTRA_CANDIDATES = (
-    REPO_ROOT / "Data_Creation" / "dae_voigt_burn_spectra" / "spectra.npz",
-    SCRIPT_DIR / "dae_voigt_burn_spectra" / "spectra.npz",
-)
+DEFAULT_SPECTRA_PATH = REPO_ROOT / "Data_Creation" / "dae_voigt_burn_spectra" / "spectra.npz"
 DEFAULT_OUTPUT_DIR = SCRIPT_DIR / "spectrum_pq_results_v3"
 
 NUM_BINS = 500
@@ -49,7 +46,6 @@ RPE_ABS_EPS = 1e-10
 
 
 def compute_rpe(pred: np.ndarray, true: np.ndarray) -> np.ndarray:
-    """Relative percent error |pred-true|/|true| * 100; NaN where |true| too small."""
     pred_a = np.asarray(pred, dtype=np.float64).reshape(-1)
     true_a = np.asarray(true, dtype=np.float64).reshape(-1)
     rpe = np.full_like(true_a, np.nan, dtype=np.float64)
@@ -94,7 +90,6 @@ def polarization_range_stats(
     bands: tuple[tuple[float, float], ...] = POL_ABS_BANDS,
     ref_name: str = "abs_P",
 ) -> list[dict[str, Any]]:
-    """RPE and residual summaries for P and Q inside each |polarization| band."""
     pred_p = np.asarray(pred_p, dtype=np.float64).reshape(-1)
     true_p = np.asarray(true_p, dtype=np.float64).reshape(-1)
     pred_q = np.asarray(pred_q, dtype=np.float64).reshape(-1)
@@ -107,11 +102,7 @@ def polarization_range_stats(
 
     rows: list[dict[str, Any]] = []
     for lo, hi in bands:
-        # Last band is closed on the right so 95-100% is included when present.
-        if hi >= 0.999:
-            mask = (ref >= lo) & (ref <= hi)
-        else:
-            mask = (ref >= lo) & (ref < hi)
+        mask = (ref >= lo) & (ref < hi) if hi < 0.999 else (ref >= lo) & (ref <= hi)
         label = f"{int(round(lo * 100))}-{int(round(hi * 100))}%"
         p_rpe = _summary_stats(rpe_p[mask])
         q_rpe = _summary_stats(rpe_q[mask])
@@ -170,7 +161,6 @@ def print_range_stats_table(rows: list[dict[str, Any]], *, title: str) -> None:
 
 
 def save_range_stats_csv(rows: list[dict[str, Any]], path: Path) -> None:
-    path = Path(path)
     if not rows:
         return
     keys = list(rows[0].keys())
@@ -188,8 +178,6 @@ def save_range_stats_csv(rows: list[dict[str, Any]], path: Path) -> None:
 
 
 class SpectrumPQModel(nn.Module):
-    """Shared MLP trunk over Ps-spectrum features with separate P and Q heads."""
-
     def __init__(
         self,
         input_dim: int,
@@ -232,7 +220,6 @@ def relative_weighted_loss(
     std: float,
     eps: float = REL_LOSS_EPS,
 ) -> torch.Tensor:
-    """Mean |pred-true| / (|true|+eps) on the denormalized scale (RPE-aligned)."""
     pred = pred_z * float(std) + float(mean)
     true = true_z * float(std) + float(mean)
     return torch.mean(torch.abs(pred - true) / (torch.abs(true) + float(eps)))
@@ -244,17 +231,12 @@ def resolve_spectra_path(spectra: Path | None) -> Path:
         if path.is_file():
             return path
         raise FileNotFoundError(f"Spectra NPZ not found: {path}")
-    for candidate in DEFAULT_SPECTRA_CANDIDATES:
-        if candidate.is_file():
-            return candidate
-    tried = ", ".join(str(p) for p in DEFAULT_SPECTRA_CANDIDATES)
-    raise FileNotFoundError(
-        "Spectra NPZ not found. Pass --spectra PATH. Tried: " + tried
-    )
+    if not path.is_file():
+        raise FileNotFoundError(f"Spectra NPZ not found: {path}")
+    return path
 
 
 def load_spectrum_pq_npz(path: Path) -> dict[str, np.ndarray]:
-    path = Path(path)
     required = ("spectra", "applied_power", "n_steps", "P_total", "Q_total")
     with np.load(path, allow_pickle=False) as raw:
         missing = [k for k in required if k not in raw.files]
@@ -326,26 +308,13 @@ def prepare_datasets(
     test_frac: float = TEST_FRAC,
     seed: int = SEED,
 ) -> tuple[data.TensorDataset, data.TensorDataset, data.TensorDataset, dict[str, Any]]:
-    spectra = np.asarray(arrays["spectra"], dtype=np.float32) # Shape: (N, 2, num_bins)
-    ps = spectra[:, 0, :] + spectra[:, 1, :]                 # Shape: (N, num_bins)
-    
-
-    ### add noise here
-
-    signal_mean = ps.mean(axis=0)
-    snr = signal_mean**2 / (1e-6**2)
-
-    print(f"Max SNR: {snr.max()}")
-    print(f"Min SNR: {snr.min()}")
-    print(f"Mean SNR: {snr.mean()}")
-    print(f"Median SNR: {np.median(snr)}")
-    print(f"Std SNR: {snr.std()}")
-
+    spectra = np.asarray(arrays["spectra"], dtype=np.float32)
+    ps = spectra[:, 0, :] + spectra[:, 1, :]
     ps += np.random.normal(0, 1e-4, size=ps.shape)
-    
+
     applied_power = np.asarray(arrays["applied_power"], dtype=np.float32).reshape(-1, 1)
     n_steps = np.asarray(arrays["n_steps"], dtype=np.float32).reshape(-1, 1)
-    
+
     y_p = np.asarray(arrays["P_total"], dtype=np.float32).reshape(-1)
     y_q = np.asarray(arrays["Q_total"], dtype=np.float32).reshape(-1)
     
@@ -414,7 +383,6 @@ def clone_state_dict(model: nn.Module) -> dict[str, torch.Tensor]:
 
 
 def _stats_for_checkpoint(stats: dict[str, Any]) -> dict[str, Any]:
-    """Drop large index arrays; keep normalization scalars needed for inference."""
     skip = {"train_idx", "val_idx", "test_idx", "p0_test"}
     return {k: v for k, v in stats.items() if k not in skip}
 
@@ -428,7 +396,6 @@ def save_best_checkpoint(
     best_val_loss: float,
     best_epoch: int,
 ) -> None:
-    path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(
         {
@@ -448,7 +415,6 @@ def load_best_checkpoint(
     *,
     device: torch.device = DEVICE,
 ) -> tuple[SpectrumPQModel, dict[str, Any]]:
-    path = Path(path)
     ckpt = torch.load(path, map_location=device, weights_only=False)
     hidden_dims = tuple(int(h) for h in ckpt["hidden_dims"])
     input_dim = int(ckpt.get("input_dim", ckpt["stats"]["input_dim"]))
@@ -612,7 +578,6 @@ def train_model(
             )
             break
 
-    # Prefer the on-disk best checkpoint so prediction uses lowest-loss weights.
     if checkpoint_path is not None and Path(checkpoint_path).is_file():
         model, ckpt = load_best_checkpoint(checkpoint_path, device=device)
         best_val = float(ckpt.get("best_val_loss", best_val))
@@ -745,7 +710,6 @@ def save_plots(
     metrics: dict[str, float | np.ndarray | list],
     plots_dir: Path,
 ) -> list[Path]:
-    plots_dir = Path(plots_dir)
     plots_dir.mkdir(parents=True, exist_ok=True)
     saved: list[Path] = []
 
@@ -848,7 +812,6 @@ def _select_example_indices(
     pred_q: np.ndarray,
     seed: int = SEED,
 ) -> np.ndarray:
-    """Pick a mix of low/median/high-error examples spread across |P|."""
     n = int(n_test)
     k = min(max(1, int(n_examples)), n)
     if k >= n:
@@ -880,8 +843,6 @@ def save_example_signal_plots(
     n_examples: int = 6,
     seed: int = SEED,
 ) -> list[Path]:
-    """Plot manipulated I+/I-/Ps with predicted vs true integrated P and Q."""
-    plots_dir = Path(plots_dir)
     plots_dir.mkdir(parents=True, exist_ok=True)
     examples_dir = plots_dir / "examples"
     examples_dir.mkdir(parents=True, exist_ok=True)
@@ -1029,7 +990,7 @@ def save_example_signal_plots(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Train and evaluate Spectrum P/Q Model.")
-    parser.add_argument("--spectra", type=Path, default=None, help="Path to spectra.npz")
+    parser.add_argument("--spectra", type=Path, default=DEFAULT_SPECTRA_PATH, help="Path to spectra.npz")
     parser.add_argument("--out-dir", type=Path, default=DEFAULT_OUTPUT_DIR, help="Output directory for results")
     parser.add_argument("--epochs", type=int, default=NUM_EPOCHS, help="Number of training epochs")
     parser.add_argument("--batch-size", type=int, default=BATCH_SIZE, help="Training batch size")
@@ -1046,8 +1007,8 @@ def main() -> None:
     args.out_dir.mkdir(parents=True, exist_ok=True)
     checkpoint_path = args.checkpoint or (args.out_dir / "spectrum_pq_best.pth")
 
-    spectra_path = resolve_spectra_path(args.spectra)
-    print(f"Loading {spectra_path} ...", flush=True)
+    spectra_path = args.spectra or DEFAULT_SPECTRA_PATH
+    print(f"Loading spectra from {spectra_path} ...", flush=True)
     arrays = load_spectrum_pq_npz(spectra_path)
 
     print("Preparing datasets...", flush=True)

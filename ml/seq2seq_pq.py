@@ -66,8 +66,6 @@ POL_ABS_BANDS: tuple[tuple[float, float], ...] = tuple(
 
 
 class Seq2SeqPQModel(nn.Module):
-    """BiLSTM encoder over the Ps sequence → scalar P_total and Q_total."""
-
     def __init__(
         self,
         input_size: int = 3,
@@ -102,7 +100,6 @@ class Seq2SeqPQModel(nn.Module):
                     nn.init.constant_(module.bias, 0.0)
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        # x: (B, T, C_in) → pred_p, pred_q: (B,)
         enc_out, _ = self.encoder(x)
         ctx = enc_out.mean(dim=1)
         return self.head_p(ctx).squeeze(-1), self.head_q(ctx).squeeze(-1)
@@ -124,7 +121,6 @@ def resolve_spectra_path(spectra: Path | None) -> Path:
 
 
 def load_seq2seq_npz(path: Path) -> dict[str, np.ndarray]:
-    path = Path(path)
     required = ("spectra", "applied_power", "n_steps", "P_total", "Q_total")
     with np.load(path, allow_pickle=False) as raw:
         missing = [k for k in required if k not in raw.files]
@@ -205,11 +201,9 @@ def prepare_datasets(
     perm = rng.permutation(n)
     n_test = max(1, int(round(n * float(test_frac))))
     n_val = max(1, int(round(n * float(val_frac))))
-    # Indices into the (possibly subsampled) feature arrays used by TensorDatasets.
     local_test = perm[:n_test]
     local_val = perm[n_test : n_test + n_val]
     local_train = perm[n_test + n_val :]
-    # Indices into the original NPZ rows (for example plots / metadata lookup).
     test_idx = orig_idx[local_test]
     val_idx = orig_idx[local_val]
     train_idx = orig_idx[local_train]
@@ -298,7 +292,6 @@ def relative_weighted_loss(
 
 
 def compute_rpe(pred: np.ndarray, true: np.ndarray) -> np.ndarray:
-    """Relative percent error |pred-true|/|true| * 100; NaN where |true| too small."""
     pred_a = np.asarray(pred, dtype=np.float64).reshape(-1)
     true_a = np.asarray(true, dtype=np.float64).reshape(-1)
     rpe = np.full_like(true_a, np.nan, dtype=np.float64)
@@ -343,7 +336,6 @@ def polarization_range_stats(
     bands: tuple[tuple[float, float], ...] = POL_ABS_BANDS,
     ref_name: str = "abs_P",
 ) -> list[dict[str, Any]]:
-    """RPE and residual summaries for P and Q inside each |polarization| band."""
     pred_p = np.asarray(pred_p, dtype=np.float64).reshape(-1)
     true_p = np.asarray(true_p, dtype=np.float64).reshape(-1)
     pred_q = np.asarray(pred_q, dtype=np.float64).reshape(-1)
@@ -356,11 +348,7 @@ def polarization_range_stats(
 
     rows: list[dict[str, Any]] = []
     for lo, hi in bands:
-        # Last band is closed on the right so 95-100% is included when present.
-        if hi >= 0.999:
-            mask = (ref >= lo) & (ref <= hi)
-        else:
-            mask = (ref >= lo) & (ref < hi)
+        mask = (ref >= lo) & (ref < hi) if hi < 0.999 else (ref >= lo) & (ref <= hi)
         label = f"{int(round(lo * 100))}-{int(round(hi * 100))}%"
         p_rpe = _summary_stats(rpe_p[mask])
         q_rpe = _summary_stats(rpe_q[mask])
@@ -419,7 +407,6 @@ def print_range_stats_table(rows: list[dict[str, Any]], *, title: str) -> None:
 
 
 def save_range_stats_csv(rows: list[dict[str, Any]], path: Path) -> None:
-    path = Path(path)
     if not rows:
         return
     keys = list(rows[0].keys())
@@ -449,7 +436,6 @@ def save_checkpoint(
     num_layers: int,
     dropout: float,
 ) -> None:
-    path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(
         {
@@ -469,7 +455,6 @@ def save_checkpoint(
 def load_checkpoint(
     path: Path, *, device: torch.device = DEVICE
 ) -> tuple[Seq2SeqPQModel, dict[str, Any]]:
-    path = Path(path)
     ckpt = torch.load(path, map_location=device, weights_only=False)
     model = Seq2SeqPQModel(
         input_size=int(ckpt.get("input_size", ckpt["stats"]["input_size"])),
@@ -744,7 +729,6 @@ def evaluate_model(
 
 
 def _configure_plot_style() -> None:
-    """Publication-style fonts via matplotlib mathtext (no system LaTeX required)."""
     plt.rcParams.update(
         {
             "font.family": "serif",
@@ -767,7 +751,6 @@ def _apply_axes_style(ax: Axes) -> None:
     ax.grid(True, which="major", color="white", linewidth=1.2, alpha=1.0)
     ax.set_axisbelow(True)
     for spine in ax.spines.values():
-        spine.set_visible(True)
         spine.set_color("#1f2933")
         spine.set_linewidth(1.15)
     ax.tick_params(colors="#4a5560", labelsize=9)
@@ -799,7 +782,7 @@ def _annotate_stats_box(
         "lower right": (0.98, 0.03, "right", "bottom"),
         "lower left": (0.02, 0.03, "left", "bottom"),
     }
-    x, y, ha, va = anchors.get(loc, anchors["upper right"])
+    x, y, ha, va = anchors[loc]
     ax.text(
         x,
         y,
@@ -819,7 +802,6 @@ def _annotate_stats_box(
 
 
 def save_history_json(history: dict[str, list[float]], path: Path) -> None:
-    path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {k: [float(x) for x in v] for k, v in history.items()}
     with path.open("w", encoding="utf-8") as f:
@@ -827,18 +809,17 @@ def save_history_json(history: dict[str, list[float]], path: Path) -> None:
 
 
 def load_history_json(path: Path) -> dict[str, list[float]] | None:
-    path = Path(path)
     if not path.is_file():
         return None
     with path.open("r", encoding="utf-8") as f:
         raw = json.load(f)
     if not isinstance(raw, dict) or "train_loss" not in raw:
         return None
-    out: dict[str, list[float]] = {}
-    for key, values in raw.items():
-        if isinstance(values, list):
-            out[key] = [float(x) for x in values]
-    return out
+    return {
+        key: [float(x) for x in values]
+        for key, values in raw.items()
+        if isinstance(values, list)
+    }
 
 
 def _plot_loss_curves(
@@ -847,7 +828,6 @@ def _plot_loss_curves(
     *,
     best_val_loss: float | None = None,
 ) -> Path:
-    plots_dir = Path(plots_dir)
     plots_dir.mkdir(parents=True, exist_ok=True)
     _configure_plot_style()
 
@@ -933,7 +913,6 @@ def save_plots(
     *,
     best_val_loss: float | None = None,
 ) -> list[Path]:
-    plots_dir = Path(plots_dir)
     plots_dir.mkdir(parents=True, exist_ok=True)
     saved: list[Path] = []
     _configure_plot_style()
@@ -1137,7 +1116,6 @@ def save_plots(
                     max(0.0, mean_v - std_v), color=color_sigma, lw=1.0, ls=":"
                 )
                 ax.axvline(mean_v + std_v, color=color_sigma, lw=1.0, ls=":")
-            # Focus on the bulk of the distribution when a long tail dominates.
             p99 = float(np.percentile(finite, 99))
             x_hi = max(p99 * 1.05, mean_v + 1.2 * std_v if np.isfinite(std_v) else p99)
             if np.isfinite(x_hi) and x_hi > 0:
@@ -1372,7 +1350,6 @@ def _select_example_indices(
     pred_q: np.ndarray,
     seed: int = SEED,
 ) -> np.ndarray:
-    """Pick a mix of low/median/high-error examples spread across |P|."""
     n = int(n_test)
     k = min(max(1, int(n_examples)), n)
     if k >= n:
@@ -1406,8 +1383,6 @@ def save_example_signal_plots(
     n_examples: int = N_EXAMPLE_PLOTS,
     seed: int = SEED,
 ) -> list[Path]:
-    """Plot manipulated I+/I-/Ps with predicted vs true integrated P and Q."""
-    plots_dir = Path(plots_dir)
     plots_dir.mkdir(parents=True, exist_ok=True)
     examples_dir = plots_dir / "examples"
     examples_dir.mkdir(parents=True, exist_ok=True)
