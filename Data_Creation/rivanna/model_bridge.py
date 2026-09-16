@@ -1,17 +1,10 @@
-"""Bridge Dulya equilibrium lineshapes to vendored ssrf_realtime."""
+"""Bridge Dulya equilibrium lineshapes to physics.rf."""
 
 from __future__ import annotations
 
 from typing import Optional
 
 import numpy as np
-
-from ssrf_realtime import Spin1Model, Spin1Params
-from ssrf_realtime.rate_equations_realtime import (
-    configure_physical_voigt_ssrf,
-    configure_single_bin_ssrf,
-    configure_voigt_burn_spectral_recovery,
-)
 
 from common import (
     D_SAME_0MINUS,
@@ -31,28 +24,22 @@ from common import (
     RF_MODE_SINGLE_BIN,
     ZQ_WIDTH_R,
 )
+from physics.rf import (
+    Spin1Model,
+    Spin1Params,
+    bin_averaged_voigt,
+    configure_physical_voigt_ssrf,
+    configure_single_bin_ssrf,
+    configure_voigt_burn_spectral_recovery,
+    mirror_bin_idx,
+    ssrf_touched_bins,
+)
 
+afp_touched_bins = ssrf_touched_bins
 
 PROFILE_REL_THRESHOLD = 0.01
 KERNEL_CUTOFF_WIDTHS = 3.0
 INTENSITY_DELTA_ABS_TOL = 1e-15
-
-
-def mirror_bin_idx(n_bins: int, bin_idx: int) -> int:
-    return int(n_bins) - 1 - int(bin_idx)
-
-
-def afp_touched_bins(n_bins: int, subset: list[int] | np.ndarray) -> list[int]:
-    touched: set[int] = set()
-    for i in subset:
-        touched.add(int(i))
-        touched.add(mirror_bin_idx(n_bins, int(i)))
-    return sorted(touched)
-
-
-def ssrf_touched_bins(n_bins: int, subset: list[int] | np.ndarray) -> list[int]:
-    """Packet/intensity bins ssRF changes: each burn index i also updates mirror(i)."""
-    return afp_touched_bins(n_bins, subset)
 
 
 def bins_within_R_radius(
@@ -111,12 +98,8 @@ def physical_voigt_rf_support_bins(
     rel_threshold: float = PROFILE_REL_THRESHOLD,
 ) -> list[int]:
     """Bins with non-negligible physical-R Voigt RF at the burn center."""
-    from ssrf_realtime.voigt_physical import bin_averaged_voigt
-
     grid = np.asarray(R, dtype=float)
     burn_idx = int(burn_idx)
-    if burn_idx < 0 or burn_idx >= grid.size:
-        raise ValueError(f"burn_idx={burn_idx} out of range for n_bins={grid.size}")
     dR = float(grid[1] - grid[0]) if grid.size > 1 else 1.0
     profile = bin_averaged_voigt(
         grid,
@@ -153,39 +136,32 @@ def burn_commit_touched_bins(
     burn_idx = int(burn_idx)
     if rf_mode == RF_MODE_SINGLE_BIN:
         return ssrf_touched_bins(n_bins, [burn_idx])
-    if rf_mode == RF_MODE_PHYSICAL_VOIGT:
-        if R is None:
-            raise ValueError("R grid required for physical Voigt burn commit")
-        support = physical_voigt_rf_support_bins(
-            R,
-            burn_idx,
-            gaussian_fwhm_R=gaussian_fwhm_R,
-            lorentzian_fwhm_R=lorentzian_fwhm_R,
-        )
-        touched: set[int] = set(ssrf_touched_bins(n_bins, support))
-        if include_diffusion_spillover:
-            spill_candidates = diffusion_spillover_bins(
-                R, support, zq_width_R=zq_width_R
-            )
-            if (
-                iplus is not None
-                and iminus is not None
-                and iplus_sim is not None
-                and iminus_sim is not None
-            ):
-                spill = bins_with_intensity_delta(
-                    iplus, iminus, iplus_sim, iminus_sim, spill_candidates
-                )
-            else:
-                spill = spill_candidates
-            for i in spill:
-                touched.add(int(i))
-                touched.add(mirror_bin_idx(n_bins, int(i)))
-        return sorted(touched)
-    raise ValueError(
-        f"unknown rf_mode={rf_mode!r}; expected "
-        f"{RF_MODE_PHYSICAL_VOIGT!r} or {RF_MODE_SINGLE_BIN!r}"
+    support = physical_voigt_rf_support_bins(
+        R,
+        burn_idx,
+        gaussian_fwhm_R=gaussian_fwhm_R,
+        lorentzian_fwhm_R=lorentzian_fwhm_R,
     )
+    touched: set[int] = set(ssrf_touched_bins(n_bins, support))
+    if include_diffusion_spillover:
+        spill_candidates = diffusion_spillover_bins(
+            R, support, zq_width_R=zq_width_R
+        )
+        if (
+            iplus is not None
+            and iminus is not None
+            and iplus_sim is not None
+            and iminus_sim is not None
+        ):
+            spill = bins_with_intensity_delta(
+                iplus, iminus, iplus_sim, iminus_sim, spill_candidates
+            )
+        else:
+            spill = spill_candidates
+        for i in spill:
+            touched.add(int(i))
+            touched.add(mirror_bin_idx(n_bins, int(i)))
+    return sorted(touched)
 
 
 def commit_touched_bins_only(
@@ -339,31 +315,16 @@ def configure_ssrf_burn(
         configure_single_bin_ssrf(
             model, burn_idx, gamma, apply_demo_recovery=False
         )
-        apply_shared_spectral_recovery(model)
-    elif mode == RF_MODE_PHYSICAL_VOIGT:
-        g_fwhm = (
-            RF_GAUSSIAN_FWHM_R if gaussian_fwhm_R is None else float(gaussian_fwhm_R)
-        )
-        l_fwhm = (
-            RF_LORENTZIAN_FWHM_R
-            if lorentzian_fwhm_R is None
-            else float(lorentzian_fwhm_R)
-        )
+    else:
         configure_physical_voigt_ssrf(
             model,
             burn_idx,
             gamma,
-            gaussian_fwhm_R=g_fwhm,
-            lorentzian_fwhm_R=l_fwhm,
+            gaussian_fwhm_R=RF_GAUSSIAN_FWHM_R if gaussian_fwhm_R is None else float(gaussian_fwhm_R),
+            lorentzian_fwhm_R=RF_LORENTZIAN_FWHM_R if lorentzian_fwhm_R is None else float(lorentzian_fwhm_R),
             full_spectrum_recovery=True,
         )
-        apply_shared_spectral_recovery(model)
-    else:
-        raise ValueError(
-            f"unknown rf_mode={mode!r}; expected "
-            f"{RF_MODE_PHYSICAL_VOIGT!r} or {RF_MODE_SINGLE_BIN!r}"
-        )
-    # Keep Dulya n_ref; pin recovery Boltzmann to initial P if RF drifts P.
+    apply_shared_spectral_recovery(model)
     model._sync_level_populations(capture_initial=False)
     p_init = float(model.n_plus - model.n_minus)
     model.set_recovery_boltzmann_P(p_init)

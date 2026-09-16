@@ -1,6 +1,6 @@
 # Data Creation
 
-Labeled NMR spectra for machine-learning training. **Start in [`rivanna/`](rivanna/README.md).**
+Labeled NMR spectra for machine-learning training. **Start in [`rivanna/`](rivanna/README.md).** Burn physics is [`physics.rf`](../physics/rf/README.md).
 
 ## Per-bin training data (main path)
 

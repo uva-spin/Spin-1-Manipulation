@@ -2,7 +2,7 @@
 Headless spin-1 ss-RF model.
 
 Convenience entry point for the capacity-weighted packet-population model in
-``physics/ssrf_realtime/``.
+``physics/rf/``.
 """
 
 from __future__ import annotations
@@ -12,7 +12,7 @@ from typing import List, Optional
 
 import numpy as np
 
-from . import Spin1Model, Spin1Params
+from .model import PLUS, ZERO, MINUS, Spin1Model, Spin1Params
 from .rf_profile import (
     SIGMA_BINS,
     VOIGT_GAMMA_BINS,
@@ -22,7 +22,6 @@ from .rf_profile import (
     unfreeze_rf_profile,
 )
 from .voigt_physical import discrete_bins_to_physical_fwhm
-from .model import PLUS, ZERO, MINUS
 
 
 def voigt_burn_params(**overrides) -> Spin1Params:

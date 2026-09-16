@@ -5,17 +5,19 @@ For each polarization on a grid:
   - find burn-window bins where equilibrium Q < 0 (noiseless initial lineshape)
   - ssRF: burn only at those Q < 0 centers; for each center, extract spectra at
     burn lengths 0 .. max_burn_steps from one trajectory (noise added after)
-  - AFP: flip at each Q < 0 bin with an AFP window; then relax for
+  - AFP: flip at each Q < 0 bin with an AFP window and save the immediately
+    post-flip spectrum (n_steps = 0). With ``--afp-relax``, then relax for
     0 .. max_relax_steps, emitting one full-spectrum event per selected
     relax frame (n_steps = relax steps completed after the flip)
 
 ssRF and AFP are never combined in the same event. Toggle modes with
 ``--ssrf`` / ``--no-ssrf`` and ``--afp`` / ``--no-afp``; when both are on,
-events are emitted separately.
+events are emitted separately. ``--afp-relax`` implies AFP.
 
 Saved NPZ fields:
   spectra       (N, 2, num_bins)  channel0=I+, channel1=I-
-                                  one row per ssRF burn step / AFP relax step
+                                  one row per ssRF burn step / AFP post-flip
+                                  or AFP relax step
   p0            (N,)              initial vector polarization
   P_total       (N,)              integrated lineshape P after this step
                                   (CC_total * sum(I++I-) with p0 post-correction)
@@ -32,7 +34,8 @@ Examples (from repo root):
   python Data_Creation/create_dae_voigt_burn_spectra.py --quick
   python Data_Creation/create_dae_voigt_burn_spectra.py --ssrf --afp
   python Data_Creation/create_dae_voigt_burn_spectra.py --ssrf --no-afp
-  python Data_Creation/create_dae_voigt_burn_spectra.py --afp --max-relax-steps 100
+  python Data_Creation/create_dae_voigt_burn_spectra.py --afp
+  python Data_Creation/create_dae_voigt_burn_spectra.py --afp-relax --max-relax-steps 100
   python Data_Creation/create_dae_voigt_burn_spectra.py --ssrf --max-burn-steps 150
 """
 
@@ -80,7 +83,7 @@ P_MAX = 0.6
 P_STEP = 0.05
 GAMMA_RF = 10.0
 MIN_BURN_STEPS = 0
-MAX_BURN_STEPS = 800
+MAX_BURN_STEPS = 100
 BURN_STEPS_STEP = 1
 DT = 0.0055
 
@@ -88,7 +91,7 @@ GAUSSIAN_FWHM_R = 3 * RF_GAUSSIAN_FWHM_R  # 0.090
 LORENTZIAN_FWHM_R = 3 * RF_LORENTZIAN_FWHM_R  # 0.045
 AFP_WINDOW = 8
 MIN_RELAX_STEPS = 0
-MAX_RELAX_STEPS = 10000
+MAX_RELAX_STEPS = 2000
 RELAX_STEPS_STEP = 1
 STORE_DTYPE = np.float32
 DEFAULT_SEED = 42
@@ -96,12 +99,7 @@ NOISE_LEVEL = 1e-4
 
 
 def _burn_window_bins() -> np.ndarray:
-    choices = np.asarray(BURN_BIN_CHOICES, dtype=np.int32)
-    if choices.size == 0:
-        raise RuntimeError(
-            f"No burn bins in R window ({BURN_R_MIN}, {BURN_R_MAX})"
-        )
-    return choices
+    return np.asarray(BURN_BIN_CHOICES, dtype=np.int32)
 
 
 def q_negative_bins_for_p0(
@@ -126,14 +124,7 @@ def burn_steps_values(
     step: int,
 ) -> np.ndarray:
     """Inclusive integer step grid from ``min_steps`` to ``max_steps``."""
-    n_min = int(min_steps)
-    n_max = int(max_steps)
-    n_step = int(step)
-    if n_step < 1:
-        raise ValueError(f"step stride must be >= 1, got {n_step}")
-    if n_max < n_min:
-        raise ValueError(f"max_steps ({n_max}) must be >= min_steps ({n_min})")
-    return np.arange(n_min, n_max + 1, n_step, dtype=np.int32)
+    return np.arange(int(min_steps), int(max_steps) + 1, int(step), dtype=np.int32)
 
 
 def _spectrum_totals(
@@ -256,34 +247,13 @@ def generate_ssrf_events(
             if bool(traj.get("skipped", False)):
                 continue
 
-            iplus_full = traj.get("iplus_full")
-            iminus_full = traj.get("iminus_full")
-            if iplus_full is None or iminus_full is None:
-                raise RuntimeError(
-                    f"ssRF traj missing per-step spectra for bin={bin_idx}, P={p0}"
-                )
-            iplus_full = np.asarray(iplus_full, dtype=float)
-            iminus_full = np.asarray(iminus_full, dtype=float)
-            if iplus_full.ndim != 2 or iminus_full.ndim != 2:
-                raise ValueError(
-                    f"Expected full-spectrum traj (t, bins) for bin {bin_idx}, P={p0}; "
-                    f"got I+={iplus_full.shape}, I-={iminus_full.shape}"
-                )
-            if int(iplus_full.shape[0]) < max_burn + 1:
-                raise RuntimeError(
-                    f"ssRF traj too short for bin={bin_idx}, P={p0}: "
-                    f"got {iplus_full.shape[0]} frames, need {max_burn + 1}"
-                )
+            iplus_full = np.asarray(traj["iplus_full"], dtype=float)
+            iminus_full = np.asarray(traj["iminus_full"], dtype=float)
 
             for burn_steps in sorted(step_set):
                 k = int(burn_steps)
                 ip_spec = np.asarray(iplus_full[k], dtype=float).copy()
                 im_spec = np.asarray(iminus_full[k], dtype=float).copy()
-                if ip_spec.size != NUM_BINS or im_spec.size != NUM_BINS:
-                    raise ValueError(
-                        f"Unexpected spectrum length at step {burn_steps}: "
-                        f"I+={ip_spec.size}, I-={im_spec.size}, expected {NUM_BINS}"
-                    )
                 p_total, q_total = _spectrum_totals(
                     ip_spec, im_spec, float(p0), calibration=calibration
                 )
@@ -314,11 +284,12 @@ def generate_afp_events(
     afp_window: int,
     max_centers_per_p: int | None = None,
 ) -> dict[str, list]:
-    """AFP flip + relaxation; save the full I+/I- spectrum at each relax step.
+    """AFP flip, then save the full I+/I- spectrum at each requested relax step.
 
     Runs one trajectory of length ``max(relax_steps_grid)`` per (P, center) with
     ``capture_spectrum=True``. Frame 0 is immediately post-flip; later frames are
-    after each relax macro-step. Emits a separate event for each index in
+    after each relax macro-step. A grid of only ``[0]`` is the post-flip snapshot
+    with no relaxation. Emits a separate event for each index in
     ``relax_steps_grid`` with ``n_steps`` equal to that index.
     """
     rows = _empty_rows()
@@ -335,7 +306,8 @@ def generate_afp_events(
             centers = centers[: int(max_centers_per_p)]
         print(
             f"  AFP P={float(p0):.3f} ({ip + 1}/{len(p_values)}): "
-            f"{centers.size} Q<0 centers × {relax_steps_grid.size} relax spectra "
+            f"{centers.size} Q<0 centers × {relax_steps_grid.size} "
+            f"{'relax' if max_relax > 0 else 'post-flip'} spectra "
             f"(window={int(afp_window)}, n_relax={max_relax})",
             flush=True,
         )
@@ -352,34 +324,13 @@ def generate_afp_events(
             if bool(traj.get("skipped", False)):
                 continue
 
-            iplus_full = traj.get("iplus_full")
-            iminus_full = traj.get("iminus_full")
-            if iplus_full is None or iminus_full is None:
-                raise RuntimeError(
-                    f"AFP traj missing per-step spectra for bin={bin_idx}, P={p0}"
-                )
-            iplus_full = np.asarray(iplus_full, dtype=float)
-            iminus_full = np.asarray(iminus_full, dtype=float)
-            if iplus_full.ndim != 2 or iminus_full.ndim != 2:
-                raise ValueError(
-                    f"Expected full-spectrum AFP traj (t, bins) for bin {bin_idx}, "
-                    f"P={p0}; got I+={iplus_full.shape}, I-={iminus_full.shape}"
-                )
-            if int(iplus_full.shape[0]) < max_relax + 1:
-                raise RuntimeError(
-                    f"AFP traj too short for bin={bin_idx}, P={p0}: "
-                    f"got {iplus_full.shape[0]} frames, need {max_relax + 1}"
-                )
+            iplus_full = np.asarray(traj["iplus_full"], dtype=float)
+            iminus_full = np.asarray(traj["iminus_full"], dtype=float)
 
             for relax_steps in sorted(step_set):
                 k = int(relax_steps)
                 ip_spec = np.asarray(iplus_full[k], dtype=float).copy()
                 im_spec = np.asarray(iminus_full[k], dtype=float).copy()
-                if ip_spec.size != NUM_BINS or im_spec.size != NUM_BINS:
-                    raise ValueError(
-                        f"Unexpected AFP spectrum length at relax step {relax_steps}: "
-                        f"I+={ip_spec.size}, I-={im_spec.size}, expected {NUM_BINS}"
-                    )
                 p_total, q_total = _spectrum_totals(
                     ip_spec, im_spec, float(p0), calibration=calibration
                 )
@@ -747,6 +698,7 @@ def generate_spectra(
     *,
     do_ssrf: bool,
     do_afp: bool,
+    do_afp_relax: bool = False,
     p_min: float = P_MIN,
     p_max: float = P_MAX,
     p_step: float = P_STEP,
@@ -762,9 +714,6 @@ def generate_spectra(
     p_values: np.ndarray | None = None,
 ) -> dict[str, np.ndarray]:
     """Build full-spectrum manipulated events for the requested modes."""
-    if not do_ssrf and not do_afp:
-        raise ValueError("Enable at least one of do_ssrf / do_afp")
-
     burn_window = _burn_window_bins()
     shape_params = get_shape_params()
     calibration = load_pq_calibration(num_bins=NUM_BINS)
@@ -773,8 +722,6 @@ def generate_spectra(
         p_values = p_values[p_values > 0.0]
     else:
         p_values = np.asarray(p_values, dtype=float).reshape(-1)
-    if p_values.size == 0:
-        raise ValueError("polarization grid is empty")
 
     groups: list[dict[str, list]] = []
     if do_ssrf:
@@ -791,8 +738,11 @@ def generate_spectra(
             )
         )
     if do_afp:
-        relax_grid = burn_steps_values(
-            min_relax_steps, max_relax_steps, relax_steps_step
+        relax_grid = _afp_relax_grid(
+            do_afp_relax,
+            min_relax_steps=min_relax_steps,
+            max_relax_steps=max_relax_steps,
+            relax_steps_step=relax_steps_step,
         )
         groups.append(
             generate_afp_events(
@@ -808,26 +758,53 @@ def generate_spectra(
     return _merge_rows(*groups)
 
 
+def _afp_relax_grid(
+    do_afp_relax: bool,
+    *,
+    min_relax_steps: int,
+    max_relax_steps: int,
+    relax_steps_step: int,
+) -> np.ndarray:
+    """Relax-step indices to save. Without relaxation this is only post-flip (0)."""
+    if not do_afp_relax:
+        return np.asarray([0], dtype=np.int32)
+    return burn_steps_values(min_relax_steps, max_relax_steps, relax_steps_step)
+
+
 def _resolve_modes(
     *,
     ssrf: bool | None,
     afp: bool | None,
+    afp_relax: bool,
     quick: bool,
-) -> tuple[bool, bool]:
-    """Resolve ``--ssrf/--no-ssrf`` and ``--afp/--no-afp`` into concrete booleans.
+) -> tuple[bool, bool, bool]:
+    """Resolve ``--ssrf/--no-ssrf``, ``--afp/--no-afp``, and ``--afp-relax``.
 
-    Defaults when no mode flag is given:
-      - ``--quick`` → both on
+    Defaults when no mode flag is given (``--afp-relax`` counts as a mode flag):
+      - ``--quick`` → ssRF and AFP on, relaxation off (post-flip only)
       - otherwise → ssRF on, AFP off
     When any mode flag is given, unspecified modes default to off.
+    ``--afp-relax`` implies AFP. ``--no-afp --afp-relax`` is an error.
     """
+    if afp is False and bool(afp_relax):
+        raise ValueError("--afp-relax requires AFP; cannot combine with --no-afp")
+
     ssrf_set = ssrf is not None
     afp_set = afp is not None
-    if not ssrf_set and not afp_set:
+    relax_set = bool(afp_relax)
+    if not ssrf_set and not afp_set and not relax_set:
         if quick:
-            return True, True
-        return True, False
-    return (bool(ssrf) if ssrf_set else False), (bool(afp) if afp_set else False)
+            return True, True, False
+        return True, False, False
+
+    do_ssrf = bool(ssrf) if ssrf_set else False
+    do_afp = bool(afp) if afp_set else False
+    do_afp_relax = bool(afp_relax)
+    if do_afp_relax:
+        do_afp = True
+    if not do_afp:
+        do_afp_relax = False
+    return do_ssrf, do_afp, do_afp_relax
 
 
 def parse_args() -> argparse.Namespace:
@@ -835,7 +812,8 @@ def parse_args() -> argparse.Namespace:
         description=(
             "Generate full-spectrum ssRF and/or AFP manipulated lineshapes "
             "centered only at burn-window bins where initial (equilibrium) Q < 0. "
-            "AFP emits one event per selected post-flip relax step. "
+            "AFP saves the immediately post-flip spectrum unless --afp-relax "
+            "is set, in which case one event is emitted per selected relax step. "
             "ssRF and AFP are never applied in the same event."
         )
     )
@@ -853,9 +831,21 @@ def parse_args() -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=None,
         help=(
-            "Enable/disable AFP + relax events "
+            "Enable/disable AFP events "
             "(--afp / --no-afp; default: off unless --quick with no mode flags). "
-            "When on: 0 .. max-relax-steps; n_steps = relax steps after flip"
+            "Without --afp-relax, saves only the immediately post-flip spectrum "
+            "(n_steps = 0)"
+        ),
+    )
+    parser.add_argument(
+        "--afp-relax",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "After each AFP flip, emit spectra along a relaxation trajectory "
+            "(--afp-relax / --no-afp-relax; default: off). Implies --afp. "
+            "Uses --min-relax-steps / --max-relax-steps / --relax-steps-step; "
+            "n_steps = relax steps after flip"
         ),
     )
     parser.add_argument(
@@ -918,19 +908,28 @@ def parse_args() -> argparse.Namespace:
         "--min-relax-steps",
         type=int,
         default=MIN_RELAX_STEPS,
-        help=f"Minimum AFP relax steps after flip (default: {MIN_RELAX_STEPS})",
+        help=(
+            "Minimum AFP relax steps after flip when --afp-relax is on "
+            f"(default: {MIN_RELAX_STEPS})"
+        ),
     )
     parser.add_argument(
         "--max-relax-steps",
         type=int,
         default=MAX_RELAX_STEPS,
-        help=f"Maximum AFP relax steps after flip (default: {MAX_RELAX_STEPS})",
+        help=(
+            "Maximum AFP relax steps after flip when --afp-relax is on "
+            f"(default: {MAX_RELAX_STEPS})"
+        ),
     )
     parser.add_argument(
         "--relax-steps-step",
         type=int,
         default=RELAX_STEPS_STEP,
-        help=f"AFP relax-step stride (default: {RELAX_STEPS_STEP})",
+        help=(
+            "AFP relax-step stride when --afp-relax is on "
+            f"(default: {RELAX_STEPS_STEP})"
+        ),
     )
     parser.add_argument(
         "--gamma-rf",
@@ -954,8 +953,8 @@ def parse_args() -> argparse.Namespace:
         "--quick",
         action="store_true",
         help=(
-            "Smoke run: 2 polarizations, few centers, short ssRF burn + AFP "
-            "relax grids, both modes"
+            "Smoke run: 2 polarizations, few centers, short ssRF burn grid, "
+            "both modes; AFP is post-flip only unless --afp-relax"
         ),
     )
     return parser.parse_args()
@@ -963,11 +962,15 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    do_ssrf, do_afp = _resolve_modes(
-        ssrf=args.ssrf,
-        afp=args.afp,
-        quick=bool(args.quick),
-    )
+    try:
+        do_ssrf, do_afp, do_afp_relax = _resolve_modes(
+            ssrf=args.ssrf,
+            afp=args.afp,
+            afp_relax=bool(args.afp_relax),
+            quick=bool(args.quick),
+        )
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
 
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -981,9 +984,12 @@ def main() -> None:
         max_relax_steps = 10
         relax_steps_step = 5
         max_centers_per_p = 3
+        afp_quick = (
+            "AFP relax {0,5,10}" if do_afp_relax else "AFP post-flip only"
+        )
         print(
             "Quick smoke: P={0.30, 0.50}, 3 centers/P, "
-            "ssRF steps {0,5,10}, AFP relax {0,5,10}",
+            f"ssRF steps {{0,5,10}}, {afp_quick}",
             flush=True,
         )
     else:
@@ -1000,15 +1006,23 @@ def main() -> None:
     if do_ssrf:
         modes.append("ssRF")
     if do_afp:
-        modes.append("AFP")
+        modes.append("AFP+relax" if do_afp_relax else "AFP")
+    if do_afp_relax:
+        afp_relax_desc = (
+            f"relax [{min_relax_steps}, {max_relax_steps}] "
+            f"stride {relax_steps_step}"
+        )
+    elif do_afp:
+        afp_relax_desc = "post-flip only (n_steps=0)"
+    else:
+        afp_relax_desc = "off"
     print(
         f"Generating {'+'.join(modes)} full spectra | "
         f"P in [{args.p_min}, {args.p_max}] step {args.p_step} | "
         f"ssRF gamma_rf={args.gamma_rf} steps "
         f"[{min_burn_steps}, {max_burn_steps}] stride {burn_steps_step} | "
         f"ssRF centers: equilibrium Q<0 only | "
-        f"AFP window={args.afp_window} relax "
-        f"[{min_relax_steps}, {max_relax_steps}] stride {relax_steps_step} | "
+        f"AFP window={args.afp_window} {afp_relax_desc} | "
         f"dt={DT} | "
         f"burn R in ({BURN_R_MIN}, {BURN_R_MAX}) | "
         f"Voigt FWHM G={GAUSSIAN_FWHM_R:.3f} L={LORENTZIAN_FWHM_R:.3f}",
@@ -1018,6 +1032,7 @@ def main() -> None:
     data = generate_spectra(
         do_ssrf=do_ssrf,
         do_afp=do_afp,
+        do_afp_relax=do_afp_relax,
         p_min=float(args.p_min),
         p_max=float(args.p_max),
         p_step=float(args.p_step),

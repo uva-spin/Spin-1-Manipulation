@@ -1,4 +1,4 @@
-# ssrf_realtime
+# physics.rf
 
 Realtime spin-1 rate-equation model for ssRF burns, AFP, recovery, and diffusion on a 500-bin Pake powder lineshape.
 
@@ -29,8 +29,9 @@ Configuration dataclass. Important fields:
 The simulation object. Typical usage:
 
 ```python
-from physics.ssrf_realtime.model import Spin1Model, Spin1Params
-from physics.ssrf_realtime.rate_equations_realtime import (
+from physics.rf import (
+    Spin1Model,
+    Spin1Params,
     build_model_for_intensities,
     configure_single_bin_ssrf,
 )
@@ -51,6 +52,7 @@ iplus_new, iminus_new, _ = model.physical_intensities()
 |----------|---------|
 | `build_model_for_intensities` | Create a `Spin1Model` from I+/I− arrays |
 | `configure_single_bin_ssrf` | Point RF at one bin with a given `gamma_rf` |
+| `configure_physical_voigt_ssrf` | Install a physical-R Voigt RF profile |
 | `burn_preserves_ps_sign` | Check that a burn step did not flip Ps sign |
 | `burn_preserves_branch_order` | Check that I+ ≥ I− ordering is preserved |
 
@@ -59,7 +61,7 @@ These guards are used by `ml/opt_q.py` when searching for valid burn parameters.
 ## Tests
 
 ```bash
-cd physics/ssrf_realtime
+cd physics/rf
 pytest -q
 ```
 
@@ -67,6 +69,6 @@ pytest -q
 
 ## Used by
 
-- `Data_Creation/rivanna/` — training data generation (vendored copy)
+- `Data_Creation/rivanna/` — training data generation (`from physics.rf import …`)
 - `ml/dqn.py`, `ml/sarsa.py` — reinforcement-learning burn policies
 - `ml/opt_q.py` — greedy incremental Q optimization

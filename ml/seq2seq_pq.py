@@ -30,12 +30,8 @@ import torch.utils.data as data
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parent
-DEFAULT_SPECTRA_CANDIDATES = (
-    SCRIPT_DIR / "data" / "spectra.npz",
-    REPO_ROOT / "Data_Creation" / "dae_voigt_burn_spectra" / "spectra.npz",
-    SCRIPT_DIR / "dae_voigt_burn_spectra" / "spectra.npz",
-)
-DEFAULT_OUTPUT_DIR = SCRIPT_DIR / "seq2seq_pq_results_v2"
+DEFAULT_SPECTRA_PATH = SCRIPT_DIR / "data" / "spectra_v2.npz"
+DEFAULT_OUTPUT_DIR = SCRIPT_DIR / "seq2seq_pq_results_v4"
 
 SEED = 42
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -111,13 +107,7 @@ def resolve_spectra_path(spectra: Path | None) -> Path:
         if path.is_file():
             return path
         raise FileNotFoundError(f"Spectra NPZ not found: {path}")
-    for candidate in DEFAULT_SPECTRA_CANDIDATES:
-        if candidate.is_file():
-            return candidate
-    tried = ", ".join(str(p) for p in DEFAULT_SPECTRA_CANDIDATES)
-    raise FileNotFoundError(
-        "Spectra NPZ not found. Pass --spectra PATH. Tried: " + tried
-    )
+    raise FileNotFoundError(f"Spectra NPZ not found: {path}")
 
 
 def load_seq2seq_npz(path: Path) -> dict[str, np.ndarray]:
@@ -1572,7 +1562,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="Train/evaluate LSTM seq model: Ps spectrum → P_total, Q_total."
     )
-    parser.add_argument("--spectra", type=Path, default=None, help="Path to spectra.npz")
+    parser.add_argument("--spectra", type=Path, default=DEFAULT_SPECTRA_PATH, help="Path to spectra.npz")
     parser.add_argument(
         "--out-dir", type=Path, default=DEFAULT_OUTPUT_DIR, help="Output directory"
     )
@@ -1615,8 +1605,8 @@ def main() -> None:
     args.out_dir.mkdir(parents=True, exist_ok=True)
     checkpoint_path = args.checkpoint or (args.out_dir / "seq2seq_pq_best.pth")
 
-    spectra_path = resolve_spectra_path(args.spectra)
-    print(f"Loading {spectra_path} ...", flush=True)
+    spectra_path = args.spectra or DEFAULT_SPECTRA_PATH
+    print(f"Loading spectra from {spectra_path} ...", flush=True)
     arrays = load_seq2seq_npz(spectra_path)
 
     print("Preparing datasets...", flush=True)

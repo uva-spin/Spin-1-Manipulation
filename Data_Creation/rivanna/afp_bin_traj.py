@@ -241,9 +241,6 @@ def run_one_bin(
     step_subsample: int = 1,
 ) -> dict:
     bin_idx = int(bin_idx)
-    if bin_idx < 0 or bin_idx >= int(num_bins):
-        raise ValueError(f"bin_idx={bin_idx} out of range for num_bins={num_bins}")
-
     mirror_idx = mirror_bin_idx(int(num_bins), bin_idx)
     p_values = np.asarray(p_values, dtype=float)
     n_p = int(p_values.size)
@@ -414,8 +411,6 @@ def main(argv: list[str] | None = None) -> None:
     print_shape_banner(shape, num_bins=int(args.num_bins))
 
     p_values = positive_polarization_grid(args.p_min, args.p_max, args.p_step)
-    if int(p_values.size) == 0:
-        raise SystemExit("No positive polarization values in the requested P grid")
 
     if not is_manipulation_shard_bin(bin_idx):
         print(

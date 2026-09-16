@@ -24,6 +24,7 @@
 set -euo pipefail
 
 PKG_DIR="${SLURM_SUBMIT_DIR:-$(cd "$(dirname "$0")" && pwd)}"
+REPO_ROOT="$(cd "${PKG_DIR}/../.." && pwd)"
 SHARD_DIR="${SHARD_DIR:-data/ssrf_shards}"
 NUM_BINS="${NUM_BINS:-500}"
 P_MIN="${P_MIN:--0.9}"
@@ -48,6 +49,7 @@ export MPLCONFIGDIR="${MPLCONFIGDIR:-${TMPDIR:-/tmp}/mplconfig_${SLURM_JOB_ID:-$
 export XDG_CACHE_HOME="${XDG_CACHE_HOME:-${TMPDIR:-/tmp}/xdg_cache_${SLURM_JOB_ID:-$$}}"
 mkdir -p "${MPLCONFIGDIR}" "${XDG_CACHE_HOME}"
 export PYTHONUNBUFFERED=1
+export PYTHONPATH="${REPO_ROOT}${PYTHONPATH:+:$PYTHONPATH}"
 
 module purge
 module load apptainer pytorch/2.9.0
@@ -63,13 +65,14 @@ fi
 
 echo "ssRF traj bin ${SLURM_ARRAY_TASK_ID} on $(hostname)"
 echo "Pkg dir: ${PKG_DIR}"
+echo "Repo root: ${REPO_ROOT}"
 echo "Shard dir: ${SHARD_DIR}"
 echo "P: [${P_MIN}, ${P_MAX}] step=${P_STEP}"
 echo "gamma_rf: ${GAMMA_MIN} (fixed)"
 echo "burn_steps: ${STEPS_MIN} (fixed)"
 echo "dt=${DT}  rf_mode=${RF_MODE}"
 
-apptainer run --bind "${PKG_DIR}:${PKG_DIR}" --pwd "${PKG_DIR}" \
+apptainer run --bind "${REPO_ROOT}:${REPO_ROOT}" --pwd "${PKG_DIR}" \
   "${CONTAINERDIR}/pytorch-2.9.0.sif" \
   ssrf_bin_traj.py \
   --bin-idx "${SLURM_ARRAY_TASK_ID}" \

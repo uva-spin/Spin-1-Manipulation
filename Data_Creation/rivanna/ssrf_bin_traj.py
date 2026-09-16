@@ -84,9 +84,6 @@ def run_one_polarization(
     """Burn exactly ``n_steps`` macro-steps at ``gamma_rf`` from Dulya equilibrium."""
     P = float(polarization)
     n_burn = int(n_steps)
-    if n_burn < 0:
-        raise ValueError(f"n_steps must be >= 0, got {n_burn}")
-
     shape = shape_params if shape_params is not None else get_shape_params()
     f = np.linspace(float(F_MIN), float(F_MAX), int(num_bins))
     _, ip_fit, im_fit = equilibrium_lineshape(P, f, shape)
@@ -448,9 +445,6 @@ def run_one_bin(
 ) -> dict:
     """Run ssRF for one burn bin on a Cartesian P × gamma × n_steps grid."""
     bin_idx = int(bin_idx)
-    if bin_idx < 0 or bin_idx >= int(num_bins):
-        raise ValueError(f"bin_idx={bin_idx} out of range for num_bins={num_bins}")
-
     p_values = np.asarray(p_values, dtype=float)
     gamma_values = (
         gamma_rf_grid()
@@ -462,9 +456,6 @@ def run_one_bin(
         if steps_values is None
         else np.asarray(steps_values, dtype=np.int32)
     )
-    if gamma_values.size == 0 or steps_values.size == 0 or p_values.size == 0:
-        raise ValueError("p_values, gamma_values, and steps_values must be non-empty")
-
     combo_list = _build_combos(p_values, gamma_values, steps_values)
     t_max = int(np.max(steps_values)) + 1
     out = _run_one_bin_combos(
@@ -560,8 +551,6 @@ def main(argv: list[str] | None = None) -> None:
 
     shape = get_shape_params()
     p_values = positive_polarization_grid(args.p_min, args.p_max, args.p_step)
-    if int(p_values.size) == 0:
-        raise SystemExit("No positive polarization values in the requested P grid")
 
     if not is_manipulation_shard_bin(bin_idx):
         print(

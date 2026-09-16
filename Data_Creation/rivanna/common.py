@@ -1,13 +1,17 @@
 """Shared constants for data generation."""
 
+import sys
 from pathlib import Path
 from typing import Optional
 
 import numpy as np
 
 _HERE = Path(__file__).resolve().parent
+_REPO_ROOT = _HERE.parents[1]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
 
-PHYSICS_MODEL = "ssrf_realtime"
+PHYSICS_MODEL = "physics.rf"
 RF_MODE = "physical_voigt"
 RF_MODE_SINGLE_BIN = "single_bin"
 RF_MODE_PHYSICAL_VOIGT = "physical_voigt"
@@ -51,10 +55,6 @@ def gamma_rf_grid(
     g_min = float(g_min)
     g_max = float(g_max)
     g_step = float(g_step)
-    if g_step <= 0.0:
-        raise ValueError(f"g_step must be > 0, got {g_step}")
-    if g_max < g_min:
-        raise ValueError(f"g_max ({g_max}) must be >= g_min ({g_min})")
     n = int(np.floor((g_max - g_min) / g_step + 1e-12)) + 1
     return g_min + g_step * np.arange(n, dtype=float)
 
@@ -65,14 +65,7 @@ def burn_steps_grid(
     n_step: int = BURN_STEPS_STEP,
 ) -> np.ndarray:
     """Inclusive burn-length (macro-step) sample grid."""
-    n_min = int(n_min)
-    n_max = int(n_max)
-    n_step = int(n_step)
-    if n_step < 1:
-        raise ValueError(f"n_step must be >= 1, got {n_step}")
-    if n_max < n_min:
-        raise ValueError(f"n_max ({n_max}) must be >= n_min ({n_min})")
-    return np.arange(n_min, n_max + 1, n_step, dtype=np.int32)
+    return np.arange(int(n_min), int(n_max) + 1, int(n_step), dtype=np.int32)
 
 # Shared recovery rates (AFP and ssRF) + voigt_burn RF widths (physical R).
 DIFFUSION_SCALE = 5.0

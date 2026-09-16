@@ -53,9 +53,7 @@ from common import (
 from model_bridge import build_spin1_model, configure_ssrf_burn
 from ssrf_bin_traj import run_one_bin as run_ssrf_bin
 from ssrf_bin_traj import run_one_polarization as run_ssrf_one
-from ssrf_realtime.rate_equations_realtime import (
-    voigt_burn_recovery_param_snapshot,
-)
+from physics.rf import voigt_burn_recovery_param_snapshot
 from unmanipulated_bin_lineshape import run_one_bin as run_unmanip_bin
 from unmanipulated_bin_lineshape import save_unmanip_bin, unmanip_bin_path
 
@@ -100,16 +98,10 @@ def test_afp_instant_flip_keeps_single_spectrum_step() -> None:
     assert np.asarray(traj["ps_full"]).shape == (1, 32)
 
 
-def test_package_is_self_contained() -> None:
-    """No imports from sibling dulya_fit or repo-root physics packages."""
-    import common
-    import lineshape
+def test_package_uses_physics_rf() -> None:
     import model_bridge
 
-    assert Path(common.FIT_PARAMS_PATH).resolve().parent == _V2.resolve()
-    assert Path(common.FIT_PARAMS_PATH).is_file()
-    assert hasattr(lineshape, "GenerateDulyaLineshape")
-    assert model_bridge.Spin1Model.__module__.startswith("ssrf_realtime")
+    assert model_bridge.Spin1Model.__module__.startswith("physics.rf")
 
 
 def test_equilibrium_lineshape_finite() -> None:

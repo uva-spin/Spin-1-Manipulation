@@ -1,6 +1,6 @@
 # Rivanna Data Pipeline
 
-Self-contained package for ssRF / AFP / unmanipulated training data from a Dulya-fitted equilibrium lineshape. Copy this folder to a cluster and run from inside it — no parent-repo imports.
+ssRF / AFP / unmanipulated training data from a Dulya-fitted equilibrium lineshape. Physics comes from [`physics.rf`](../../physics/rf/README.md) at the repo root — submit from this directory with the repo on `PYTHONPATH` (the SLURM scripts do that).
 
 ## What to run
 
@@ -26,7 +26,7 @@ Optional: `plot_physics_demo.py` (diagnostic PNGs) and `create_sample_single_bin
 | Path | Role |
 |------|------|
 | `fit_params.json` | Frozen Dulya lineshape fit |
-| `ssrf_realtime/` | Vendored physics model |
+| `model_bridge.py` | Dulya equilibrium → `physics.rf` `Spin1Model` |
 | `ssrf_bin_traj.py` / `afp_bin_traj.py` / `unmanipulated_bin_lineshape.py` | Workers |
 | `combine_all_train.py` | Merge shards → per-bin training NPZs |
 | `generate_bins.py` | Local dispatcher for the three workers |
@@ -60,7 +60,7 @@ Each `combined_train_all/train_bin_XXXX.npz` row is one event observed at bin XX
 
 ## Cluster notes
 
-Submit from this directory. Scripts assume Rivanna-style `apptainer` with `module load apptainer pytorch/2.9.0`. The container entrypoint is already Python — pass scripts directly (`apptainer run … ssrf_bin_traj.py`), do not prefix with `python`. Account: `spinquest_standard`. Override paths with `DATA_DIR`, `SHARD_DIR`, `P_MIN`, `P_MAX`.
+Submit from this directory. Scripts assume Rivanna-style `apptainer` with `module load apptainer pytorch/2.9.0`. The container entrypoint is already Python — pass scripts directly (`apptainer run … ssrf_bin_traj.py`), do not prefix with `python`. Account: `spinquest_standard`. Override paths with `DATA_DIR`, `SHARD_DIR`, `P_MIN`, `P_MAX`. Array jobs bind the repo root and set `PYTHONPATH` so `physics.rf` imports.
 
 ## Constants (`common.py`)
 

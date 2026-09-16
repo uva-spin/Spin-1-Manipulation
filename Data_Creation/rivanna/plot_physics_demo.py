@@ -2,8 +2,8 @@
 Demo plots at a realistic Dulya-fit polarization (default P=0.45).
 
 Shows equilibrium lineshape, physical-Voigt (and optional single-bin) ssRF burn
-effects, burn/mirror trajectories, and AFP + relaxation — all driven by the
-vendored ``ssrf_realtime`` package with frozen ``fit_params.json``.
+effects, burn/mirror trajectories, and AFP + relaxation — all driven by
+``physics.rf`` with frozen ``fit_params.json``.
 
 Examples (from this directory):
   python plot_physics_demo.py
@@ -187,7 +187,7 @@ def plot_ssrf_burn_and_trajectory(
     )
 
     fig.suptitle(
-        f"ssrf_realtime + Dulya fit_params  |  diffusion={DIFFUSION_SCALE}  "
+        f"physics.rf + Dulya fit_params  |  diffusion={DIFFUSION_SCALE}  "
         f"Gauss={RF_GAUSSIAN_FWHM_R:.3f} Lorentz={RF_LORENTZIAN_FWHM_R:.3f}",
         fontsize=11,
         y=0.995,
@@ -285,7 +285,7 @@ def plot_afp_and_relaxation(
     )
 
     fig.suptitle(
-        r"ssrf_realtime AFP + Boltzmann recovery at $P_{\mathrm{AFP}}$ ($Q\to Q_B(P)$)",
+        r"physics.rf AFP + Boltzmann recovery at $P_{\mathrm{AFP}}$ ($Q\to Q_B(P)$)",
         fontsize=11,
         y=0.995,
     )
