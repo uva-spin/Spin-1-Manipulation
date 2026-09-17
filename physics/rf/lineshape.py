@@ -17,26 +17,20 @@ The returned function is a density in the dimensionless coordinate R.  It is
 not a hole profile.  Hole width / RF leakage should be modeled separately by a
 Voigt RF kernel after the ideal-bin dynamics are understood.
 """
-
-from __future__ import annotations
-
 import numpy as np
 
-
-def trapezoid_integral(y, x) -> float:
+def trapezoid_integral(y, x):
     """Compatibility wrapper for NumPy < 2.0 and newer NumPy versions."""
-    trapezoid = getattr(np, "trapezoid", None)
+    trapezoid = getattr(np, 'trapezoid', None)
     if trapezoid is not None:
-        return float(trapezoid(y, x))
-    return float(np.trapz(y, x))
+        return trapezoid(y, x)
+    return np.trapz(y, x)
 
-
-def boltzmann_Q(P: float) -> float:
+def boltzmann_Q(P):
     """Spin-1 Boltzmann relation Q(P) = 2 - sqrt(4 - 3 P^2)."""
-    return float(2.0 - np.sqrt(max(0.0, 4.0 - 3.0 * P * P)))
+    return 2.0 - np.sqrt(max(0.0, 4.0 - 3.0 * P * P))
 
-
-def boltzmann_branch_ratio(P: float) -> float:
+def boltzmann_branch_ratio(P):
     """
     Boltzmann equilibrium area ratio I_plus/I_minus for a spin-1 doublet.
 
@@ -44,78 +38,66 @@ def boltzmann_branch_ratio(P: float) -> float:
     """
     denom = 2.0 - 2.0 * P
     if abs(denom) < 1e-15:
-        return float("inf")
-    return float((np.sqrt(max(0.0, 4.0 - 3.0 * P * P)) + P) / denom)
+        return 'inf'
+    return (np.sqrt(max(0.0, 4.0 - 3.0 * P * P)) + P) / denom
 
-
-def level_populations_from_PQ(P: float, Q: float | None = None) -> np.ndarray:
+def level_populations_from_PQ(P, Q=None):
     """Return normalized spin-1 level fractions [p_plus, p_zero, p_minus]."""
     if Q is None:
         Q = boltzmann_Q(P)
     p_plus = 1.0 / 3.0 + 0.5 * P + Q / 6.0
     p_zero = (1.0 - Q) / 3.0
     p_minus = 1.0 / 3.0 - 0.5 * P + Q / 6.0
-    p = np.array([p_plus, p_zero, p_minus], dtype=float)
+    p = np.array([p_plus, p_zero, p_minus])
     if np.any(p < -1e-12):
-        raise ValueError(
-            f"Invalid spin-1 populations from P={P}, Q={Q}: {p}. "
-            "Check that P,Q are in the physically allowed triangle."
-        )
+        raise ValueError(f'Invalid spin-1 populations from P={P}, Q={Q}: {p}. Check that P,Q are in the physically allowed triangle.')
     p = np.maximum(p, 0.0)
     return p / p.sum()
 
-
-def pake_component_raw(R, epsilon: int = +1, gamma: float = 0.05, asym: float = 0.04):
+def pake_component_raw(R, epsilon=+1, gamma=0.05, asym=0.04):
     """
     Analytic broadened single-branch Pake component I(R, epsilon).
 
     This is a vectorized, numerically guarded implementation of the formula.
     """
     eps = 1 if epsilon >= 0 else -1
-    R = np.asarray(R, dtype=float)
-    gamma = float(gamma)
-    asym = float(asym)
-
+    R = np.asarray(R)
+    gamma = gamma
+    asym = asym
     bigy = np.sqrt(max(1e-15, 3.0 - asym))
     X2 = np.sqrt(gamma * gamma + (1.0 - eps * R - asym) ** 2)
     sqrt_X2 = np.sqrt(np.maximum(X2, 1e-300))
-
     cos_alpha = (1.0 - eps * R - asym) / np.maximum(X2, 1e-300)
     cos_alpha = np.clip(cos_alpha, -1.0, 1.0)
     cos_half = np.sqrt(np.maximum(0.0, (1.0 + cos_alpha) / 2.0))
     sin_half = np.sqrt(np.maximum(0.0, (1.0 - cos_alpha) / 2.0))
-
     denom1 = 2.0 * bigy * sqrt_X2 * sin_half
     numer1 = bigy * bigy - X2
-    with np.errstate(divide="ignore", invalid="ignore"):
+    with np.errstate(divide='ignore', invalid='ignore'):
         ratio1 = np.divide(numer1, denom1, out=np.full_like(numer1, np.inf), where=np.abs(denom1) > 1e-300)
     term_one = np.pi / 2.0 + np.arctan(ratio1)
-
     denom2 = bigy * bigy + X2 - 2.0 * bigy * sqrt_X2 * cos_half
     numer2 = bigy * bigy + X2 + 2.0 * bigy * sqrt_X2 * cos_half
     denom2 = np.maximum(denom2, 1e-300)
     numer2 = np.maximum(numer2, 1e-300)
     term_two = np.log(numer2 / denom2)
-
     mult = 1.0 / (2.0 * np.pi * np.sqrt(np.maximum(X2, 1e-300)))
     out = mult * (2.0 * cos_half * term_one + sin_half * term_two)
-    out = np.asarray(out, dtype=float)
+    out = np.asarray(out)
     out = np.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0)
     out = np.maximum(out, 0.0)
     return out
 
-
-def normalized_component(R, epsilon: int = +1, gamma: float = 0.05, asym: float = 0.04):
+def normalized_component(R, epsilon=+1, gamma=0.05, asym=0.04):
     """Return the area-normalized analytic component density on grid R."""
-    R = np.asarray(R, dtype=float)
+    R = np.asarray(R)
     y = pake_component_raw(R, epsilon=epsilon, gamma=gamma, asym=asym)
-    area = trapezoid_integral(y, R) if len(R) > 1 else float(np.sum(y))
+    area = trapezoid_integral(y, R) if len(R) > 1 else np.sum(y)
     if area <= 0 or not np.isfinite(area):
-        raise ValueError("Lineshape area is not positive; check gamma/asym/R grid.")
+        raise ValueError('Lineshape area is not positive; check gamma/asym/R grid.')
     return y / area
 
-
-def plot_signal_reference(R, P: float = 0.50, gamma: float = 0.05, asym: float = 0.04, divisor: float = 10.0):
+def plot_signal_reference(R, P=0.5, gamma=0.05, asym=0.04, divisor=10.0):
     """
     Reproduce the attached Plot_Signal.py convention.
 
@@ -124,8 +106,8 @@ def plot_signal_reference(R, P: float = 0.50, gamma: float = 0.05, asym: float =
         I_plus  = r * I(R,+1) / divisor
         I_minus =     I(-R,+1) / divisor.
     """
-    R = np.asarray(R, dtype=float)
+    R = np.asarray(R)
     r = boltzmann_branch_ratio(P)
     y_plus = pake_component_raw(R, +1, gamma=gamma, asym=asym) / divisor
     y_minus = pake_component_raw(-R, +1, gamma=gamma, asym=asym) / divisor
-    return r * y_plus, y_minus, r * y_plus + y_minus
+    return (r * y_plus, y_minus, r * y_plus + y_minus)

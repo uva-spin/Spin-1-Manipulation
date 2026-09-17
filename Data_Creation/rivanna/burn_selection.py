@@ -1,135 +1,76 @@
 import numpy as np
-
 from bin_setup import equilibrium_lineshape, get_shape_params, polarization_grid
 from common import BURN_BIN_CHOICES, F_MAX, F_MIN, NUM_BINS, P_ABS_MIN, EXCLUDED_MANIPULATION_BURN_BINS, is_burn_bin
 
-
-def positive_polarization_grid(
-    p_min: float,
-    p_max: float,
-    p_step: float,
-    *,
-    p_abs_min: float = P_ABS_MIN,
-) -> np.ndarray:
+def positive_polarization_grid(p_min, p_max, p_step, *, p_abs_min=P_ABS_MIN):
     """Polarization grid with only strictly positive P values."""
-    g = polarization_grid(float(p_min), float(p_max), float(p_step))
-    return g[g > float(p_abs_min)]
+    g = polarization_grid(p_min, p_max, p_step)
+    return g[g > p_abs_min]
 
-
-def equilibrium_q_profile(
-    polarization: float,
-    *,
-    num_bins: int = NUM_BINS,
-    shape_params: dict[str, float] | None = None,
-) -> np.ndarray:
+def equilibrium_q_profile(polarization, *, num_bins=NUM_BINS, shape_params=None):
     """Equilibrium Q = I+ - I- at each spectral bin."""
     shape = shape_params if shape_params is not None else get_shape_params()
-    f = np.linspace(float(F_MIN), float(F_MAX), int(num_bins))
-    _, ip, im = equilibrium_lineshape(float(polarization), f, shape)
-    return np.asarray(ip, dtype=float) - np.asarray(im, dtype=float)
+    f = np.linspace(F_MIN, F_MAX, num_bins)
+    (_, ip, im) = equilibrium_lineshape(polarization, f, shape)
+    return np.asarray(ip) - np.asarray(im)
 
-
-def q_negative_burn_mask(
-    polarization: float,
-    *,
-    num_bins: int = NUM_BINS,
-    shape_params: dict[str, float] | None = None,
-) -> np.ndarray:
+def q_negative_burn_mask(polarization, *, num_bins=NUM_BINS, shape_params=None):
     """True at burn-window bins where equilibrium Q < 0."""
-    q = equilibrium_q_profile(
-        polarization, num_bins=int(num_bins), shape_params=shape_params
-    )
-    mask = np.zeros(int(num_bins), dtype=bool)
+    q = equilibrium_q_profile(polarization, num_bins=num_bins, shape_params=shape_params)
+    mask = np.zeros(num_bins, dtype=bool)
     for b in BURN_BIN_CHOICES:
-        if q[int(b)] < 0.0:
-            mask[int(b)] = True
+        if q[b] < 0.0:
+            mask[b] = True
     return mask
 
-
-def is_q_negative_burn_center(
-    polarization: float,
-    bin_idx: int,
-    *,
-    num_bins: int = NUM_BINS,
-    shape_params: dict[str, float] | None = None,
-) -> bool:
+def is_q_negative_burn_center(polarization, bin_idx, *, num_bins=NUM_BINS, shape_params=None):
     """True when ``bin_idx`` is in the burn window and equilibrium Q < 0."""
-    if not is_burn_bin(int(bin_idx)):
+    if not is_burn_bin(bin_idx):
         return False
-    q = equilibrium_q_profile(
-        polarization, num_bins=int(num_bins), shape_params=shape_params
-    )
-    return float(q[int(bin_idx)]) < 0.0
+    q = equilibrium_q_profile(polarization, num_bins=num_bins, shape_params=shape_params)
+    return q[bin_idx] < 0.0
 
-
-def border_neighbor_mask(
-    polarization: float,
-    *,
-    num_bins: int = NUM_BINS,
-    shape_params: dict[str, float] | None = None,
-) -> np.ndarray:
+def border_neighbor_mask(polarization, *, num_bins=NUM_BINS, shape_params=None):
     """Burn-window bins with Q >= 0 adjacent to a Q < 0 bin."""
-    q = equilibrium_q_profile(
-        polarization, num_bins=int(num_bins), shape_params=shape_params
-    )
-    qneg = q_negative_burn_mask(
-        polarization, num_bins=int(num_bins), shape_params=shape_params
-    )
-    border = np.zeros(int(num_bins), dtype=bool)
+    q = equilibrium_q_profile(polarization, num_bins=num_bins, shape_params=shape_params)
+    qneg = q_negative_burn_mask(polarization, num_bins=num_bins, shape_params=shape_params)
+    border = np.zeros(num_bins, dtype=bool)
     for b in BURN_BIN_CHOICES:
-        bi = int(b)
+        bi = b
         if q[bi] >= 0.0:
             for nb in (bi - 1, bi + 1):
-                if 0 <= nb < int(num_bins) and qneg[nb]:
+                if 0 <= nb < num_bins and qneg[nb]:
                     border[bi] = True
                     break
     return border
 
-
-def neighbor_border_offsets(
-    q_eq: np.ndarray,
-    burn_bin: int,
-    *,
-    num_bins: int = NUM_BINS,
-) -> tuple[int, ...]:
+def neighbor_border_offsets(q_eq, burn_bin, *, num_bins=NUM_BINS):
     """Offsets (-1, +1) of border neighbors to record when burning at ``burn_bin``."""
-    if float(q_eq[int(burn_bin)]) >= 0.0:
+    if q_eq[burn_bin] >= 0.0:
         return ()
-    offsets: list[int] = []
+    offsets = []
     for d in (-1, 1):
-        nb = int(burn_bin) + d
-        if 0 <= nb < int(num_bins) and is_burn_bin(nb) and float(q_eq[nb]) >= 0.0:
+        nb = burn_bin + d
+        if 0 <= nb < num_bins and is_burn_bin(nb) and (q_eq[nb] >= 0.0):
             offsets.append(d)
     return tuple(offsets)
 
-
-def union_q_negative_burn_centers(
-    p_values: np.ndarray,
-    *,
-    num_bins: int = NUM_BINS,
-    shape_params: dict[str, float] | None = None,
-) -> np.ndarray:
+def union_q_negative_burn_centers(p_values, *, num_bins=NUM_BINS, shape_params=None):
     """Sorted burn-window bins that are Q < 0 for at least one P in ``p_values``."""
     shape = shape_params if shape_params is not None else get_shape_params()
-    union = np.zeros(int(num_bins), dtype=bool)
-    for p0 in np.asarray(p_values, dtype=float):
-        union |= q_negative_burn_mask(
-            float(p0), num_bins=int(num_bins), shape_params=shape
-        )
+    union = np.zeros(num_bins, dtype=bool)
+    for p0 in np.asarray(p_values):
+        union |= q_negative_burn_mask(p0, num_bins=num_bins, shape_params=shape)
     return np.flatnonzero(union).astype(int)
 
-
-def manipulation_shard_bins(*, num_bins: int = NUM_BINS) -> frozenset[int]:
+def manipulation_shard_bins(*, num_bins=NUM_BINS):
     """Burn-window bins that receive ssRF/AFP shard generation (minus exclusions)."""
     choices = np.asarray(BURN_BIN_CHOICES, dtype=int)
-    valid = choices[(choices >= 0) & (choices < int(num_bins))]
-    excluded = {
-        int(b) for b in EXCLUDED_MANIPULATION_BURN_BINS if 0 <= int(b) < int(num_bins)
-    }
-    return frozenset(int(b) for b in valid if int(b) not in excluded)
+    valid = choices[(choices >= 0) & (choices < num_bins)]
+    excluded = {b for b in EXCLUDED_MANIPULATION_BURN_BINS if 0 <= b < num_bins}
+    return frozenset((b for b in valid if b not in excluded))
 
-
-def is_manipulation_shard_bin(bin_idx: int) -> bool:
+def is_manipulation_shard_bin(bin_idx):
     """True when ``bin_idx`` may be an ssRF/AFP manipulation center."""
-    bi = int(bin_idx)
+    bi = bin_idx
     return is_burn_bin(bi) and bi not in EXCLUDED_MANIPULATION_BURN_BINS

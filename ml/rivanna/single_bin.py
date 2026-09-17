@@ -1,650 +1,380 @@
 import argparse
 import json
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
-
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
 import torch.utils.data as data
-
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 SEED = 42
-
-### Training parameters ###
-
 TRAIN_POLARIZATION_FRACTION = 0.8
-FEATURE_SET = "gamma_rf_n_steps_ps"
-TARGET_MODE = "iplus_iminus"
+FEATURE_SET = 'gamma_rf_n_steps_ps'
+TARGET_MODE = 'iplus_iminus'
 NUM_EPOCHS = 1000
 BATCH_SIZE = 64
-LEARNING_RATE = 1e-3
-WEIGHT_DECAY = 1e-4
+LEARNING_RATE = 0.001
+WEIGHT_DECAY = 0.0001
 LR_PATIENCE = 5
 PATIENCE = 50
-MIN_DELTA = 1e-6
+MIN_DELTA = 1e-06
 LR_FACTOR = 0.5
-LR_MIN = 1e-8
+LR_MIN = 1e-08
 MAX_GRAD_NORM = 1.0
 HIDDEN_DIM = 256
-HEAD_LAYOUT = "split"
+HEAD_LAYOUT = 'split'
+DEFAULT_DATA_DIR = Path('combined_train_all')
+DEFAULT_OUTPUT_DIR = Path('single_bin_models')
+VALID_TARGET_MODES = ('pq', 'iplus_iminus')
 
-DEFAULT_DATA_DIR = Path("combined_train_all")
-DEFAULT_OUTPUT_DIR = Path("single_bin_models")
-
-VALID_TARGET_MODES = ("pq", "iplus_iminus")
-
-
-def resolve_target_mode(mode: str = TARGET_MODE) -> str:
+def resolve_target_mode(mode=TARGET_MODE):
     normalized = str(mode).strip().lower()
     if normalized not in VALID_TARGET_MODES:
-        raise ValueError(
-            f"Unsupported TARGET_MODE={mode!r}; expected one of {VALID_TARGET_MODES}"
-        )
+        raise ValueError(f'Unsupported TARGET_MODE={mode!r}; expected one of {VALID_TARGET_MODES}')
     return normalized
 
-
-def target_labels(mode: str = TARGET_MODE) -> Tuple[str, str]:
+def target_labels(mode=TARGET_MODE):
     resolved = resolve_target_mode(mode)
-    if resolved == "pq":
-        return "P", "Q"
-    return "Iplus", "Iminus"
+    if resolved == 'pq':
+        return ('P', 'Q')
+    return ('Iplus', 'Iminus')
 
-
-def target_npz_keys(mode: str = TARGET_MODE) -> Tuple[str, str]:
+def target_npz_keys(mode=TARGET_MODE):
     resolved = resolve_target_mode(mode)
-    if resolved == "pq":
-        return "P", "Q"
-    return "iplus", "iminus"
+    if resolved == 'pq':
+        return ('P', 'Q')
+    return ('iplus', 'iminus')
 
+def target_stat_keys(mode=TARGET_MODE):
+    (label0, label1) = target_labels(mode)
+    return (f'{label0}_mean', f'{label0}_std', f'{label1}_mean', f'{label1}_std')
 
-def target_stat_keys(mode: str = TARGET_MODE) -> Tuple[str, str, str, str]:
-    label0, label1 = target_labels(mode)
-    return f"{label0}_mean", f"{label0}_std", f"{label1}_mean", f"{label1}_std"
+def to_column(values):
+    return torch.from_numpy(np.asarray(values)).float().reshape(-1, 1)
 
-
-def to_column(values: np.ndarray) -> torch.Tensor:
-    return torch.from_numpy(np.asarray(values, dtype=np.float32)).float().reshape(-1, 1)
-
-
-def to_matrix(values: np.ndarray) -> torch.Tensor:
-    return torch.from_numpy(np.asarray(values, dtype=np.float32)).float()
-
+def to_matrix(values):
+    return torch.from_numpy(np.asarray(values)).float()
 
 class BinModel(nn.Module):
     """Shared trunk with separate heads for the two target channels."""
 
-    def __init__(self, input_dim: int, hidden_dim: int = 128):
+    def __init__(self, input_dim, hidden_dim=128):
         super().__init__()
-        self.trunk = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim, bias=True),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim, bias=True),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim, bias=True),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim, bias=True),
-            nn.ReLU(),
-        )
+        self.trunk = nn.Sequential(nn.Linear(input_dim, hidden_dim, bias=True), nn.ReLU(), nn.Linear(hidden_dim, hidden_dim, bias=True), nn.ReLU(), nn.Linear(hidden_dim, hidden_dim, bias=True), nn.ReLU(), nn.Linear(hidden_dim, hidden_dim, bias=True), nn.ReLU())
         self.head_p = nn.Linear(hidden_dim, 1, bias=True)
         self.head_q = nn.Linear(hidden_dim, 1, bias=True)
         self._initialize_weights()
 
-    def _initialize_weights(self) -> None:
+    def _initialize_weights(self):
         for module in self.modules():
             if isinstance(module, nn.Linear):
                 nn.init.xavier_uniform_(module.weight)
                 if module.bias is not None:
                     nn.init.constant_(module.bias, 0.0)
 
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, x):
         hidden = self.trunk(x)
-        return self.head_p(hidden).squeeze(-1), self.head_q(hidden).squeeze(-1)
+        return (self.head_p(hidden).squeeze(-1), self.head_q(hidden).squeeze(-1))
 
+def _is_split_head_state_dict(state_dict):
+    return 'head_p.weight' in state_dict
 
-def _is_split_head_state_dict(state_dict: Dict[str, torch.Tensor]) -> bool:
-    return "head_p.weight" in state_dict
-
-
-def _legacy_fused_to_split_state_dict(
-    state_dict: Dict[str, torch.Tensor],
-) -> Dict[str, torch.Tensor]:
+def _legacy_fused_to_split_state_dict(state_dict):
     """Upgrade checkpoints from a single Linear(hidden, 2) output layer."""
     if _is_split_head_state_dict(state_dict):
         return state_dict
-    if "net.8.weight" not in state_dict:
-        raise KeyError(
-            "Unrecognized checkpoint layout: expected split heads (head_p/head_q) "
-            "or legacy fused net.8 output"
-        )
-    out: Dict[str, torch.Tensor] = {}
+    if 'net.8.weight' not in state_dict:
+        raise KeyError('Unrecognized checkpoint layout: expected split heads (head_p/head_q) or legacy fused net.8 output')
+    out = {}
     for layer_idx in (0, 2, 4, 6):
-        out[f"trunk.{layer_idx}.weight"] = state_dict[f"net.{layer_idx}.weight"]
-        out[f"trunk.{layer_idx}.bias"] = state_dict[f"net.{layer_idx}.bias"]
-    fused_weight = state_dict["net.8.weight"]
-    fused_bias = state_dict["net.8.bias"]
-    out["head_p.weight"] = fused_weight[0:1].clone()
-    out["head_p.bias"] = fused_bias[0:1].clone()
-    out["head_q.weight"] = fused_weight[1:2].clone()
-    out["head_q.bias"] = fused_bias[1:2].clone()
+        out[f'trunk.{layer_idx}.weight'] = state_dict[f'net.{layer_idx}.weight']
+        out[f'trunk.{layer_idx}.bias'] = state_dict[f'net.{layer_idx}.bias']
+    fused_weight = state_dict['net.8.weight']
+    fused_bias = state_dict['net.8.bias']
+    out['head_p.weight'] = fused_weight[0:1].clone()
+    out['head_p.bias'] = fused_bias[0:1].clone()
+    out['head_q.weight'] = fused_weight[1:2].clone()
+    out['head_q.bias'] = fused_bias[1:2].clone()
     return out
 
-
-def load_bin_model_state_dict(
-    model: BinModel,
-    state_dict: Dict[str, torch.Tensor],
-) -> None:
+def load_bin_model_state_dict(model, state_dict):
     """Load split-head or legacy fused-head per-bin checkpoint weights."""
     model.load_state_dict(_legacy_fused_to_split_state_dict(state_dict), strict=True)
 
-
-def resolve_bin_npz(data_dir: Path, bin_idx: int) -> Path:
+def resolve_bin_npz(data_dir, bin_idx):
     """Prefer combined train_bin_*, then ssRF / AFP organized names."""
     data_dir = Path(data_dir)
-    candidates = [
-        data_dir / f"train_bin_{int(bin_idx):04d}.npz",
-        data_dir / f"ssrf_train_bin_{int(bin_idx):04d}.npz",
-        data_dir / f"afp_train_bin_{int(bin_idx):04d}.npz",
-    ]
+    candidates = [data_dir / f'train_bin_{bin_idx:04d}.npz', data_dir / f'ssrf_train_bin_{bin_idx:04d}.npz', data_dir / f'afp_train_bin_{bin_idx:04d}.npz']
     for path in candidates:
         if path.is_file():
             return path
-    raise FileNotFoundError(
-        f"No training NPZ for bin {bin_idx} under {data_dir}; tried: "
-        + ", ".join(p.name for p in candidates)
-    )
+    raise FileNotFoundError(f'No training NPZ for bin {bin_idx} under {data_dir}; tried: ' + ', '.join((p.name for p in candidates)))
 
-
-def resolve_gamma_rf_from_npz(data: Any, path: Path) -> np.ndarray:
+def resolve_gamma_rf_from_npz(data, path):
     """Load per-row ``gamma_rf`` (0 for unmanipulated / non-ssRF rows)."""
-    if "gamma_rf" in data.files:
-        return np.asarray(data["gamma_rf"], dtype=np.float32)
-    if "applied_power" in data.files:
-        return np.asarray(data["applied_power"], dtype=np.float32)
-    if "source" in data.files:
-        source = np.asarray(data["source"], dtype=np.int32).reshape(-1)
-        n = int(source.size)
+    if 'gamma_rf' in data.files:
+        return np.asarray(data['gamma_rf'])
+    if 'applied_power' in data.files:
+        return np.asarray(data['applied_power'])
+    if 'source' in data.files:
+        source = np.asarray(data['source'], dtype=np.int32).reshape(-1)
+        n = source.size
         if n > 0 and np.all(source == 2):
-            return np.zeros(n, dtype=np.float32)
-    raise KeyError(
-        f"{path}: missing gamma_rf/applied_power; regenerate combined train NPZs "
-        "with gamma_rf or include only unmanipulated rows"
-    )
+            return np.zeros(n)
+    raise KeyError(f'{path}: missing gamma_rf/applied_power; regenerate combined train NPZs with gamma_rf or include only unmanipulated rows')
 
-
-def resolve_n_steps_from_npz(data: Any, path: Path) -> np.ndarray:
+def resolve_n_steps_from_npz(data, path):
     """Load per-row macro-step count (matches ``spectra.npz`` ``n_steps``).
 
     Prefers explicit ``n_steps``; otherwise uses trajectory frame index ``step``.
     Does **not** use ``burn_steps`` (configured combo length, not steps applied).
     """
-    if "n_steps" in data.files:
-        return np.asarray(data["n_steps"], dtype=np.float32)
-    if "step" in data.files:
-        return np.asarray(data["step"], dtype=np.float32)
-    raise KeyError(
-        f"{path}: missing n_steps/step; regenerate combined train NPZs"
-    )
+    if 'n_steps' in data.files:
+        return np.asarray(data['n_steps'])
+    if 'step' in data.files:
+        return np.asarray(data['step'])
+    raise KeyError(f'{path}: missing n_steps/step; regenerate combined train NPZs')
 
-
-def event_manipulation_features(
-    *,
-    source: int | None = None,
-    gamma_rf: float | None = None,
-    applied_power: float | None = None,
-    n_steps: float | None = None,
-) -> Tuple[float, float]:
+def event_manipulation_features(*, source=None, gamma_rf=None, applied_power=None, n_steps=None):
     """Return ``(gamma_rf, n_steps)`` for inference, aligned with train NPZs."""
-    if source is not None and int(source) != 0:
-        return 0.0, 0.0
+    if source is not None and source != 0:
+        return (0.0, 0.0)
     gamma = gamma_rf if gamma_rf is not None else applied_power
     if gamma is None:
         gamma = 0.0
-    steps = 0.0 if n_steps is None else float(n_steps)
-    return float(gamma), steps
+    steps = 0.0 if n_steps is None else n_steps
+    return (gamma, steps)
 
-
-def build_feature_row(
-    feature_names: List[str],
-    *,
-    gamma_rf: float = 0.0,
-    n_steps: float = 0.0,
-    ps: float = 0.0,
-    p0: float | None = None,
-) -> np.ndarray:
+def build_feature_row(feature_names, *, gamma_rf=0.0, n_steps=0.0, ps=0.0, p0=None):
     """Build one normalized feature vector for a single spectral bin."""
-    columns: Dict[str, float] = {
-        "gamma_rf": float(gamma_rf),
-        "n_steps": float(n_steps),
-        "ps": float(ps),
-        "ps_at_burn_bin": float(ps),
-    }
+    columns = {'gamma_rf': gamma_rf, 'n_steps': n_steps, 'ps': ps, 'ps_at_burn_bin': ps}
     if p0 is not None:
-        columns["p0"] = float(p0)
-        columns["P"] = float(p0)
+        columns['p0'] = p0
+        columns['P'] = p0
     missing = [name for name in feature_names if name not in columns]
     if missing:
-        raise KeyError(
-            f"Unsupported feature names {missing}; supported: {sorted(columns)}"
-        )
-    return np.array([columns[name] for name in feature_names], dtype=np.float32)
+        raise KeyError(f'Unsupported feature names {missing}; supported: {sorted(columns)}')
+    return np.array([columns[name] for name in feature_names])
 
-
-def build_event_feature_matrix(
-    ps: np.ndarray,
-    feature_names: List[str],
-    *,
-    gamma_rf: float = 0.0,
-    n_steps: float = 0.0,
-    p0: float | None = None,
-) -> np.ndarray:
+def build_event_feature_matrix(ps, feature_names, *, gamma_rf=0.0, n_steps=0.0, p0=None):
     """Per-bin feature matrix for one lineshape event (global gamma_rf / n_steps)."""
-    ps_arr = np.asarray(ps, dtype=np.float32).reshape(-1)
-    n = int(ps_arr.size)
-    columns: Dict[str, np.ndarray] = {
-        "gamma_rf": np.full(n, float(gamma_rf), dtype=np.float32),
-        "n_steps": np.full(n, float(n_steps), dtype=np.float32),
-        "ps": ps_arr,
-        "ps_at_burn_bin": ps_arr,
-    }
+    ps_arr = np.asarray(ps).reshape(-1)
+    n = ps_arr.size
+    columns = {'gamma_rf': np.full(n, gamma_rf), 'n_steps': np.full(n, n_steps), 'ps': ps_arr, 'ps_at_burn_bin': ps_arr}
     if p0 is not None:
         p0_val = np.float32(p0)
-        columns["p0"] = np.full(n, p0_val, dtype=np.float32)
-        columns["P"] = np.full(n, p0_val, dtype=np.float32)
+        columns['p0'] = np.full(n, p0_val)
+        columns['P'] = np.full(n, p0_val)
     missing = [name for name in feature_names if name not in columns]
     if missing:
-        raise KeyError(
-            f"Unsupported feature names {missing}; supported: {sorted(columns)}"
-        )
-    return np.column_stack([columns[name] for name in feature_names]).astype(
-        np.float32, copy=False
-    )
+        raise KeyError(f'Unsupported feature names {missing}; supported: {sorted(columns)}')
+    return np.column_stack([columns[name] for name in feature_names]).astype(np.float32, copy=False)
 
-
-def load_bin_npz(path: Path, target_mode: str = TARGET_MODE) -> Dict[str, np.ndarray]:
+def load_bin_npz(path, target_mode=TARGET_MODE):
     path = Path(path)
     mode = resolve_target_mode(target_mode)
-    key0, key1 = target_npz_keys(mode)
+    (key0, key1) = target_npz_keys(mode)
     with np.load(path, allow_pickle=False) as data:
-        ps = np.asarray(data["ps"], dtype=np.float32)
-        p0 = np.asarray(data["p0"], dtype=np.float32)
+        ps = np.asarray(data['ps'])
+        p0 = np.asarray(data['p0'])
         missing = [key for key in (key0, key1) if key not in data.files]
         if missing:
-            raise KeyError(
-                f"{path}: missing target field(s) {missing} for "
-                f"TARGET_MODE={mode!r}; regenerate train NPZs or switch mode"
-            )
+            raise KeyError(f'{path}: missing target field(s) {missing} for TARGET_MODE={mode!r}; regenerate train NPZs or switch mode')
         gamma_rf = resolve_gamma_rf_from_npz(data, path)
         n_steps = resolve_n_steps_from_npz(data, path)
-        out: Dict[str, np.ndarray] = {
-            "ps": ps,
-            "p0": p0,
-            "gamma_rf": gamma_rf,
-            "n_steps": n_steps,
-            key0: np.asarray(data[key0], dtype=np.float32),
-            key1: np.asarray(data[key1], dtype=np.float32),
-            "amp": (
-                np.asarray(data["amp"], dtype=np.float32)
-                if "amp" in data.files
-                else np.abs(ps)
-            ),
-        }
-        for optional_key in ("P", "Q", "q", "iplus", "iminus"):
+        out = {'ps': ps, 'p0': p0, 'gamma_rf': gamma_rf, 'n_steps': n_steps, key0: np.asarray(data[key0]), key1: np.asarray(data[key1]), 'amp': np.asarray(data['amp']) if 'amp' in data.files else np.abs(ps)}
+        for optional_key in ('P', 'Q', 'q', 'iplus', 'iminus'):
             if optional_key in data.files and optional_key not in out:
-                out[optional_key] = np.asarray(data[optional_key], dtype=np.float32)
-        if "is_mirror" in data.files:
-            out["is_mirror"] = np.asarray(data["is_mirror"], dtype=np.float32)
-        if "source" in data.files:
-            out["source"] = np.asarray(data["source"], dtype=np.float32)
-        if "center_bin" in data.files:
-            out["center_bin"] = np.asarray(data["center_bin"], dtype=np.float32)
-        elif "burn_bin" in data.files:
-            out["center_bin"] = np.asarray(data["burn_bin"], dtype=np.float32)
-        if "step" in data.files and "step" not in out:
-            out["step"] = np.asarray(data["step"], dtype=np.float32)
-        if "meta_json" in data.files:
-            out["meta_json"] = np.asarray(data["meta_json"])
-    n = int(ps.size)
-    for key, value in list(out.items()):
-        if key == "meta_json":
+                out[optional_key] = np.asarray(data[optional_key])
+        if 'is_mirror' in data.files:
+            out['is_mirror'] = np.asarray(data['is_mirror'])
+        if 'source' in data.files:
+            out['source'] = np.asarray(data['source'])
+        if 'center_bin' in data.files:
+            out['center_bin'] = np.asarray(data['center_bin'])
+        elif 'burn_bin' in data.files:
+            out['center_bin'] = np.asarray(data['burn_bin'])
+        if 'step' in data.files and 'step' not in out:
+            out['step'] = np.asarray(data['step'])
+        if 'meta_json' in data.files:
+            out['meta_json'] = np.asarray(data['meta_json'])
+    n = ps.size
+    for (key, value) in list(out.items()):
+        if key == 'meta_json':
             continue
-        if int(np.asarray(value).size) != n:
-            raise ValueError(
-                f"{path}: field {key!r} length {np.asarray(value).size} != ps length {n}"
-            )
+        if np.asarray(value).size != n:
+            raise ValueError(f'{path}: field {key!r} length {np.asarray(value).size} != ps length {n}')
     return out
 
+def build_features(arrays):
+    gamma_rf = arrays['gamma_rf'].reshape(-1, 1).astype(np.float32, copy=False)
+    n_steps = arrays['n_steps'].reshape(-1, 1).astype(np.float32, copy=False)
+    ps = arrays['ps'].reshape(-1, 1).astype(np.float32, copy=False)
+    features = np.concatenate([gamma_rf, n_steps, ps], axis=1).astype(np.float32, copy=False)
+    return (features, ['gamma_rf', 'n_steps', 'ps'], 2)
 
-def build_features(arrays: Dict[str, np.ndarray]) -> Tuple[np.ndarray, List[str], int]:
-    gamma_rf = arrays["gamma_rf"].reshape(-1, 1).astype(np.float32, copy=False)
-    n_steps = arrays["n_steps"].reshape(-1, 1).astype(np.float32, copy=False)
-    ps = arrays["ps"].reshape(-1, 1).astype(np.float32, copy=False)
-    features = np.concatenate([gamma_rf, n_steps, ps], axis=1).astype(
-        np.float32, copy=False
-    )
-    return features, ["gamma_rf", "n_steps", "ps"], 2
-
-
-def clip_features_z(features: np.ndarray, clip_z: float) -> np.ndarray:
-    if clip_z is None or float(clip_z) <= 0.0:
+def clip_features_z(features, clip_z):
+    if clip_z is None or clip_z <= 0.0:
         return features
     mean = features.mean(axis=0, keepdims=True)
     std = features.std(axis=0, keepdims=True)
     std = np.where(std < 1e-12, 1.0, std)
     z = (features - mean) / std
-    z = np.clip(z, -float(clip_z), float(clip_z))
+    z = np.clip(z, -clip_z, clip_z)
     return (z * std + mean).astype(np.float32, copy=False)
 
-
-def load_bin_arrays(
-    data_path: Path,
-    train_polarization_fraction: float,
-    feature_clip_z: float = 0.0,
-    target_mode: str = TARGET_MODE,
-) -> Dict[str, Any]:
+def load_bin_arrays(data_path, train_polarization_fraction, feature_clip_z=0.0, target_mode=TARGET_MODE):
     mode = resolve_target_mode(target_mode)
-    key0, key1 = target_npz_keys(mode)
+    (key0, key1) = target_npz_keys(mode)
     raw = load_bin_npz(data_path, target_mode=mode)
-    features, feature_names, ps_col = build_features(raw)
+    (features, feature_names, ps_col) = build_features(raw)
     features = clip_features_z(features, feature_clip_z)
-
-    y0_target = np.asarray(raw[key0], dtype=np.float32)
-    y1_target = np.asarray(raw[key1], dtype=np.float32)
-    polarizations = raw["p0"]
-
+    y0_target = np.asarray(raw[key0])
+    y1_target = np.asarray(raw[key1])
+    polarizations = raw['p0']
     unique_p = np.unique(polarizations)
     if unique_p.size < 2:
-        raise ValueError(
-            f"{data_path}: need >= 2 distinct p0 values for train/holdout split, "
-            f"got {unique_p.size}"
-        )
-
+        raise ValueError(f'{data_path}: need >= 2 distinct p0 values for train/holdout split, got {unique_p.size}')
     rng = np.random.default_rng(SEED)
     shuffled = rng.permutation(unique_p)
-    n_train_p = int(round(unique_p.size * float(train_polarization_fraction)))
+    n_train_p = round(unique_p.size * train_polarization_fraction)
     n_train_p = max(1, min(n_train_p, unique_p.size - 1))
     train_p = set(shuffled[:n_train_p].tolist())
     holdout_p = set(shuffled[n_train_p:].tolist())
-
     train_mask = np.isin(polarizations, list(train_p))
     holdout_mask = np.isin(polarizations, list(holdout_p))
     if not np.any(train_mask) or not np.any(holdout_mask):
-        raise RuntimeError(f"{data_path}: empty train or holdout after p0 split")
+        raise RuntimeError(f'{data_path}: empty train or holdout after p0 split')
+    return {'x_train': to_matrix(features[train_mask]), 'y0_train': to_column(y0_target[train_mask]), 'y1_train': to_column(y1_target[train_mask]), 'x_holdout': to_matrix(features[holdout_mask]), 'y0_holdout': to_column(y0_target[holdout_mask]), 'y1_holdout': to_column(y1_target[holdout_mask]), 'target_mode': mode, 'target_labels': list(target_labels(mode)), 'feature_names': feature_names, 'ps_col': ps_col, 'n_samples': features.shape[0], 'n_train': train_mask.sum(), 'n_holdout': holdout_mask.sum(), 'train_p0': sorted(train_p), 'holdout_p0': sorted(holdout_p), 'data_path': str(data_path)}
 
-    return {
-        "x_train": to_matrix(features[train_mask]),
-        "y0_train": to_column(y0_target[train_mask]),
-        "y1_train": to_column(y1_target[train_mask]),
-        "x_holdout": to_matrix(features[holdout_mask]),
-        "y0_holdout": to_column(y0_target[holdout_mask]),
-        "y1_holdout": to_column(y1_target[holdout_mask]),
-        "target_mode": mode,
-        "target_labels": list(target_labels(mode)),
-        "feature_names": feature_names,
-        "ps_col": int(ps_col),
-        "n_samples": int(features.shape[0]),
-        "n_train": int(train_mask.sum()),
-        "n_holdout": int(holdout_mask.sum()),
-        "train_p0": sorted(train_p),
-        "holdout_p0": sorted(holdout_p),
-        "data_path": str(data_path),
-    }
-
-
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="Train a single binning model for one bin index from per-bin NPZ."
-    )
-    parser.add_argument("--bin-idx", type=int, required=True, help="Target bin index")
-    parser.add_argument(
-        "--data-dir",
-        type=Path,
-        default=DEFAULT_DATA_DIR,
-        help="Directory with train_bin_XXXX.npz (or ssrf_/afp_train_bin_XXXX.npz)",
-    )
-    parser.add_argument(
-        "--data-file",
-        type=Path,
-        default=None,
-        help="Optional explicit NPZ path (overrides --data-dir / --bin-idx lookup)",
-    )
-    parser.add_argument(
-        "--output-dir",
-        type=Path,
-        default=DEFAULT_OUTPUT_DIR,
-        help="Directory for checkpoints and metrics",
-    )
-    parser.add_argument(
-        "--feature-clip-z",
-        type=float,
-        default=0.0,
-        help="Optional |z|-clip on ps before split (0 disables)",
-    )
-    parser.add_argument(
-        "--train-polarization-fraction",
-        type=float,
-        default=TRAIN_POLARIZATION_FRACTION,
-        help="Fraction of distinct p0 values used for training",
-    )
+def parse_args():
+    parser = argparse.ArgumentParser(description='Train a single binning model for one bin index from per-bin NPZ.')
+    parser.add_argument('--bin-idx', type=int, required=True, help='Target bin index')
+    parser.add_argument('--data-dir', type=Path, default=DEFAULT_DATA_DIR, help='Directory with train_bin_XXXX.npz (or ssrf_/afp_train_bin_XXXX.npz)')
+    parser.add_argument('--data-file', type=Path, default=None, help='Optional explicit NPZ path (overrides --data-dir / --bin-idx lookup)')
+    parser.add_argument('--output-dir', type=Path, default=DEFAULT_OUTPUT_DIR, help='Directory for checkpoints and metrics')
+    parser.add_argument('--feature-clip-z', type=float, default=0.0, help='Optional |z|-clip on ps before split (0 disables)')
+    parser.add_argument('--train-polarization-fraction', type=float, default=TRAIN_POLARIZATION_FRACTION, help='Fraction of distinct p0 values used for training')
     return parser.parse_args()
 
-
-def build_bin_datasets(
-    arrays: Dict[str, Any],
-    validation_fraction: float,
-) -> Tuple[data.TensorDataset, data.TensorDataset, data.TensorDataset, Dict[str, Any]]:
-    mode = resolve_target_mode(str(arrays.get("target_mode", TARGET_MODE)))
-    mean0_key, std0_key, mean1_key, std1_key = target_stat_keys(mode)
-
-    x_train = arrays["x_train"]
-    x_holdout = arrays["x_holdout"]
-    ps_col = int(arrays["ps_col"])
-
+def build_bin_datasets(arrays, validation_fraction):
+    mode = resolve_target_mode(str(arrays.get('target_mode', TARGET_MODE)))
+    (mean0_key, std0_key, mean1_key, std1_key) = target_stat_keys(mode)
+    x_train = arrays['x_train']
+    x_holdout = arrays['x_holdout']
+    ps_col = arrays['ps_col']
     x_mean = x_train.mean(dim=0, keepdim=True)
     x_std = x_train.std(dim=0, keepdim=True).clamp_min(1e-12)
     x_train_norm = (x_train - x_mean) / x_std
     x_holdout_norm = (x_holdout - x_mean) / x_std
-
-    y0_train = arrays["y0_train"]
-    y1_train = arrays["y1_train"]
-    y0_holdout = arrays["y0_holdout"]
-    y1_holdout = arrays["y1_holdout"]
-
+    y0_train = arrays['y0_train']
+    y1_train = arrays['y1_train']
+    y0_holdout = arrays['y0_holdout']
+    y1_holdout = arrays['y1_holdout']
     y0_mean = y0_train.mean()
     y0_std = y0_train.std().clamp_min(1e-12)
     y1_mean = y1_train.mean()
     y1_std = y1_train.std().clamp_min(1e-12)
-
-    stats: Dict[str, Any] = {
-        "x_mean": x_mean.detach().cpu(),
-        "x_std": x_std.detach().cpu(),
-        "ps_mean": x_mean[0, ps_col].detach().cpu(),
-        "ps_std": x_std[0, ps_col].detach().cpu(),
-        "ps_col": ps_col,
-        "target_mode": mode,
-        mean0_key: y0_mean.detach().cpu(),
-        std0_key: y0_std.detach().cpu(),
-        mean1_key: y1_mean.detach().cpu(),
-        std1_key: y1_std.detach().cpu(),
-    }
-
+    stats = {'x_mean': x_mean.detach().cpu(), 'x_std': x_std.detach().cpu(), 'ps_mean': x_mean[0, ps_col].detach().cpu(), 'ps_std': x_std[0, ps_col].detach().cpu(), 'ps_col': ps_col, 'target_mode': mode, mean0_key: y0_mean.detach().cpu(), std0_key: y0_std.detach().cpu(), mean1_key: y1_mean.detach().cpu(), std1_key: y1_std.detach().cpu()}
     y0_train_norm = (y0_train - y0_mean) / y0_std
     y1_train_norm = (y1_train - y1_mean) / y1_std
     y0_holdout_norm = (y0_holdout - y0_mean) / y0_std
     y1_holdout_norm = (y1_holdout - y1_mean) / y1_std
-
     train_dataset = data.TensorDataset(x_train_norm, y0_train_norm, y1_train_norm)
-    split_source = data.TensorDataset(
-        x_holdout_norm,
-        y0_holdout_norm,
-        y1_holdout_norm,
-    )
-
-    val_count = int(round(len(split_source) * validation_fraction))
+    split_source = data.TensorDataset(x_holdout_norm, y0_holdout_norm, y1_holdout_norm)
+    val_count = round(len(split_source) * validation_fraction)
     val_count = max(1, min(val_count, len(split_source) - 1))
     test_count = len(split_source) - val_count
-    val_dataset, test_dataset = data.random_split(
-        split_source,
-        [val_count, test_count],
-        generator=torch.Generator().manual_seed(SEED),
-    )
-
+    (val_dataset, test_dataset) = data.random_split(split_source, [val_count, test_count], generator=torch.Generator().manual_seed(SEED))
     val_indices = val_dataset.indices
     test_indices = test_dataset.indices
+    val_bin_dataset = data.TensorDataset(split_source.tensors[0][val_indices], split_source.tensors[1][val_indices], split_source.tensors[2][val_indices])
+    test_bin_dataset = data.TensorDataset(split_source.tensors[0][test_indices], split_source.tensors[1][test_indices], split_source.tensors[2][test_indices])
+    return (train_dataset, val_bin_dataset, test_bin_dataset, stats)
 
-    val_bin_dataset = data.TensorDataset(
-        split_source.tensors[0][val_indices],
-        split_source.tensors[1][val_indices],
-        split_source.tensors[2][val_indices],
-    )
-    test_bin_dataset = data.TensorDataset(
-        split_source.tensors[0][test_indices],
-        split_source.tensors[1][test_indices],
-        split_source.tensors[2][test_indices],
-    )
+def clone_state_dict(model):
+    return {key: value.detach().cpu().clone() for (key, value) in model.state_dict().items()}
 
-    return train_dataset, val_bin_dataset, test_bin_dataset, stats
-
-
-def clone_state_dict(model: nn.Module) -> Dict[str, torch.Tensor]:
-    return {key: value.detach().cpu().clone() for key, value in model.state_dict().items()}
-
-
-def train_model(
-    train_dataset: data.TensorDataset,
-    val_dataset: data.TensorDataset,
-    args: argparse.Namespace,
-    stats: Dict[str, Any],
-    device: torch.device = DEVICE,
-) -> Tuple[nn.Module, float]:
-    train_loader = data.DataLoader(
-        train_dataset, batch_size=BATCH_SIZE, shuffle=True
-    )
-    val_loader = data.DataLoader(
-        val_dataset, batch_size=BATCH_SIZE, shuffle=False
-    )
-
-    model = BinModel(
-        input_dim=train_dataset.tensors[0].shape[1],
-        hidden_dim=HIDDEN_DIM,
-    ).to(device)
-
-    best_val_loss = float("inf")
+def train_model(train_dataset, val_dataset, args, stats, device=DEVICE):
+    train_loader = data.DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
+    val_loader = data.DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False)
+    model = BinModel(input_dim=train_dataset.tensors[0].shape[1], hidden_dim=HIDDEN_DIM).to(device)
+    best_val_loss = 'inf'
     best_model_state = None
-
-    optimizer = optim.AdamW(
-        model.parameters(),
-        lr=LEARNING_RATE,
-        weight_decay=WEIGHT_DECAY,
-    )
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer,
-        mode="min",
-        factor=LR_FACTOR,
-        patience=LR_PATIENCE,
-        min_lr=LR_MIN,
-    )
+    optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=LR_FACTOR, patience=LR_PATIENCE, min_lr=LR_MIN)
     loss_fn = nn.L1Loss()
     epochs_without_improvement = 0
-
     for epoch in range(NUM_EPOCHS):
         model.train()
         train_loss_sum = 0.0
         train_batches = 0
-        for x_batch, y_p, y_q in train_loader:
+        for (x_batch, y_p, y_q) in train_loader:
             x_batch = x_batch.to(device)
             y_p = y_p.squeeze(-1).to(device)
             y_q = y_q.squeeze(-1).to(device)
-            pred_p, pred_q = model(x_batch)
+            (pred_p, pred_q) = model(x_batch)
             loss = loss_fn(pred_p, y_p) + loss_fn(pred_q, y_q)
-
             optimizer.zero_grad()
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), MAX_GRAD_NORM)
             optimizer.step()
-
             train_loss_sum += loss.item()
             train_batches += 1
-
         avg_train_loss = train_loss_sum / max(train_batches, 1)
-
         model.eval()
         val_loss_sum = 0.0
         val_batches = 0
         with torch.no_grad():
-            for x_val, y_p_val, y_q_val in val_loader:
+            for (x_val, y_p_val, y_q_val) in val_loader:
                 x_val = x_val.to(device)
                 y_p_val = y_p_val.squeeze(-1).to(device)
                 y_q_val = y_q_val.squeeze(-1).to(device)
-                pred_p_val, pred_q_val = model(x_val)
+                (pred_p_val, pred_q_val) = model(x_val)
                 val_loss = loss_fn(pred_p_val, y_p_val) + loss_fn(pred_q_val, y_q_val)
                 val_loss_sum += val_loss.item()
                 val_batches += 1
-
         avg_val_loss = val_loss_sum / max(val_batches, 1)
         scheduler.step(avg_val_loss)
-
         if best_model_state is None or avg_val_loss < best_val_loss - MIN_DELTA:
             best_val_loss = avg_val_loss
             best_model_state = clone_state_dict(model)
             epochs_without_improvement = 0
         else:
             epochs_without_improvement += 1
-
         if epoch % 50 == 0 or epoch == NUM_EPOCHS - 1:
-            current_lr = optimizer.param_groups[0]["lr"]
-            print(
-                f"Bin {args.bin_idx} | epoch {epoch:04d} | "
-                f"train {avg_train_loss:.6f} | val {avg_val_loss:.6f} | "
-                f"lr {current_lr:.2e}",
-                flush=True,
-            )
-
+            current_lr = optimizer.param_groups[0]['lr']
+            print(f'Bin {args.bin_idx} | epoch {epoch:04d} | train {avg_train_loss:.6f} | val {avg_val_loss:.6f} | lr {current_lr:.2e}', flush=True)
         if epochs_without_improvement >= PATIENCE:
-            print(
-                f"Stopping early at epoch {epoch} (best val {best_val_loss:.6f})",
-                flush=True,
-            )
+            print(f'Stopping early at epoch {epoch} (best val {best_val_loss:.6f})', flush=True)
             break
-
     if best_model_state is not None:
         model.load_state_dict(best_model_state)
+    return (model, best_val_loss)
 
-    return model, best_val_loss
-
-
-def evaluate_model(
-    model: nn.Module,
-    test_dataset: data.TensorDataset,
-    stats: Dict[str, Any],
-    device: torch.device,
-) -> Dict[str, float]:
+def evaluate_model(model, test_dataset, stats, device):
     test_loader = data.DataLoader(test_dataset, batch_size=1024, shuffle=False)
     loss_fn = nn.L1Loss()
-
-    mode = resolve_target_mode(str(stats.get("target_mode", TARGET_MODE)))
-    label0, label1 = target_labels(mode)
-    mean0_key, std0_key, mean1_key, std1_key = target_stat_keys(mode)
-    y0_mean = float(stats[mean0_key].item())
-    y0_std = float(stats[std0_key].item())
-    y1_mean = float(stats[mean1_key].item())
-    y1_std = float(stats[std1_key].item())
-
+    mode = resolve_target_mode(str(stats.get('target_mode', TARGET_MODE)))
+    (label0, label1) = target_labels(mode)
+    (mean0_key, std0_key, mean1_key, std1_key) = target_stat_keys(mode)
+    y0_mean = stats[mean0_key].item()
+    y0_std = stats[std0_key].item()
+    y1_mean = stats[mean1_key].item()
+    y1_std = stats[std1_key].item()
     test_loss_sum = 0.0
     test_batches = 0
-    pred_y0_batches: List[torch.Tensor] = []
-    pred_y1_batches: List[torch.Tensor] = []
-    true_y0_batches: List[torch.Tensor] = []
-    true_y1_batches: List[torch.Tensor] = []
-
+    pred_y0_batches = []
+    pred_y1_batches = []
+    true_y0_batches = []
+    true_y1_batches = []
     model.eval()
     with torch.no_grad():
-        for x_test, y0, y1 in test_loader:
+        for (x_test, y0, y1) in test_loader:
             x_test = x_test.to(device)
             y0 = y0.squeeze(-1).to(device)
             y1 = y1.squeeze(-1).to(device)
-            pred_y0, pred_y1 = model(x_test)
+            (pred_y0, pred_y1) = model(x_test)
             test_loss = loss_fn(pred_y0, y0) + loss_fn(pred_y1, y1)
             pred_y0_batches.append((pred_y0 * y0_std + y0_mean).cpu())
             pred_y1_batches.append((pred_y1 * y1_std + y1_mean).cpu())
@@ -652,12 +382,10 @@ def evaluate_model(
             true_y1_batches.append((y1 * y1_std + y1_mean).cpu())
             test_loss_sum += test_loss.item()
             test_batches += 1
-
     pred_y0 = torch.cat(pred_y0_batches).numpy()
     pred_y1 = torch.cat(pred_y1_batches).numpy()
     true_y0 = torch.cat(true_y0_batches).numpy()
     true_y1 = torch.cat(true_y1_batches).numpy()
-
     ss_res_y0 = np.sum((true_y0 - pred_y0) ** 2)
     ss_tot_y0 = np.sum((true_y0 - np.mean(true_y0)) ** 2)
     ss_res_y1 = np.sum((true_y1 - pred_y1) ** 2)
@@ -666,195 +394,61 @@ def evaluate_model(
     rpe_y1 = np.zeros_like(true_y1)
     mask_y0 = np.abs(true_y0) > 1e-10
     mask_y1 = np.abs(true_y1) > 1e-10
-    rpe_y0[mask_y0] = (
-        np.abs(pred_y0[mask_y0] - true_y0[mask_y0]) / np.abs(true_y0[mask_y0]) * 100.0
-    )
-    rpe_y1[mask_y1] = (
-        np.abs(pred_y1[mask_y1] - true_y1[mask_y1]) / np.abs(true_y1[mask_y1]) * 100.0
-    )
+    rpe_y0[mask_y0] = np.abs(pred_y0[mask_y0] - true_y0[mask_y0]) / np.abs(true_y0[mask_y0]) * 100.0
+    rpe_y1[mask_y1] = np.abs(pred_y1[mask_y1] - true_y1[mask_y1]) / np.abs(true_y1[mask_y1]) * 100.0
+    return {'test_l1_loss': test_loss_sum / max(test_batches, 1), f'l1_{label0}': np.mean(np.abs(true_y0 - pred_y0)), f'l1_{label1}': np.mean(np.abs(true_y1 - pred_y1)), f'r2_{label0}': 1.0 - ss_res_y0 / (ss_tot_y0 + 1e-12), f'r2_{label1}': 1.0 - ss_res_y1 / (ss_tot_y1 + 1e-12), f'median_rpe_{label0}': np.median(rpe_y0[mask_y0]) if np.any(mask_y0) else 0.0, f'median_rpe_{label1}': np.median(rpe_y1[mask_y1]) if np.any(mask_y1) else 0.0}
 
-    return {
-        "test_l1_loss": test_loss_sum / max(test_batches, 1),
-        f"l1_{label0}": float(np.mean(np.abs(true_y0 - pred_y0))),
-        f"l1_{label1}": float(np.mean(np.abs(true_y1 - pred_y1))),
-        f"r2_{label0}": 1.0 - float(ss_res_y0 / (ss_tot_y0 + 1e-12)),
-        f"r2_{label1}": 1.0 - float(ss_res_y1 / (ss_tot_y1 + 1e-12)),
-        f"median_rpe_{label0}": (
-            float(np.median(rpe_y0[mask_y0])) if np.any(mask_y0) else 0.0
-        ),
-        f"median_rpe_{label1}": (
-            float(np.median(rpe_y1[mask_y1])) if np.any(mask_y1) else 0.0
-        ),
-    }
-
-
-def _validate_saved_stats(
-    stats: Dict[str, Any],
-    arrays: Dict[str, Any],
-    *,
-    bin_idx: int,
-) -> None:
+def _validate_saved_stats(stats, arrays, *, bin_idx):
     """Sanity-check normalization stats before writing a checkpoint."""
-    x_train = arrays.get("x_train")
+    x_train = arrays.get('x_train')
     if x_train is None:
         return
-    x_mean = stats["x_mean"].reshape(-1)
-    feature_names = list(arrays.get("feature_names", []))
+    x_mean = stats['x_mean'].reshape(-1)
+    feature_names = list(arrays.get('feature_names', []))
     if x_train.shape[0] == 0 or x_mean.numel() == 0:
         return
-    n_check = min(int(x_mean.numel()), int(x_train.shape[1]))
+    n_check = min(x_mean.numel(), x_train.shape[1])
     for col in range(n_check):
-        train_col = np.asarray(x_train[:, col].numpy(), dtype=np.float64)
-        expected = float(np.mean(train_col))
-        saved = float(x_mean[col].item())
-        if abs(saved - expected) > 1e-4:
-            name = feature_names[col] if col < len(feature_names) else f"col{col}"
-            raise RuntimeError(
-                f"bin {bin_idx}: X_mean[{name}]={saved:.6f} != train mean "
-                f"{expected:.6f}; refusing to save a corrupt checkpoint"
-            )
+        train_col = np.asarray(x_train[:, col].numpy())
+        expected = np.mean(train_col)
+        saved = x_mean[col].item()
+        if abs(saved - expected) > 0.0001:
+            name = feature_names[col] if col < len(feature_names) else f'col{col}'
+            raise RuntimeError(f'bin {bin_idx}: X_mean[{name}]={saved:.6f} != train mean {expected:.6f}; refusing to save a corrupt checkpoint')
 
-
-def save_outputs(
-    args: argparse.Namespace,
-    model: nn.Module,
-    best_val_loss: float,
-    stats: Dict[str, Any],
-    metrics: Dict[str, float],
-    feature_names: List[str],
-    model_path: Path,
-    metrics_path: Path,
-    *,
-    arrays: Dict[str, Any] | None = None,
-) -> None:
-    _validate_saved_stats(stats, arrays or {}, bin_idx=int(args.bin_idx))
-    mode = resolve_target_mode(str(stats.get("target_mode", TARGET_MODE)))
-    mean0_key, std0_key, mean1_key, std1_key = target_stat_keys(mode)
-    x_mean = stats["x_mean"].numpy().reshape(-1)
-    x_std = stats["x_std"].numpy().reshape(-1)
-    is_pq = mode == "pq"
-    payload: Dict[str, Any] = {
-        "model_state_dict": model.state_dict(),
-        "best_val_loss": best_val_loss,
-        "X_mean": x_mean,
-        "X_std": x_std,
-        "Ps_mean": float(stats["ps_mean"].item()),
-        "Ps_std": float(stats["ps_std"].item()),
-        "target_mode": mode,
-        "head_layout": HEAD_LAYOUT,
-        "ps_col": int(stats["ps_col"]),
-        "feature_names": list(feature_names),
-        "input_dim": int(len(feature_names)),
-        "use_hidden": True,
-        "bin_idx": args.bin_idx,
-        "hidden_dim": HIDDEN_DIM,
-        "metrics": metrics,
-        mean0_key: float(stats[mean0_key].item()),
-        std0_key: float(stats[std0_key].item()),
-        mean1_key: float(stats[mean1_key].item()),
-        std1_key: float(stats[std1_key].item()),
-        "targets_precalibrated": bool(is_pq),
-        "pq_target_scope": "per_bin" if is_pq else "",
-        "pq_post_correct": bool(is_pq),
-        "args": {
-            **{k: (str(v) if isinstance(v, Path) else v) for k, v in vars(args).items()},
-            "feature_set": FEATURE_SET,
-            "target_mode": mode,
-        },
-    }
+def save_outputs(args, model, best_val_loss, stats, metrics, feature_names, model_path, metrics_path, *, arrays=None):
+    _validate_saved_stats(stats, arrays or {}, bin_idx=args.bin_idx)
+    mode = resolve_target_mode(str(stats.get('target_mode', TARGET_MODE)))
+    (mean0_key, std0_key, mean1_key, std1_key) = target_stat_keys(mode)
+    x_mean = stats['x_mean'].numpy().reshape(-1)
+    x_std = stats['x_std'].numpy().reshape(-1)
+    is_pq = mode == 'pq'
+    payload = {'model_state_dict': model.state_dict(), 'best_val_loss': best_val_loss, 'X_mean': x_mean, 'X_std': x_std, 'Ps_mean': stats['ps_mean'].item(), 'Ps_std': stats['ps_std'].item(), 'target_mode': mode, 'head_layout': HEAD_LAYOUT, 'ps_col': stats['ps_col'], 'feature_names': list(feature_names), 'input_dim': len(feature_names), 'use_hidden': True, 'bin_idx': args.bin_idx, 'hidden_dim': HIDDEN_DIM, 'metrics': metrics, mean0_key: stats[mean0_key].item(), std0_key: stats[std0_key].item(), mean1_key: stats[mean1_key].item(), std1_key: stats[std1_key].item(), 'targets_precalibrated': is_pq, 'pq_target_scope': 'per_bin' if is_pq else '', 'pq_post_correct': is_pq, 'args': {**{k: str(v) if isinstance(v, Path) else v for (k, v) in vars(args).items()}, 'feature_set': FEATURE_SET, 'target_mode': mode}}
     torch.save(payload, model_path)
+    metrics_payload = {'bin_idx': args.bin_idx, 'model': str(model_path), 'best_val_loss': best_val_loss, 'feature_names': list(feature_names), **metrics}
+    metrics_path.write_text(json.dumps(metrics_payload, indent=2) + '\n')
 
-    metrics_payload = {
-        "bin_idx": args.bin_idx,
-        "model": str(model_path),
-        "best_val_loss": best_val_loss,
-        "feature_names": list(feature_names),
-        **metrics,
-    }
-    metrics_path.write_text(json.dumps(metrics_payload, indent=2) + "\n")
-
-
-def main() -> None:
+def main():
     args = parse_args()
-
-    model_path = args.output_dir / f"binning_model_bin_{args.bin_idx}.pth"
-    metrics_path = args.output_dir / f"binning_model_bin_{args.bin_idx}_metrics.json"
+    model_path = args.output_dir / f'binning_model_bin_{args.bin_idx}.pth'
+    metrics_path = args.output_dir / f'binning_model_bin_{args.bin_idx}_metrics.json'
     args.output_dir.mkdir(parents=True, exist_ok=True)
-
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(SEED)
     np.random.seed(SEED)
     torch.manual_seed(SEED)
-
     mode = resolve_target_mode(TARGET_MODE)
-    label0, label1 = target_labels(mode)
-    data_path = (
-        Path(args.data_file)
-        if args.data_file is not None
-        else resolve_bin_npz(args.data_dir, args.bin_idx)
-    )
-    print(
-        f"bin_idx={args.bin_idx}  data={data_path}  features={FEATURE_SET}  "
-        f"targets={label0},{label1} (mode={mode})  device={DEVICE}",
-        flush=True,
-    )
-
-    arrays = load_bin_arrays(
-        data_path=data_path,
-        train_polarization_fraction=args.train_polarization_fraction,
-        feature_clip_z=args.feature_clip_z,
-        target_mode=mode,
-    )
-    print(
-        f"samples={arrays['n_samples']}  train={arrays['n_train']}  "
-        f"holdout={arrays['n_holdout']}  features={arrays['feature_names']}",
-        flush=True,
-    )
-
-    train_dataset, val_dataset, test_dataset, stats = build_bin_datasets(
-        arrays=arrays,
-        validation_fraction=0.5,
-    )
-
-    model, best_val_loss = train_model(
-        train_dataset=train_dataset,
-        val_dataset=val_dataset,
-        args=args,
-        stats=stats,
-        device=DEVICE,
-    )
-    metrics = evaluate_model(
-        model=model,
-        test_dataset=test_dataset,
-        stats=stats,
-        device=DEVICE,
-    )
-    save_outputs(
-        args=args,
-        model=model,
-        best_val_loss=best_val_loss,
-        stats=stats,
-        metrics=metrics,
-        feature_names=arrays["feature_names"],
-        model_path=model_path,
-        metrics_path=metrics_path,
-        arrays=arrays,
-    )
-
-    print(f"Saved model to {model_path}", flush=True)
-    print(f"Saved metrics to {metrics_path}", flush=True)
-    print(
-        " | ".join(
-            [
-                f"best_val={best_val_loss:.6f}",
-                f"test_l1={metrics['test_l1_loss']:.6f}",
-                f"r2_{label0}={metrics[f'r2_{label0}']:.6f}",
-                f"r2_{label1}={metrics[f'r2_{label1}']:.6f}",
-            ]
-        ),
-        flush=True,
-    )
-
-
-if __name__ == "__main__":
+    (label0, label1) = target_labels(mode)
+    data_path = Path(args.data_file) if args.data_file is not None else resolve_bin_npz(args.data_dir, args.bin_idx)
+    print(f'bin_idx={args.bin_idx}  data={data_path}  features={FEATURE_SET}  targets={label0},{label1} (mode={mode})  device={DEVICE}', flush=True)
+    arrays = load_bin_arrays(data_path=data_path, train_polarization_fraction=args.train_polarization_fraction, feature_clip_z=args.feature_clip_z, target_mode=mode)
+    print(f"samples={arrays['n_samples']}  train={arrays['n_train']}  holdout={arrays['n_holdout']}  features={arrays['feature_names']}", flush=True)
+    (train_dataset, val_dataset, test_dataset, stats) = build_bin_datasets(arrays=arrays, validation_fraction=0.5)
+    (model, best_val_loss) = train_model(train_dataset=train_dataset, val_dataset=val_dataset, args=args, stats=stats, device=DEVICE)
+    metrics = evaluate_model(model=model, test_dataset=test_dataset, stats=stats, device=DEVICE)
+    save_outputs(args=args, model=model, best_val_loss=best_val_loss, stats=stats, metrics=metrics, feature_names=arrays['feature_names'], model_path=model_path, metrics_path=metrics_path, arrays=arrays)
+    print(f'Saved model to {model_path}', flush=True)
+    print(f'Saved metrics to {metrics_path}', flush=True)
+    print(' | '.join([f'best_val={best_val_loss:.6f}', f"test_l1={metrics['test_l1_loss']:.6f}", f"r2_{label0}={metrics[f'r2_{label0}']:.6f}", f"r2_{label1}={metrics[f'r2_{label1}']:.6f}"]), flush=True)
+if __name__ == '__main__':
     main()

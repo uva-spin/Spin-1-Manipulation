@@ -3,41 +3,33 @@ from scipy.integrate import trapezoid
 from scipy.special import wofz
 from scipy.signal import hilbert
 
-def Baseline(f, U, Cknob, eta, trim, Cstray, phi_const, DC_offset, species: str):
-    # Preamble
-    circ_consts = (3*10**(-8), 0.35, 619, 50, 10, 0.0343, 4.752*10**(-9), 50, 1.027*10**(-10), 2.542*10**(-7), 0, 0, 0, 0)
+def Baseline(f, U, Cknob, eta, trim, Cstray, phi_const, DC_offset, species):
+    circ_consts = (3 * 10 ** (-8), 0.35, 619, 50, 10, 0.0343, 4.752 * 10 ** (-9), 50, 1.027 * 10 ** (-10), 2.542 * 10 ** (-7), 0, 0, 0, 0)
     pi = np.pi
-    im_unit = 1j  
+    im_unit = 1j
     sign = 1
-    span = 6 ## default span for now
-
-    # Main constants
-    L0, Rcoil, R, R1, r, alpha, beta1, Z_cable, D, M, delta_C, delta_phi, delta_phase, delta_l = circ_consts
-
-    I = U*1000/R  # Ideal constant current, mA
-
+    span = 6
+    (L0, Rcoil, R, R1, r, alpha, beta1, Z_cable, D, M, delta_C, delta_phi, delta_phase, delta_l) = circ_consts
+    I = U * 1000 / R
     if species == 'proton':
-        w_res = 2 * pi * 213e6
-        w_low = 2 * pi * (213 - span) * 1e6
-        w_high = 2 * pi * (213 + span) * 1e6
-        delta_w = 2 * pi * 4e6 / 500
+        w_res = 2 * pi * 213000000.0
+        w_low = 2 * pi * (213 - span) * 1000000.0
+        w_high = 2 * pi * (213 + span) * 1000000.0
+        delta_w = 2 * pi * 4000000.0 / 500
     elif species == 'deuteron':
-        w_res = 2 * pi * 32.68e6
-        w_low = 2 * pi * (32.68 - span) * 1e6
-        w_high = 2 * pi * (32.68 + span) * 1e6
-        delta_w = 2 * pi * 4e6 / 500
+        w_res = 2 * pi * 32680000.0
+        w_low = 2 * pi * (32.68 - span) * 1000000.0
+        w_high = 2 * pi * (32.68 + span) * 1000000.0
+        delta_w = 2 * pi * 4000000.0 / 500
     else:
         raise ValueError(f"Invalid species: {species}. Choose 'proton' or 'deuteron'.")
+    w = 2 * pi * f * 1000000.0
 
-    # Convert frequency to angular frequency (rad/s)
-    w = 2 * pi * f * 1e6
-
-    # Functions
     def slope():
-        return delta_C / (0.25 * 2 * pi * 1e6)
+        return delta_C / (0.25 * 2 * pi * 1000000.0)
 
     def slope_phi():
-        return delta_phi / (0.25 * 2 * pi * 1e6)
+        return delta_phi / (0.25 * 2 * pi * 1000000.0)
 
     def Ctrim(w):
         return slope() * (w - w_res)
@@ -52,19 +44,19 @@ def Baseline(f, U, Cknob, eta, trim, Cstray, phi_const, DC_offset, species: str)
         S = 2 * Z_cable * alpha
         with np.errstate(divide='ignore', invalid='ignore'):
             result = np.sqrt((S + w * M * im_unit) / (w * D * im_unit))
-        return np.where(w == 0, 0, result)  # Avoid invalid values for w=0
+        return np.where(w == 0, 0, result)
 
     def beta(w):
         return beta1 * w
 
     def gamma(w):
-        return alpha + beta(w) * 1j  # Create a complex number using numpy
+        return alpha + beta(w) * 1j
 
     def ZC(w):
         Cw = C(w)
         with np.errstate(divide='ignore', invalid='ignore'):
             result = np.where(Cw != 0, 1 / (im_unit * w * Cw), 0)
-        return np.where(w == 0, 0, result)  # Avoid invalid values for w=0
+        return np.where(w == 0, 0, result)
 
     def vel(w):
         return 1 / beta(w)
@@ -76,7 +68,7 @@ def Baseline(f, U, Cknob, eta, trim, Cstray, phi_const, DC_offset, species: str)
         return 0.11133
 
     def chi(w):
-        return np.zeros_like(w)  # Placeholder for x1(w) and x2(w)
+        return np.zeros_like(w)
 
     def pt(w):
         return ic(w)
@@ -90,30 +82,28 @@ def Baseline(f, U, Cknob, eta, trim, Cstray, phi_const, DC_offset, species: str)
     def Zstray(w):
         with np.errstate(divide='ignore', invalid='ignore'):
             result = np.where(Cstray != 0, 1 / (im_unit * w * Cstray), 0)
-        return np.where(w == 0, 0, result)  # Avoid invalid values for w=0
+        return np.where(w == 0, 0, result)
 
     def ZL(w):
         return ZLpure(w) * Zstray(w) / (ZLpure(w) + Zstray(w))
 
     def ZT(w):
-        epsilon = 1e-10  # Small constant to avoid division by zero
+        epsilon = 1e-10
         return Z0(w) * (ZL(w) + Z0(w) * np.tanh(gamma(w) * l(w))) / (Z0(w) + ZL(w) * np.tanh(gamma(w) * l(w)) + epsilon)
 
     def Zleg1(w):
         return r + ZC(w) + ZT(w)
 
     def Ztotal(w):
-        return R1 / (1 + (R1 / Zleg1(w)))
+        return R1 / (1 + R1 / Zleg1(w))
 
     def parfaze(w):
         yp1 = 0
         yp2 = delta_phase
         yp3 = 0
-
-        a = ((yp1 - yp2) * (w_low - w_high) - (yp1 - yp3) * (w_low - w_res)) / \
-            (((w_low ** 2) - (w_res ** 2)) * (w_low - w_high) - ((w_low ** 2) - (w_high ** 2)) * (w_low - w_res))
-        bb = (yp1 - yp3 - a * ((w_low ** 2) - (w_high ** 2))) / (w_low - w_high)
-        c = yp1 - a * (w_low ** 2) - bb * w_low
+        a = ((yp1 - yp2) * (w_low - w_high) - (yp1 - yp3) * (w_low - w_res)) / ((w_low ** 2 - w_res ** 2) * (w_low - w_high) - (w_low ** 2 - w_high ** 2) * (w_low - w_res))
+        bb = (yp1 - yp3 - a * (w_low ** 2 - w_high ** 2)) / (w_low - w_high)
+        c = yp1 - a * w_low ** 2 - bb * w_low
         return a * w ** 2 + bb * w + c
 
     def phi_trim(w):
@@ -124,25 +114,23 @@ def Baseline(f, U, Cknob, eta, trim, Cstray, phi_const, DC_offset, species: str)
 
     def V_out(w):
         return -1 * (I * Ztotal(w) * np.exp(im_unit * phi(w) * pi / 180))
-
     out_y = V_out(w)
     offset = np.array([x - min(out_y.real) for x in out_y.real])
-    
     return offset.real + DC_offset
 
-def Lineshape(x,eps, eta, phi, g):
+def Lineshape(x, eps, eta, phi, g):
 
-    def bigy(eta,phi):
-        return np.sqrt(3 - eta*np.cos(2*phi))
-    
+    def bigy(eta, phi):
+        return np.sqrt(3 - eta * np.cos(2 * phi))
+
     def cosal(x, eps):
-        return (1 - eps * x - eta*np.cos(2*phi)) / bigxsquare(x, eps)
+        return (1 - eps * x - eta * np.cos(2 * phi)) / bigxsquare(x, eps)
 
     def c(x):
-        return np.sqrt(np.sqrt(g**2 + (1 - x - eta*np.cos(2*phi))**2))
+        return np.sqrt(np.sqrt(g ** 2 + (1 - x - eta * np.cos(2 * phi)) ** 2))
 
     def bigxsquare(x, eps):
-        return np.sqrt(g**2 + (1 - eps * x - eta*np.cos(2*phi))**2)
+        return np.sqrt(g ** 2 + (1 - eps * x - eta * np.cos(2 * phi)) ** 2)
 
     def mult_term(x, eps):
         return 1 / (2 * np.pi * np.sqrt(bigxsquare(x, eps)))
@@ -154,67 +142,55 @@ def Lineshape(x,eps, eta, phi, g):
         return np.sqrt((1 - cosal(x, eps)) / 2)
 
     def termone(x, eps):
-        return np.pi / 2 + np.arctan((bigy(eta,phi)**2 - bigxsquare(x, eps)) / (2 * bigy(eta,phi) * np.sqrt(bigxsquare(x, eps)) * sinaltwo(x, eps)))
+        return np.pi / 2 + np.arctan((bigy(eta, phi) ** 2 - bigxsquare(x, eps)) / (2 * bigy(eta, phi) * np.sqrt(bigxsquare(x, eps)) * sinaltwo(x, eps)))
 
     def termtwo(x, eps):
-        return np.log((bigy(eta,phi)**2 + bigxsquare(x, eps) + 2 * bigy(eta,phi) * np.sqrt(bigxsquare(x, eps)) * cosaltwo(x, eps)) /
-                    (bigy(eta,phi)**2 + bigxsquare(x, eps) - 2 * bigy(eta,phi) * np.sqrt(bigxsquare(x, eps)) * cosaltwo(x, eps)))
+        return np.log((bigy(eta, phi) ** 2 + bigxsquare(x, eps) + 2 * bigy(eta, phi) * np.sqrt(bigxsquare(x, eps)) * cosaltwo(x, eps)) / (bigy(eta, phi) ** 2 + bigxsquare(x, eps) - 2 * bigy(eta, phi) * np.sqrt(bigxsquare(x, eps)) * cosaltwo(x, eps)))
 
     def icurve(x, eps):
         return mult_term(x, eps) * (2 * cosaltwo(x, eps) * termone(x, eps) + sinaltwo(x, eps) * termtwo(x, eps))
-    
-    return icurve(x,eps)/10
+    return icurve(x, eps) / 10
 
-
-
-def GenerateVectorLineshape(P,x, CC, eta, phi, g):
-
-    r = (np.sqrt(4-3*P**(2))+P)/(2-2*P)
-    
+def GenerateVectorLineshape(P, x, CC, eta, phi, g):
+    r = (np.sqrt(4 - 3 * P ** 2) + P) / (2 - 2 * P)
     if P > 0:
-        Iplus = r*Lineshape(x,1, eta, phi, g)
-        Iminus = Lineshape(x,-1, eta, phi, g)
+        Iplus = r * Lineshape(x, 1, eta, phi, g)
+        Iminus = Lineshape(x, -1, eta, phi, g)
         r = r
     else:
-        r = 1/r
-        Iplus = -Lineshape(x,1, eta, phi, g)
-        Iminus = -r*Lineshape(x,-1, eta, phi, g)
-
-    ### Scaling
+        r = 1 / r
+        Iplus = -Lineshape(x, 1, eta, phi, g)
+        Iminus = -r * Lineshape(x, -1, eta, phi, g)
     pSummed = np.sum(Iplus + Iminus)
-    deltaP = P/pSummed*CC
-    Iplus = Iplus*deltaP
-    Iminus = Iminus*deltaP
+    deltaP = P / pSummed * CC
+    Iplus = Iplus * deltaP
+    Iminus = Iminus * deltaP
     signal = Iplus + Iminus
-
-    return signal,Iplus,Iminus
+    return (signal, Iplus, Iminus)
 
 def DulyaFit(x, P, scaling_factor, eta, phi, g):
     """Fitsub/basesub Dulya doublet: sign(P) reverses frequency; sum = P * scaling_factor."""
-    x = np.asarray(x, dtype=float)
-    p_signed = float(P)
+    x = np.asarray(x)
+    p_signed = P
     p_mag = abs(p_signed)
-    if p_mag < 1e-4:
-        p_mag = 1e-4
-        p_signed = 1e-4 if p_signed >= 0.0 else -1e-4
+    if p_mag < 0.0001:
+        p_mag = 0.0001
+        p_signed = 0.0001 if p_signed >= 0.0 else -0.0001
     x_use = x if p_signed >= 0.0 else -x
-
-    r = (np.sqrt(4.0 - 3.0 * p_mag**2) + p_mag) / (2.0 - 2.0 * p_mag)
+    r = (np.sqrt(4.0 - 3.0 * p_mag ** 2) + p_mag) / (2.0 - 2.0 * p_mag)
     i_plus = r * Lineshape(x_use, 1, eta, phi, g)
     i_minus = Lineshape(x_use, -1, eta, phi, g)
-
     p_summed = np.sum(i_plus + i_minus)
     if p_summed == 0.0:
-        return np.zeros_like(x, dtype=float)
-    delta_p = (p_signed / p_summed) * scaling_factor
+        return np.zeros_like(x)
+    delta_p = p_signed / p_summed * scaling_factor
     return (i_plus + i_minus) * delta_p
-
 
 def QmeterGain(x_eff, split_ref, xi):
     """Q-meter false-asymmetry correction: D = 1 + 0.5 * xi * (1 + x_eff/split_ref)."""
-    x_eff = np.asarray(x_eff, dtype=float)
-    Rq = x_eff / float(split_ref)
-    return 1.0 + 0.5 * float(xi) * (1.0 + Rq)
+    x_eff = np.asarray(x_eff)
+    Rq = x_eff / split_ref
+    return 1.0 + 0.5 * xi * (1.0 + Rq)
 
 def SamplingVectorLineshape(P, x, bound, CC, eta, phi, g):
     """Sampling the lineshape with a stochastic shift to frequency bins.
@@ -231,10 +207,9 @@ def SamplingVectorLineshape(P, x, bound, CC, eta, phi, g):
     Returns:
         signal (list): Generated lineshape with a stochastic shift
     """
-    shift = np.full(len(x),np.random.uniform( -bound , bound))
+    shift = np.full(len(x), np.random.uniform(-bound, bound))
     x += shift
-    ### Generate the lineshape with the shifted 
-    signal, _, _ = GenerateVectorLineshape(P,x, CC, eta, phi, g)
+    (signal, _, _) = GenerateVectorLineshape(P, x, CC, eta, phi, g)
     return signal
 
 def GenerateTensorLineshape(x, P, phi_deg, eta, phi, g):
@@ -255,35 +230,19 @@ def GenerateTensorLineshape(x, P, phi_deg, eta, phi, g):
     float or array-like
         The total signal value(s)
     """
-    # System parameters
     g = 0.05
     s = 0.04
     bigy = np.sqrt(3 - s)
-
-    # x = (x - 32.68) / 0.6
-    
-    # Calculate r from P
-    r = (np.sqrt(4 - 3 * P**2) + P) / (2 - 2 * P)
-    
-    # Convert phase to radians
+    r = (np.sqrt(4 - 3 * P ** 2) + P) / (2 - 2 * P)
     phi_rad = np.deg2rad(phi_deg)
-    
-    # Calculate absorptive signals
-    yvals_absorp1 = Lineshape(x, 1, eta, phi, g)        # χ''₊
-    yvals_absorp2 = Lineshape(-x, 1, eta, phi, g)       # χ''₋
-    
-    # Calculate dispersive signals using Hilbert transform
-    yvals_disp1 = np.imag(hilbert(yvals_absorp1))  # χ'₊
-    yvals_disp2 = np.imag(hilbert(yvals_absorp2))  # χ'₋
-    
-    # Calculate phase-sensitive linear combination
+    yvals_absorp1 = Lineshape(x, 1, eta, phi, g)
+    yvals_absorp2 = Lineshape(-x, 1, eta, phi, g)
+    yvals_disp1 = np.imag(hilbert(yvals_absorp1))
+    yvals_disp2 = np.imag(hilbert(yvals_absorp2))
     Iplus = r * (yvals_absorp1 * np.sin(phi_rad) + yvals_disp1 * np.cos(phi_rad))
     Iminus = yvals_absorp2 * np.sin(phi_rad) + yvals_disp2 * np.cos(phi_rad)
-
     signal = Iplus + Iminus
-    
-    # Return total signal
-    return signal, Iplus, Iminus
+    return (signal, Iplus, Iminus)
 
 def SamplingTensorLineshape(P, x, bound, eta, phi, g):
     """Sampling the lineshape with a stochastic shift to frequency bins.
@@ -297,10 +256,9 @@ def SamplingTensorLineshape(P, x, bound, eta, phi, g):
     Returns:
         signal (list): Generated lineshape with a stochastic shift
     """
-    shift = np.full(len(x),np.random.uniform( -bound , bound))
+    shift = np.full(len(x), np.random.uniform(-bound, bound))
     x += shift
-    ### Generate the lineshape with the shifted 
-    signal, _, _ = GenerateTensorLineshape(x, P, phi, eta, phi, g)
+    (signal, _, _) = GenerateTensorLineshape(x, P, phi, eta, phi, g)
     return signal
 
 def Voigt(x, amp, s, g, x0):
@@ -315,7 +273,7 @@ def Voigt(x, amp, s, g, x0):
     :return: Voigt profile values
     """
     z = (x - x0 + 1j * g) / (s * np.sqrt(2.0))
-    v = wofz(z)  # Faddeeva function for Voigt profile
+    v = wofz(z)
     out = amp * (np.real(v) / (s * np.sqrt(2 * np.pi)))
     return out
 
@@ -329,12 +287,11 @@ def generate_proton_signal(x, target_area=None):
     gam = 0.1 + np.random.uniform(-0.009, 0.001)
     amp = 0.005 + np.random.uniform(-0.0061, 0.003)
     center = 213 + np.random.uniform(-0.1, 0.1)
-
     y = Voigt(x, amp, sig, gam, center)
-    area = float(trapezoid(y, x))
+    area = trapezoid(y, x)
     if target_area is not None:
         if abs(area) < 1e-15:
-            raise ValueError("Degenerate proton Voigt area; cannot scale to target_area")
-        y = y * (float(target_area) / area)
-        area = float(target_area)
-    return y, area
+            raise ValueError('Degenerate proton Voigt area; cannot scale to target_area')
+        y = y * (target_area / area)
+        area = target_area
+    return (y, area)
