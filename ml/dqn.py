@@ -29,9 +29,9 @@ if str(RIVANNA) not in sys.path:
 from common import DIFFUSION_SCALE, DT, RF_GAUSSIAN_FWHM_R, RF_LORENTZIAN_FWHM_R, RF_MODE_PHYSICAL_VOIGT, RF_MODE_SINGLE_BIN
 from model_bridge import build_spin1_model, burn_commit_touched_bins, commit_touched_bins_only, configure_ssrf_burn, euler_n_sub
 from physics.lineshape.Lineshape import GenerateVectorLineshape
-from ssrf_realtime.conversions import physical_intensities_to_packet_n
-from ssrf_realtime.model import Spin1Model
-from ssrf_realtime.rate_equations_realtime import _value_crosses_zero, burn_preserves_ps_sign
+from physics.rf.conversions import physical_intensities_to_packet_n
+from physics.rf.model import Spin1Model
+from physics.rf.rate_equations_realtime import _value_crosses_zero, burn_preserves_ps_sign
 OUTPUT_DIR = REPO_ROOT / 'results' / 'current' / 'dqn'
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 SEED = 42
@@ -146,24 +146,24 @@ def apply_spin1_burn(model, bin_idx, gamma_rf, n_steps, *, rf_mode, gaussian_fwh
 
 @dataclass
 class BurnConfig:
-    num_bins = 249
-    f_min = -3.0
-    f_max = 3.0
-    dt = DT
-    burn_steps = 800
-    gamma_min = 0.0
-    gamma_max = 50.0
-    n_gamma_bins = 50
-    max_burns = MAX_BURNS
-    enforce_full_spectrum = FREE_BIN_SELECTION
-    only_negative_initial_q = True
-    q_filter_use_theta = False
-    n_q_bins = MAX_BURNS
-    x_values = None
-    rf_mode = RF_MODE_PHYSICAL_VOIGT
-    diffusion_scale = DIFFUSION_SCALE
-    gaussian_fwhm_R = RF_GAUSSIAN_FWHM_R
-    lorentzian_fwhm_R = RF_LORENTZIAN_FWHM_R
+    num_bins: int = 249
+    f_min: float = -3.0
+    f_max: float = 3.0
+    dt: float = DT
+    burn_steps: int = 800
+    gamma_min: float = 0.0
+    gamma_max: float = 50.0
+    n_gamma_bins: int = 50
+    max_burns: int = MAX_BURNS
+    enforce_full_spectrum: bool = FREE_BIN_SELECTION
+    only_negative_initial_q: bool = True
+    q_filter_use_theta: bool = False
+    n_q_bins: int = MAX_BURNS
+    x_values: np.ndarray | None = None
+    rf_mode: str = RF_MODE_PHYSICAL_VOIGT
+    diffusion_scale: float = DIFFUSION_SCALE
+    gaussian_fwhm_R: float = RF_GAUSSIAN_FWHM_R
+    lorentzian_fwhm_R: float = RF_LORENTZIAN_FWHM_R
 
     def __post_init__(self):
         if self.x_values is None or len(self.x_values) == 0:
@@ -231,7 +231,7 @@ class Spin1BurnEnv:
             if 0 <= idx < n_x:
                 used[idx] = 1.0
         step_frac = self._step / max(self.config.max_burns, 1)
-        return np.concatenate([np.asarray(self._iplus), np.asarray(self._iminus), np.array([self._q, step_frac]), used])
+        return np.concatenate([np.asarray(self._iplus), np.asarray(self._iminus), np.array([self._q, step_frac]), used]).astype(np.float32)
 
     def _x_to_freq_bin(self, x):
         return np.argmin(np.abs(self.f - x))
@@ -347,11 +347,11 @@ class ReplayBuffer:
         self.rng = np.random.default_rng(seed)
         self.ptr = 0
         self.size = 0
-        self.states = np.zeros((self.capacity, self.state_dim))
+        self.states = np.zeros((self.capacity, self.state_dim), dtype=np.float32)
         self.actions = np.zeros(self.capacity, dtype=np.int64)
-        self.rewards = np.zeros(self.capacity)
-        self.next_states = np.zeros((self.capacity, self.state_dim))
-        self.dones = np.zeros(self.capacity)
+        self.rewards = np.zeros(self.capacity, dtype=np.float32)
+        self.next_states = np.zeros((self.capacity, self.state_dim), dtype=np.float32)
+        self.dones = np.zeros(self.capacity, dtype=np.float32)
         self.next_masks = np.ones((self.capacity, self.n_actions), dtype=np.bool_)
 
     def add(self, state, action, reward, next_state, done, next_mask):
@@ -421,8 +421,7 @@ class DQNAgent:
             return 0
         if explore and self.rng.random() < self.epsilon:
             return self.rng.choice(valid_actions)
-        state_t = torch.from_numpy(np.asarray(state)).unsqueeze(0)
-        state_t = state_t.to(self.device)
+        state_t = torch.as_tensor(np.asarray(state), dtype=torch.float32, device=self.device).unsqueeze(0)
         with torch.no_grad():
             q_values = self.online(state_t).squeeze(0).detach().cpu().numpy()
         q_values[~mask] = -np.inf
@@ -435,12 +434,12 @@ class DQNAgent:
         if self.buffer.size < max(self.learn_start, self.batch_size):
             return None
         batch = self.buffer.sample(self.batch_size)
-        states = torch.from_numpy(batch['states']).to(self.device)
-        actions = torch.from_numpy(batch['actions']).to(self.device)
-        rewards = torch.from_numpy(batch['rewards']).to(self.device)
-        next_states = torch.from_numpy(batch['next_states']).to(self.device)
-        dones = torch.from_numpy(batch['dones']).to(self.device)
-        next_masks = torch.from_numpy(batch['next_masks']).to(self.device)
+        states = torch.as_tensor(batch['states'], dtype=torch.float32, device=self.device)
+        actions = torch.as_tensor(batch['actions'], dtype=torch.int64, device=self.device)
+        rewards = torch.as_tensor(batch['rewards'], dtype=torch.float32, device=self.device)
+        next_states = torch.as_tensor(batch['next_states'], dtype=torch.float32, device=self.device)
+        dones = torch.as_tensor(batch['dones'], dtype=torch.float32, device=self.device)
+        next_masks = torch.as_tensor(batch['next_masks'], dtype=torch.bool, device=self.device)
         q_values = self.online(states)
         q_sa = q_values.gather(1, actions.unsqueeze(1)).squeeze(1)
         with torch.no_grad():

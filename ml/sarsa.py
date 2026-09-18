@@ -24,9 +24,9 @@ if str(RIVANNA) not in sys.path:
 from common import DIFFUSION_SCALE, RF_GAUSSIAN_FWHM_R, RF_LORENTZIAN_FWHM_R, RF_MODE_PHYSICAL_VOIGT, RF_MODE_SINGLE_BIN
 from model_bridge import build_spin1_model, burn_commit_touched_bins, commit_touched_bins_only, configure_ssrf_burn, euler_n_sub
 from physics.lineshape.Lineshape import GenerateVectorLineshape
-from ssrf_realtime.conversions import physical_intensities_to_packet_n
-from ssrf_realtime.model import Spin1Model
-from ssrf_realtime.rate_equations_realtime import _value_crosses_zero, burn_preserves_ps_sign
+from physics.rf.conversions import physical_intensities_to_packet_n
+from physics.rf.model import Spin1Model
+from physics.rf.rate_equations_realtime import _value_crosses_zero, burn_preserves_ps_sign
 OUTPUT_DIR = REPO_ROOT / 'results' / 'current' / 'sarsa'
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 SARSA_DT = 0.015
@@ -132,24 +132,24 @@ def apply_spin1_burn(model, bin_idx, gamma_rf, n_steps, *, rf_mode, gaussian_fwh
 
 @dataclass
 class BurnConfig:
-    num_bins = 249
-    f_min = -3.0
-    f_max = 3.0
-    dt = SARSA_DT
-    burn_steps = 100
-    gamma_min = 0.0
-    gamma_max = 50.0
-    n_gamma_bins = 10
-    max_burns = MAX_BURNS
-    enforce_full_spectrum = FREE_BIN_SELECTION
-    only_negative_initial_q = True
-    q_filter_use_theta = False
-    n_q_bins = MAX_BURNS
-    x_values = None
-    rf_mode = RF_MODE_PHYSICAL_VOIGT
-    diffusion_scale = DIFFUSION_SCALE
-    gaussian_fwhm_R = RF_GAUSSIAN_FWHM_R
-    lorentzian_fwhm_R = RF_LORENTZIAN_FWHM_R
+    num_bins: int = 249
+    f_min: float = -3.0
+    f_max: float = 3.0
+    dt: float = SARSA_DT
+    burn_steps: int = 100
+    gamma_min: float = 0.0
+    gamma_max: float = 50.0
+    n_gamma_bins: int = 10
+    max_burns: int = MAX_BURNS
+    enforce_full_spectrum: bool = FREE_BIN_SELECTION
+    only_negative_initial_q: bool = True
+    q_filter_use_theta: bool = False
+    n_q_bins: int = MAX_BURNS
+    x_values: np.ndarray | None = None
+    rf_mode: str = RF_MODE_PHYSICAL_VOIGT
+    diffusion_scale: float = DIFFUSION_SCALE
+    gaussian_fwhm_R: float = RF_GAUSSIAN_FWHM_R
+    lorentzian_fwhm_R: float = RF_LORENTZIAN_FWHM_R
 
     def __post_init__(self):
         if self.x_values is None or len(self.x_values) == 0:
