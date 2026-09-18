@@ -5,10 +5,13 @@ Capacity-weighted version of the spin-1 ss-RF model.  Local Pake spin-packet
 density scales RF, DNP, same-theta recovery, and spectral-neighbor diffusion.
 AFP, multi-burn ssRF, and intensity loading follow the v1 conventions.
 
-With DNP off, RF is the only vector-polarization sink.  Internal recovery and
-neighbor diffusion conserve the current reduced P(t).  With DNP on, a separate
-external reservoir builds toward P_DNP_sat.
+Population ODE, Voigt RF, and recovery defaults match ssRF-beta: Lorentzian
+zero-quantum overlap, cross-branch tensor exchange, and double-quantum
+transport.  With DNP off, RF is the only vector-polarization sink.
 """
+from dataclasses import asdict, dataclass, field, replace as dataclass_replace
+from typing import Optional
+
 import numpy as np
 from .conversions import physical_intensities_to_packet_n, packet_n_to_physical_intensities
 from .voigt_burn_physics import VoigtBurnPhysicsMixin
@@ -19,118 +22,67 @@ def _clamp_p(P):
     """Keep P inside the physically safe open interval for numeric use."""
     return np.clip(P, -0.999999, 0.999999)
 
+@dataclass
 class Spin1Params:
     """Numerical and phenomenological parameters for the spin-1 model."""
 
-    def __init__(
-        self,
-        n_bins=500,
-        r_min=-3.0,
-        r_max=3.0,
-        line_gamma=0.05,
-        line_asym=0.04,
-        plot_signal_units=True,
-        plot_divisor=10.0,
-        display_scale=1.0,
-        calibration_p=0.50,
-        p0=0.60,
-        q0=None,
-        rf_burn_R=-0.92,
-        rf_enabled=True,
-        gamma_rf=2.0,
-        ssrf_subset_indices=None,
-        rf_profile=None,
-        ssrf_multi_bin_capacity="center_shared",
-        use_physical_voigt_rf=False,
-        rf_gaussian_fwhm_R=0.030,
-        rf_lorentzian_fwhm_R=0.015,
-        rf_profile_normalization="center_bin",
-        rf_profile_quadrature_order=0,
-        diffusion_scale=0.0,
-        zq_width_R=0.05,
-        cross_branch_ratio=0.0,
-        orientation_corr_fraction=0.0,
-        orientation_corr_width_deg=20.0,
-        kernel_cutoff_widths=4.0,
-        microwave_diffusion_factor=1.0,
-        relax_enabled=True,
-        d_same_plus0=0.18,
-        d_same_0minus=0.10,
-        d_spec_plus0=2.0,
-        d_spec_0minus=1.0,
-        t2_width_R=0.05,
-        capacity_rate_power=1.0,
-        capacity_rate_clip=12.0,
-        dnp_enabled=False,
-        p_dnp_sat=0.58,
-        dnp_rate=0.05,
-        t1_rate=0.0,
-        t1_p_eq=0.0,
-        dt=0.0015,
-        noise_sigma=0.0,
-        steps=50,
-        afp_enabled=False,
-        afp_efficiency=1.0,
-        afp_center_margin=0,
-        afp_preserve_intensity_area=False,
-        afp_subset_indices=None,
-    ):
-        self.n_bins = n_bins
-        self.r_min = r_min
-        self.r_max = r_max
-        self.line_gamma = line_gamma
-        self.line_asym = line_asym
-        self.plot_signal_units = plot_signal_units
-        self.plot_divisor = plot_divisor
-        self.display_scale = display_scale
-        self.calibration_p = calibration_p
-        self.p0 = p0
-        self.q0 = q0
-        self.rf_burn_R = rf_burn_R
-        self.rf_enabled = rf_enabled
-        self.gamma_rf = gamma_rf
-        self.ssrf_subset_indices = ssrf_subset_indices
-        self.rf_profile = rf_profile
-        self.ssrf_multi_bin_capacity = ssrf_multi_bin_capacity
-        self.use_physical_voigt_rf = use_physical_voigt_rf
-        self.rf_gaussian_fwhm_R = rf_gaussian_fwhm_R
-        self.rf_lorentzian_fwhm_R = rf_lorentzian_fwhm_R
-        self.rf_profile_normalization = rf_profile_normalization
-        self.rf_profile_quadrature_order = rf_profile_quadrature_order
-        self.diffusion_scale = diffusion_scale
-        self.zq_width_R = zq_width_R
-        self.cross_branch_ratio = cross_branch_ratio
-        self.orientation_corr_fraction = orientation_corr_fraction
-        self.orientation_corr_width_deg = orientation_corr_width_deg
-        self.kernel_cutoff_widths = kernel_cutoff_widths
-        self.microwave_diffusion_factor = microwave_diffusion_factor
-        self.relax_enabled = relax_enabled
-        self.d_same_plus0 = d_same_plus0
-        self.d_same_0minus = d_same_0minus
-        self.d_spec_plus0 = d_spec_plus0
-        self.d_spec_0minus = d_spec_0minus
-        self.t2_width_R = t2_width_R
-        self.capacity_rate_power = capacity_rate_power
-        self.capacity_rate_clip = capacity_rate_clip
-        self.dnp_enabled = dnp_enabled
-        self.p_dnp_sat = p_dnp_sat
-        self.dnp_rate = dnp_rate
-        self.t1_rate = t1_rate
-        self.t1_p_eq = t1_p_eq
-        self.dt = dt
-        self.noise_sigma = noise_sigma
-        self.steps = steps
-        self.afp_enabled = afp_enabled
-        self.afp_efficiency = afp_efficiency
-        self.afp_center_margin = afp_center_margin
-        self.afp_preserve_intensity_area = afp_preserve_intensity_area
-        self.afp_subset_indices = afp_subset_indices
+    n_bins: int = 701
+    r_min: float = -3.0
+    r_max: float = 3.0
+    line_gamma: float = 0.05
+    line_asym: float = 0.04
+    plot_signal_units: bool = True
+    plot_divisor: float = 10.0
+    display_scale: float = 1.0
+    calibration_p: float = 0.50
+    p0: float = 0.45
+    q0: Optional[float] = None
+    rf_burn_R: float = 0.40
+    rf_enabled: bool = False
+    gamma_rf: float = 2.0
+    rf_gaussian_fwhm_R: float = 0.030
+    rf_lorentzian_fwhm_R: float = 0.015
+    rf_profile_normalization: str = "center_bin"
+    rf_profile_quadrature_order: int = 0
+    diffusion_enabled: bool = True
+    diffusion_scale: float = 5.0
+    zq_width_R: float = 0.05
+    diffusion_overlap: str = "lorentzian"
+    cross_branch_ratio: float = 1.0
+    double_quantum_ratio: float = 0.10
+    orientation_corr_fraction: float = 0.0
+    orientation_corr_width_deg: float = 20.0
+    kernel_cutoff_widths: float = 0.0
+    microwave_diffusion_factor: float = 1.0
+    capacity_rate_power: float = 1.0
+    capacity_rate_clip: float = 12.0
+    dnp_enabled: bool = False
+    p_dnp_sat: float = 0.58
+    dnp_rate: float = 0.05
+    t1_rate: float = 0.0
+    t1_p_eq: float = 0.0
+    dt: float = 0.0015
+    noise_sigma: float = 0.0
+    ssrf_subset_indices: Optional[list] = None
+    rf_profile: Optional[np.ndarray] = field(default=None, repr=False)
+    ssrf_multi_bin_capacity: str = "center_shared"
+    use_physical_voigt_rf: bool = False
+    relax_enabled: bool = True
+    d_same_plus0: float = 0.18
+    d_same_0minus: float = 0.10
+    d_spec_plus0: float = 2.0
+    d_spec_0minus: float = 1.0
+    t2_width_R: float = 0.05
+    steps: int = 50
+    afp_enabled: bool = False
+    afp_efficiency: float = 1.0
+    afp_center_margin: int = 0
+    afp_preserve_intensity_area: bool = False
+    afp_subset_indices: Optional[list] = None
 
     def replace(self, **overrides):
-        """Return a copy with selected fields overridden (dataclass.replace stand-in)."""
-        values = dict(self.__dict__)
-        values.update(overrides)
-        return Spin1Params(**values)
+        """Return a copy with selected fields overridden."""
+        return dataclass_replace(self, **overrides)
 
 class Spin1Model(VoigtBurnPhysicsMixin):
     """Stateful spin-1 population model with ideal-bin ss-RF and optional DNP."""
@@ -167,12 +119,19 @@ class Spin1Model(VoigtBurnPhysicsMixin):
         self._rf_profile_cache_key = None
         self._rf_profile_cache = None
         self._diffusion_kernel_key = None
+        self._dq_correlation_key = None
+        self._dq_correlation = None
+        self._same_matrix = None
+        self._cross_matrix = None
+        self._same_row = None
+        self._cross_row_plus = None
+        self._cross_row_minus = None
         self._same_i = np.empty(0, dtype=np.int64)
         self._same_j = np.empty(0, dtype=np.int64)
-        self._same_base = np.empty(0)
+        self._same_base = np.empty(0, dtype=float)
         self._cross_i = np.empty(0, dtype=np.int64)
         self._cross_j = np.empty(0, dtype=np.int64)
-        self._cross_base = np.empty(0)
+        self._cross_base = np.empty(0, dtype=float)
         self._rf_profile_frozen = False
         self._active_idx = None
         self._window_radius = None
@@ -191,14 +150,23 @@ class Spin1Model(VoigtBurnPhysicsMixin):
             self.set_rf_profile()
 
     def set_rf_profile(self):
-        """Per-bin RF rate. Q-shaped profile peaks at deepest Q<0."""
-        (ip, im, _) = self.physical_intensities(self.n_initial)
-        q = ip - im
-        q_min = np.min(q)
-        if q_min >= 0.0:
-            self.params.rf_profile = np.zeros_like(q)
-        else:
-            self.params.rf_profile = self.params.gamma_rf * np.clip(q / q_min, 0.0, 1.0)
+        """Install a discrete RF-rate vector if one is not already frozen.
+
+        Historical Q-shaped envelope (commented; peaks at deepest Q<0):
+            (ip, im, _) = self.physical_intensities(self.n_initial)
+            q = ip - im
+            q_min = np.min(q)
+            if q_min >= 0.0:
+                self.params.rf_profile = np.zeros_like(q)
+            else:
+                self.params.rf_profile = self.params.gamma_rf * np.clip(q / q_min, 0.0, 1.0)
+
+        Pulse-program / physical-Voigt / frozen profiles now own the RF field.
+        """
+        if getattr(self, "_rf_profile_frozen", False):
+            return
+        if self.params.rf_profile is None:
+            self.params.rf_profile = np.zeros(int(self.params.n_bins), dtype=float)
 
     def _compute_display_calibration(self):
         """Scale packet differences to displayed intensities using initial ``p0``."""
@@ -233,7 +201,7 @@ class Spin1Model(VoigtBurnPhysicsMixin):
             setattr(self.params, key, value)
             if key in {'rf_burn_R', 'rf_gaussian_fwhm_R', 'rf_lorentzian_fwhm_R', 'rf_profile_normalization', 'rf_profile_quadrature_order', 'use_physical_voigt_rf'}:
                 rf_profile_changed = True
-            if key in {'diffusion_scale', 'zq_width_R', 'cross_branch_ratio', 'orientation_corr_fraction', 'orientation_corr_width_deg', 'kernel_cutoff_widths', 'microwave_diffusion_factor', 'line_asym', 'n_bins', 'r_min', 'r_max'}:
+            if key in {'diffusion_scale', 'diffusion_enabled', 'diffusion_overlap', 'zq_width_R', 'cross_branch_ratio', 'double_quantum_ratio', 'orientation_corr_fraction', 'orientation_corr_width_deg', 'kernel_cutoff_widths', 'microwave_diffusion_factor', 'line_asym', 'n_bins', 'r_min', 'r_max'}:
                 diffusion_changed = True
         if rf_profile_changed:
             self.invalidate_rf_profile()
@@ -241,7 +209,10 @@ class Spin1Model(VoigtBurnPhysicsMixin):
             self._diffusion_kernel_key = None
 
     def as_dict(self):
-        return dict(self.params.__dict__)
+        return asdict(self.params)
+
+    def set_diffusion_enabled(self, enabled):
+        self.params.diffusion_enabled = bool(enabled)
 
     def set_rf_enabled(self, enabled):
         self.params.rf_enabled = enabled
@@ -877,7 +848,7 @@ class Spin1Model(VoigtBurnPhysicsMixin):
         else:
             dn_rf = np.zeros_like(self.n)
         dn_terms['RF'] = dn_rf
-        if self.params.diffusion_scale > 0.0:
+        if getattr(self.params, 'diffusion_enabled', True) and self.params.diffusion_scale > 0.0:
             dn_terms.update(self._spin_diffusion_terms(dnp_on))
         if self.params.relax_enabled:
             dynamic_ref = self.recovery_dynamic_reference()
