@@ -61,6 +61,11 @@ def clone_model(model):
     trial._populations_from_intensities = model._populations_from_intensities
     trial._recovery_boltzmann_P = model._recovery_boltzmann_P
     trial._force_boltzmann_recovery = model._force_boltzmann_recovery
+    trial._conserve_tensor_recovery = getattr(model, '_conserve_tensor_recovery', False)
+    trial._conserve_vector_recovery = getattr(model, '_conserve_vector_recovery', True)
+    trial._restore_initial_recovery = getattr(model, '_restore_initial_recovery', False)
+    trial._pre_afp_state = None if getattr(model, '_pre_afp_state', None) is None else np.asarray(model._pre_afp_state).copy()
+    trial._recovery_hold_Q = getattr(model, '_recovery_hold_Q', None)
     trial._active_idx = None if model._active_idx is None else np.asarray(model._active_idx).copy()
     trial.n_plus = model.n_plus
     trial.n_zero = model.n_zero

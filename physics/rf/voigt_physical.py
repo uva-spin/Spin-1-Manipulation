@@ -67,7 +67,7 @@ def recommended_quadrature_order(bin_width, gaussian_fwhm, lorentzian_fwhm, mini
     if width <= 0.0:
         return minimum
     raw = np.ceil(12.0 * abs(bin_width) / max(width, 1e-15))
-    return np.clip(max(minimum, raw), minimum, maximum)
+    return int(np.clip(max(minimum, raw), minimum, maximum))
 
 def bin_averaged_voigt(bin_centers, center_R, bin_width_R, gaussian_fwhm_R, lorentzian_fwhm_R, normalization='center_bin', quadrature_order=0):
     centers = np.asarray(bin_centers)
@@ -86,6 +86,7 @@ def bin_averaged_voigt(bin_centers, center_R, bin_width_R, gaussian_fwhm_R, lore
     order = quadrature_order
     if order <= 0:
         order = recommended_quadrature_order(dR, g, l)
+    order = int(order)
     (nodes, weights) = _legendre_rule(order)
     sample_R = centers[:, None] + 0.5 * dR * nodes[None, :]
     values = voigt_peak_normalized(sample_R - center_R, g, l)

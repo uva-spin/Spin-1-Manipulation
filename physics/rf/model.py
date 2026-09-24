@@ -15,7 +15,7 @@ from typing import Optional
 import numpy as np
 from .conversions import physical_intensities_to_packet_n, packet_n_to_physical_intensities
 from .voigt_burn_physics import VoigtBurnPhysicsMixin
-from .lineshape import boltzmann_Q, boltzmann_branch_ratio, level_populations_from_PQ, normalized_component, pake_component_raw, trapezoid_integral
+from .lineshape import boltzmann_P_from_Q, boltzmann_Q, boltzmann_branch_ratio, level_populations_from_PQ, normalized_component, pake_component_raw, trapezoid_integral
 (PLUS, ZERO, MINUS) = (0, 1, 2)
 
 def _clamp_p(P):
@@ -136,7 +136,12 @@ class Spin1Model(VoigtBurnPhysicsMixin):
         self._active_idx = None
         self._window_radius = None
         self._recovery_boltzmann_P = None
+        self._recovery_hold_Q = None
         self._force_boltzmann_recovery = False
+        self._conserve_tensor_recovery = False
+        self._conserve_vector_recovery = True
+        self._restore_initial_recovery = False
+        self._pre_afp_state = None
         self._afp_pending = self.params.afp_enabled
         self._afp_last_subset = []
         self.ip_afp = None
@@ -169,28 +174,25 @@ class Spin1Model(VoigtBurnPhysicsMixin):
             self.params.rf_profile = np.zeros(int(self.params.n_bins), dtype=float)
 
     def _compute_display_calibration(self):
-        """Scale packet differences to displayed intensities using initial ``p0``."""
+        """Plot_Signal-style display scale (ssRF-beta). State/rates stay population-based."""
         p = self.params
         if not p.plot_signal_units:
-            return p.display_scale
-        return _clamp_p(p.p0)
-
-    def _plot_signal_reference_calibration(self):
-        """Plot_Signal-style scale for ``static_plot_signal_reference`` comparisons only."""
-        p = self.params
-        if not p.plot_signal_units:
-            return p.display_scale
+            return float(p.display_scale)
         Pcal = _clamp_p(p.calibration_p)
         pref_cal = level_populations_from_PQ(Pcal, None)
-        minor_diff = abs(pref_cal[ZERO] - pref_cal[MINUS])
+        minor_diff = abs(float(pref_cal[ZERO] - pref_cal[MINUS]))
         if minor_diff < 1e-15:
             pref_cal = level_populations_from_PQ(0.5, None)
-            minor_diff = abs(pref_cal[ZERO] - pref_cal[MINUS])
+            minor_diff = abs(float(pref_cal[ZERO] - pref_cal[MINUS]))
         raw = pake_component_raw(self.Rplus, +1, gamma=p.line_gamma, asym=p.line_asym)
         raw_area = trapezoid_integral(raw, self.Rplus)
         if raw_area <= 0 or not np.isfinite(raw_area):
-            return p.display_scale
-        return p.display_scale * raw_area / (max(p.plot_divisor, 1e-15) * minor_diff)
+            return float(p.display_scale)
+        return float(p.display_scale * raw_area / (max(p.plot_divisor, 1e-15) * minor_diff))
+
+    def _plot_signal_reference_calibration(self):
+        """Same display scale as ``_compute_display_calibration`` (ssRF-beta Plot_Signal)."""
+        return self._compute_display_calibration()
 
     def set_params(self, **kwargs):
         rf_profile_changed = False
@@ -227,7 +229,11 @@ class Spin1Model(VoigtBurnPhysicsMixin):
         self.n_ref = self.n.copy()
         self._populations_from_intensities = True
         self._recovery_boltzmann_P = None
+        self._recovery_hold_Q = None
         self._force_boltzmann_recovery = False
+        self._conserve_tensor_recovery = False
+        self._conserve_vector_recovery = True
+        self._restore_initial_recovery = False
         self._sync_level_populations(capture_initial=True)
         self._afp_pending = self.params.afp_enabled
         self._afp_last_subset = []
@@ -275,6 +281,7 @@ class Spin1Model(VoigtBurnPhysicsMixin):
         mirror indices in ``subset_indices`` or AFP is applied twice. Only those
         packets are written; all other bins are left unchanged.
         """
+        self._pre_afp_state = self.n.copy()
         (ip_before, im_before, _) = self.physical_intensities()
         area_before = np.sum(ip_before + im_before)
         (target, subset) = self.afp_target_state(self.n, self.params.afp_subset_indices, efficiency=self.params.afp_efficiency, center_margin=self.params.afp_center_margin)
@@ -490,42 +497,33 @@ class Spin1Model(VoigtBurnPhysicsMixin):
 
     def recovery_dynamic_reference(self):
         """Reference for mode recovery (Boltzmann at P(t), or loaded event shape)."""
-        if self._populations_from_intensities:
+        if self._populations_from_intensities or getattr(self, '_force_boltzmann_recovery', False):
             return self.recovery_equilibrium_reference()
         return self.equilibrium_reference()
 
     def _boltzmann_packet_at_vector_p(self, P):
-        """Boltzmann packet state at vector ``P`` in the current intensity basis."""
-        pref = level_populations_from_PQ(P, None)
-        if not self._populations_from_intensities:
-            return self.mu[:, None] * pref[None, :]
-        n_ideal = self.mu[:, None] * pref[None, :]
-        (ip, im, _) = packet_n_to_physical_intensities(n_ideal, self.Rplus, display_cal=1.0, dR=self.dR)
-        area = np.sum(ip + im)
-        if abs(area) > 1e-30:
-            scale = P / area
-            ip = ip * scale
-            im = im * scale
-        return physical_intensities_to_packet_n(ip, im, self.mu, display_cal=self.display_cal, dR=self.dR)
+        """Boltzmann packet state at vector ``P`` (``mu`` × Boltzmann fractions)."""
+        pref = level_populations_from_PQ(_clamp_p(P), None)
+        return self.mu[:, None] * pref[None, :]
 
     def set_recovery_boltzmann_P(self, P):
-        """Use vector ``P`` when rebuilding Boltzmann after P drifts (ssRF).
-
-        Does not replace event ``n_ref`` — hole filling still targets the loaded
-        lineshape while P≈P₀.
-        """
+        """Use vector ``P`` when rebuilding Boltzmann after P drifts (ssRF)."""
         self._recovery_boltzmann_P = P
+        self._recovery_hold_Q = None
         self._force_boltzmann_recovery = False
+        self._conserve_tensor_recovery = False
+        self._conserve_vector_recovery = True
+        self._restore_initial_recovery = False
         return self._recovery_boltzmann_P
 
     def install_boltzmann_recovery_at_P(self, P):
-        """Always recover toward Boltzmann at vector ``P``; leave ``n`` unchanged.
-
-        Used after AFP (manipulated P). Overwrites ``n_ref`` with that Boltzmann.
-        """
-        P = P
+        """Recover toward Boltzmann at vector ``P``; overwrite ``n_ref``."""
         self._recovery_boltzmann_P = P
+        self._recovery_hold_Q = None
         self._force_boltzmann_recovery = True
+        self._conserve_tensor_recovery = False
+        self._conserve_vector_recovery = True
+        self._restore_initial_recovery = False
         self.n_ref = self._boltzmann_packet_at_vector_p(P)
         return P
 
@@ -534,17 +532,61 @@ class Spin1Model(VoigtBurnPhysicsMixin):
         self._sync_level_populations(capture_initial=False)
         return self.install_boltzmann_recovery_at_P(self.n_plus - self.n_minus)
 
+    def install_boltzmann_recovery_at_current_Q(self):
+        """Hold the current tensor Q and recover toward the Boltzmann vector P(Q).
+
+        The target lineshape is the Boltzmann packet at
+        ``P = boltzmann_P_from_Q(Q)`` with the sign of the current vector
+        polarization. Subsequent relaxation projects out ``dQ`` so tensor
+        polarization stays at this value while vector polarization moves.
+        """
+        pol = self.polarizations()
+        q_hold = float(pol['Q'])
+        p_now = float(pol['P'])
+        p_eq = float(boltzmann_P_from_Q(q_hold, sign=p_now))
+        self._recovery_boltzmann_P = p_eq
+        self._recovery_hold_Q = q_hold
+        self._force_boltzmann_recovery = True
+        self._conserve_tensor_recovery = True
+        self._conserve_vector_recovery = False
+        self._restore_initial_recovery = False
+        self.n_ref = self._boltzmann_packet_at_vector_p(p_eq)
+        return p_eq
+
+    def install_recovery_to_pre_afp_state(self):
+        """Relax back to the packet stored immediately before the last AFP sweep.
+
+        Neither vector P nor tensor Q is held fixed. The target is that full
+        pre-AFP packet, so both polarizations return to their pre-sweep values
+        and the lineshape returns to the pre-AFP shape.
+        """
+        target = self._pre_afp_state if self._pre_afp_state is not None else self.n_initial
+        self.n_ref = np.array(target, copy=True)
+        self._restore_initial_recovery = True
+        self._force_boltzmann_recovery = True
+        self._recovery_boltzmann_P = None
+        self._recovery_hold_Q = None
+        self._conserve_tensor_recovery = False
+        self._conserve_vector_recovery = False
+        pol = self.polarizations(self.n_ref)
+        return (float(pol['P']), float(pol['Q']))
+
     def recovery_equilibrium_reference(self):
         """Null manifold for mode recovery.
 
-        AFP (``_force_boltzmann_recovery``): always Boltzmann at the fixed
-        (manipulated) vector P so Q → Q_boltz(P).
+        Pre-AFP restore: the packet saved at the start of ``afp_sweep``. Both
+        vector and tensor polarization are free to move back to that state.
+
+        Other AFP recovery (``_force_boltzmann_recovery`` with a stored P):
+        Boltzmann packet at ``_recovery_boltzmann_P``.
 
         ssRF / intensity-loaded events: always the loaded event shape ``n_ref``
         (Dulya at the initial polarization). That way RF-mode recovery only
         fills burn holes; unburned bins are already on the null manifold and
         do not drift toward a global Boltzmann reshape when P dips under RF.
         """
+        if getattr(self, '_restore_initial_recovery', False):
+            return self.n_ref
         if self._force_boltzmann_recovery and self._recovery_boltzmann_P is not None:
             return self._boltzmann_packet_at_vector_p(self._recovery_boltzmann_P)
         if self._populations_from_intensities:
@@ -754,6 +796,29 @@ class Spin1Model(VoigtBurnPhysicsMixin):
         correction[:, MINUS] += 0.5 * dP * self.mu
         return dn + correction
 
+    def _project_conserve_tensor(self, dn):
+        """Cancel global dQ. Row sums and vector polarization of ``dn`` stay put."""
+        dQ = np.sum(dn[:, PLUS] - 2.0 * dn[:, ZERO] + dn[:, MINUS])
+        mu_sum = np.sum(self.mu)
+        if abs(dQ) < 1e-18 or mu_sum < 1e-30:
+            return dn
+        # Equal δ on n+ and n−, −2δ on n0: ΔP = 0, Δ(row sum) = 0, ΔQ = 6 Σδ.
+        c = -dQ / (6.0 * mu_sum)
+        correction = np.zeros_like(dn)
+        correction[:, PLUS] = c * self.mu
+        correction[:, ZERO] = -2.0 * c * self.mu
+        correction[:, MINUS] = c * self.mu
+        return dn + correction
+
+    def _project_recovery(self, dn):
+        if getattr(self, '_restore_initial_recovery', False):
+            return dn
+        if getattr(self, '_conserve_tensor_recovery', False):
+            return self._project_conserve_tensor(dn)
+        if getattr(self, '_conserve_vector_recovery', True):
+            return self._project_conserve_vector(dn)
+        return dn
+
     def _mode_relax_reference(self, which, rate, reference):
         """Same-bin backpath: decay an RF-created mode toward the current reference."""
         if rate == 0.0:
@@ -855,12 +920,12 @@ class Spin1Model(VoigtBurnPhysicsMixin):
             dn_same = np.zeros_like(self.n)
             dn_same += self._mode_relax_reference('plus0', self.params.d_same_plus0, dynamic_ref)
             dn_same += self._mode_relax_reference('0minus', self.params.d_same_0minus, dynamic_ref)
-            dn_same = self._project_conserve_vector(dn_same)
+            dn_same = self._project_recovery(dn_same)
             dn_terms['spin_temp_redistribution'] = dn_same
             dn_spec = np.zeros_like(self.n)
             dn_spec += self._mode_diffuse_delta('plus0', self.params.d_spec_plus0, dynamic_ref)
             dn_spec += self._mode_diffuse_delta('0minus', self.params.d_spec_0minus, dynamic_ref)
-            dn_spec = self._project_conserve_vector(dn_spec)
+            dn_spec = self._project_recovery(dn_spec)
             dn_terms['spectral_neighbors'] = dn_spec
         dn_dnp = np.zeros_like(self.n)
         if dnp_on and self.params.dnp_rate != 0.0:

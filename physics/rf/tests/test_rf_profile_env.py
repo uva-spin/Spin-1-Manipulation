@@ -5,6 +5,7 @@ import numpy as np
 import pytest
 from physics.rf.profile_control import (
     RFProfileEnv,
+    ProfileBuildEnv,
     decode_unit_action,
     rates_and_duration_to_program,
     q_shaped_manual_rates,
@@ -62,6 +63,7 @@ def test_empty_action_gives_zero_reward():
 def test_env_modules_do_not_import_ssrf_beta():
     files = [
         Path(__file__).resolve().parents[1] / "profile_control.py",
+        Path(__file__).resolve().parents[1] / "optimal_profile.py",
         Path(__file__).resolve().parents[3] / "ml" / "rf_profile_rl.py",
     ]
     for path in files:
@@ -87,3 +89,29 @@ def test_q_shaped_manual_rates_nonnegative():
     assert np.all(rates >= 0.0)
     program = rates_and_duration_to_program(rates, 0.2, r_min=-3.0, r_max=3.0, mask=env.mask)
     assert program.n_bins == 21
+
+
+def test_profile_build_env_uses_population_q_and_simultaneous_program():
+    env = ProfileBuildEnv(n_bins=21, polarization=0.45, max_steps=4, n_u_bins=5, n_t_bins=3)
+    obs = env.reset(0.45)
+    assert obs.shape == (env.observation_dim,)
+    pol = env.model.polarizations()
+    assert env.initial_q == pytest.approx(pol["Q"])
+    assert env.current_p == pytest.approx(pol["P"])
+    mask = env.valid_action_mask()
+    assert mask[: env.n_duration_actions].all()
+    candidates = np.flatnonzero(env.mask)
+    assert candidates.size > 0
+    n_u = env.u_values.size
+    bin_idx = int(candidates[0])
+    u_idx = n_u - 1
+    action = env.n_duration_actions + bin_idx * n_u + u_idx
+    obs2, reward, done, info = env.step(action)
+    assert np.isfinite(reward)
+    assert info["rate"] > 0.0
+    assert env.last_program is not None
+    assert env.last_program.n_bins == 21
+    starts = {pulse.start for pulse in env.last_program.profiles[0].pulses}
+    assert starts == {0.0} or len(starts) == 0
+    assert env.rates[bin_idx] == pytest.approx(env.u_values[u_idx])
+    assert np.all(env.rates[~env.mask] == 0.0)

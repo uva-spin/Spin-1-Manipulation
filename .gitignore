@@ -241,3 +241,12 @@ seq2seq_pq_results/
 seq2seq_pq_results_*/
 single_bin_pq_results/
 single_bin_pq_results_*/
+spectra_data/
+cnn_pq_results/
+cnn_pq_results_*/
+mlp_pq_results/
+mlp_pq_results_*/
+lstm_result/
+lstm_result_*/
+transformer_pq_results/
+transformer_pq_results_*/

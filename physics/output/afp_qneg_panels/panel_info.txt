@@ -1,0 +1,23 @@
+AFP Q<0 sweep — publication panel metadata
+initial P0 = 0.450000
+shared intensity y-limits: [-0.5, 2]
+shared Q(R) y-limits: [-0.25, 1.25]
+intensity curves: I+, I-, and total lineshape P = I+ + I-
+Q curves: local Q(R) = I+(R) - I-(R)
+Q<0 sweep bins: 134 in 2 region(s)
+  R in [-1.004, -0.607]
+  R in [1.136, 2.327]
+
+Intensity panels:
+  01_before_afp.png  —  Before AFP  (P=0.450000, Q=0.158126)
+  02_after_afp.png  —  Immediately after AFP flip  (P=0.424706, Q=0.288319)
+  03_after_relaxation.png  —  After relaxation  (P=0.449981, Q=0.158226)
+
+Q(R) panels:
+  01_before_afp_q.png  —  Before AFP  (P=0.450000, Q=0.158126)
+  02_after_afp_q.png  —  Immediately after AFP flip  (P=0.424706, Q=0.288319)
+  03_after_relaxation_q.png  —  After relaxation  (P=0.449981, Q=0.158226)
+
+vector P: 0.450000 -> post-AFP 0.424706 -> relaxed 0.449981  (target P=0.450000)
+tensor Q: 0.158126 -> post-AFP 0.288319 -> relaxed 0.158226  (target Q=0.158126)
+relaxation steps: 3583  dt=0.002
