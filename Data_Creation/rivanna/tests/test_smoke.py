@@ -16,7 +16,7 @@ from combine_all_train import combine_all, combined_bin_path
 from bin_setup import equilibrium_lineshape, generate_unmanipulated_cube, get_shape_params
 from pq_calibration import load_pq_calibration, validate_stored_per_bin_pq
 from common import AFP_N_RELAX, BURN_BIN_ARRAY_END, BURN_BIN_ARRAY_START, BURN_BIN_CHOICES, BURN_R_MAX, BURN_R_MIN, DEMO_BURN_BIN, DEMO_P, DT, F_MAX, F_MIN, NUM_BINS, PHYSICS_MODEL, RF_MODE, RF_MODE_PHYSICAL_VOIGT, RF_MODE_SINGLE_BIN, SOURCE_AFP, SOURCE_SSRF, SOURCE_UNMANIP, burn_steps_grid, effective_afp_step_subsample, gamma_rf_grid, is_burn_bin
-from model_bridge import build_spin1_model, configure_ssrf_burn
+from model_bridge import afp_touched_bins, build_spin1_model, configure_ssrf_burn
 from ssrf_bin_traj import run_one_bin as run_ssrf_bin
 from ssrf_bin_traj import run_one_polarization as run_ssrf_one
 from physics.rf import voigt_burn_recovery_param_snapshot
@@ -54,6 +54,28 @@ def test_afp_instant_flip_keeps_single_spectrum_step():
     assert traj['n_steps'] == 1
     assert traj['ps_full'] is not None
     assert np.asarray(traj['ps_full']).shape == (1, 32)
+
+def test_afp_relaxation_returns_toward_initial_polarizations():
+    traj = run_afp_one(SMOKE_BIN, 0.2, n_relax=400, capture_spectrum=True, legacy_spectral_recovery=False)
+    pre = np.asarray(traj['ip_spectrum0']) + np.asarray(traj['im_spectrum0'])
+    ps = np.asarray(traj['ps_full'])
+    touched = np.zeros(pre.size, dtype=bool)
+    touched[list(afp_touched_bins(NUM_BINS, traj['afp_subset']))] = True
+    d_flip = np.abs(ps[0] - pre)
+    assert d_flip[~touched].max() < 1e-08
+    assert d_flip[touched].max() > 0.05
+    p_initial = float(traj['p_initial'])
+    q_initial = float(traj['q_initial'])
+    p_post = float(traj['p_full'][0])
+    q_post = float(traj['q_full'][0])
+    p_final = float(traj['p_full'][-1])
+    q_final = float(traj['q_full'][-1])
+    assert abs(p_final - p_initial) < abs(p_post - p_initial)
+    assert abs(q_final - q_initial) < abs(q_post - q_initial)
+    idx = np.arange(pre.size)
+    dist = np.min(np.abs(idx[:, None] - idx[touched][None, :]), axis=1)
+    far = dist > 80
+    assert np.abs(ps[-1, far] - pre[far]).max() < 1e-03
 
 def test_package_uses_physics_rf():
     import model_bridge
@@ -170,8 +192,19 @@ def test_afp_full_spectrum_capture():
 def test_combine_all_train_smoke(tmp_path):
     """Per-bin trajectory shards + unmanip -> train_bin_XXXX.npz with P/Q and mirror reorg."""
     n_bins = NUM_BINS
-    bin_a = 206
     smoke_p = np.array([0.48])
+    from burn_selection import neighbor_border_offsets, q_negative_burn_mask
+    from burn_selection import equilibrium_q_profile
+    q_eq = equilibrium_q_profile(0.48)
+    bin_a = None
+    neighbor_bin = None
+    for b in np.flatnonzero(q_negative_burn_mask(0.48)):
+        offsets = neighbor_border_offsets(q_eq, int(b))
+        if offsets:
+            bin_a = int(b)
+            neighbor_bin = int(b) + int(offsets[0])
+            break
+    assert bin_a is not None, 'Pake equilibrium should have a Q<0 burn bin with a border neighbor'
     ssrf_dir = tmp_path / 'ssrf_shards'
     afp_dir = tmp_path / 'afp_shards'
     unmanip_dir = tmp_path / 'unmanip'
@@ -225,7 +258,7 @@ def test_combine_all_train_smoke(tmp_path):
         m_mirror = np.asarray(data['is_mirror'], dtype=bool)
         assert np.any(m_source == SOURCE_SSRF)
         assert np.any(m_mirror[m_source == SOURCE_SSRF])
-    border_path = combined_bin_path(out_dir, 205)
+    border_path = combined_bin_path(out_dir, neighbor_bin)
     assert border_path.is_file()
     with np.load(border_path, allow_pickle=False) as data:
         nb_src = np.asarray(data['source'], dtype=np.uint8)
@@ -244,10 +277,17 @@ def test_manipulation_burn_selection():
     assert not is_manipulation_shard_bin(250)
     qneg_centers = union_q_negative_burn_centers(p_grid)
     assert qneg_centers.size >= 100
-    assert is_q_negative_burn_center(0.48, 206)
-    assert not is_q_negative_burn_center(0.48, 205)
-    assert border_neighbor_mask(0.48)[205]
-    traj = run_ssrf_one(205, 0.48, gamma_rf=50.0, n_steps=5, rf_mode=RF_MODE_PHYSICAL_VOIGT)
+    from burn_selection import q_negative_burn_mask
+    qneg = q_negative_burn_mask(0.48)
+    assert np.any(qneg)
+    center = int(np.flatnonzero(qneg)[0])
+    assert is_q_negative_burn_center(0.48, center)
+    border = border_neighbor_mask(0.48)
+    assert np.any(border)
+    neighbor = int(np.flatnonzero(border)[0])
+    assert not is_q_negative_burn_center(0.48, neighbor)
+    assert border[neighbor]
+    traj = run_ssrf_one(neighbor, 0.48, gamma_rf=50.0, n_steps=5, rf_mode=RF_MODE_PHYSICAL_VOIGT)
     assert not traj['skipped']
 
 def test_plot_physics_demo_writes_pngs(smoke_dirs):

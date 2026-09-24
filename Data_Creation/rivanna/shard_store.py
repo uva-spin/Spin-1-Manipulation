@@ -116,7 +116,7 @@ def load_afp_shard(path):
 def save_ssrf_shard(result, path, *, extra_meta=None):
     gamma_values = np.asarray(result.get('gamma_values', []))
     steps_values = np.asarray(result.get('steps_values', []), dtype=np.int32)
-    meta = {'bin_idx': result['bin_idx'], 'mirror_idx': result['mirror_idx'], 'R': result['R'], 'num_bins': result['num_bins'], 'dt': result['dt'], 'max_burn_steps': result.get('max_burn_steps', result.get('max_steps', 0)), 'gamma_values': [g for g in gamma_values.tolist()], 'steps_values': [s for s in steps_values.tolist()], 'physics_model': PHYSICS_MODEL, 'rf_mode': str(result.get('rf_mode', RF_MODE)), 'gaussian_fwhm_R': result.get('gaussian_fwhm_R', 0.0), 'lorentzian_fwhm_R': result.get('lorentzian_fwhm_R', 0.0), 'diffusion_scale': result.get('diffusion_scale', 0.0), 'sampling': 'p_x_gamma_x_n_steps', 'dataset': 'ssrf_bin_traj_v2'}
+    meta = {'bin_idx': int(result['bin_idx']), 'mirror_idx': int(result['mirror_idx']), 'R': float(result['R']), 'num_bins': int(result['num_bins']), 'dt': float(result['dt']), 'max_burn_steps': int(result.get('max_burn_steps', result.get('max_steps', 0))), 'gamma_values': [g for g in gamma_values.tolist()], 'steps_values': [int(s) for s in steps_values.tolist()], 'physics_model': PHYSICS_MODEL, 'rf_mode': str(result.get('rf_mode', RF_MODE)), 'gaussian_fwhm_R': result.get('gaussian_fwhm_R', 0.0), 'lorentzian_fwhm_R': result.get('lorentzian_fwhm_R', 0.0), 'diffusion_scale': result.get('diffusion_scale', 0.0), 'sampling': 'p_x_gamma_x_n_steps', 'dataset': 'ssrf_bin_traj_v2'}
     if extra_meta:
         meta.update(extra_meta)
     ps = np.asarray(result['ps'], dtype=STORE_DTYPE)
@@ -145,7 +145,7 @@ def save_ssrf_shard(result, path, *, extra_meta=None):
     _save_npz_atomic(path, **payload)
 
 def save_afp_shard(result, path, *, extra_meta=None):
-    meta = {'bin_idx': result['bin_idx'], 'mirror_idx': result['mirror_idx'], 'R': result['R'], 'num_bins': result['num_bins'], 'dt': result['dt'], 'n_relax': result['n_relax'], 'afp_window': result['afp_window'], 'afp_efficiency': result['afp_efficiency'], 'afp_subset': [i for i in np.asarray(result['afp_subset']).tolist()], 'physics_model': PHYSICS_MODEL, 'dataset': 'afp_bin_traj_v2'}
+    meta = {'bin_idx': int(result['bin_idx']), 'mirror_idx': int(result['mirror_idx']), 'R': float(result['R']), 'num_bins': int(result['num_bins']), 'dt': float(result['dt']), 'n_relax': int(result['n_relax']), 'afp_window': int(result['afp_window']), 'afp_efficiency': float(result['afp_efficiency']), 'afp_subset': [int(i) for i in np.asarray(result['afp_subset']).tolist()], 'physics_model': PHYSICS_MODEL, 'dataset': 'afp_bin_traj_v2'}
     if extra_meta:
         meta.update(extra_meta)
     ps = np.asarray(result['ps'], dtype=STORE_DTYPE)

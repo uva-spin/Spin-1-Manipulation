@@ -1,5 +1,5 @@
 import numpy as np
-from bin_setup import equilibrium_lineshape, get_shape_params, polarization_grid
+from bin_setup import equilibrium_lineshape, polarization_grid
 from common import BURN_BIN_CHOICES, F_MAX, F_MIN, NUM_BINS, P_ABS_MIN, EXCLUDED_MANIPULATION_BURN_BINS, is_burn_bin
 
 def positive_polarization_grid(p_min, p_max, p_step, *, p_abs_min=P_ABS_MIN):
@@ -7,10 +7,12 @@ def positive_polarization_grid(p_min, p_max, p_step, *, p_abs_min=P_ABS_MIN):
     g = polarization_grid(p_min, p_max, p_step)
     return g[g > p_abs_min]
 
-def equilibrium_q_profile(polarization, *, num_bins=NUM_BINS, shape_params=None):
+def equilibrium_q_profile(polarization, *, num_bins=NUM_BINS, shape_params=None, r_min=None, r_max=None):
     """Equilibrium Q = I+ - I- at each spectral bin."""
-    shape = shape_params if shape_params is not None else get_shape_params()
-    f = np.linspace(F_MIN, F_MAX, num_bins)
+    shape = shape_params
+    r_lo = F_MIN if r_min is None else r_min
+    r_hi = F_MAX if r_max is None else r_max
+    f = np.linspace(r_lo, r_hi, num_bins)
     (_, ip, im) = equilibrium_lineshape(polarization, f, shape)
     return np.asarray(ip) - np.asarray(im)
 
@@ -57,10 +59,9 @@ def neighbor_border_offsets(q_eq, burn_bin, *, num_bins=NUM_BINS):
 
 def union_q_negative_burn_centers(p_values, *, num_bins=NUM_BINS, shape_params=None):
     """Sorted burn-window bins that are Q < 0 for at least one P in ``p_values``."""
-    shape = shape_params if shape_params is not None else get_shape_params()
     union = np.zeros(num_bins, dtype=bool)
     for p0 in np.asarray(p_values):
-        union |= q_negative_burn_mask(p0, num_bins=num_bins, shape_params=shape)
+        union |= q_negative_burn_mask(p0, num_bins=num_bins, shape_params=shape_params)
     return np.flatnonzero(union).astype(int)
 
 def manipulation_shard_bins(*, num_bins=NUM_BINS):

@@ -125,7 +125,7 @@ def validate_stored_per_bin_pq(ps, q, p0, p_cal, q_cal, *, calibration, post_cor
     if np.any(np.abs(wrong_total_scale) > 1e-12):
         assert not np.allclose(p_cal, wrong_total_scale, rtol=0.05, atol=1e-12), 'P looks like CC_total*ps (integrated scale) instead of CC_bin*ps (per-bin)'
     p0_arr = np.asarray(p0)
-    if np.any(np.abs(p0_arr) > 1e-06):
+    if np.any(np.abs(p0_arr) > 1e-06) and not np.allclose(exp_p, p0_arr, rtol=0.01, atol=1e-06):
         assert not np.allclose(p_cal, p0_arr, rtol=0.01, atol=1e-06), 'P must be per-bin calibrated values, not input polarization p0'
 
 def calibrated_pq_fields(arrays, *, num_bins=NUM_BINS, calibration=None, post_correct=True):

@@ -11,13 +11,9 @@ if str(REPO_ROOT) not in sys.path:
 if str(RIVANNA) not in sys.path:
     sys.path.insert(0, str(RIVANNA))
 
-from bin_setup import equilibrium_lineshape, get_shape_params, spin1_scale_factors
-from burn_selection import is_manipulation_shard_bin
+from physics.rf.model import Spin1Model, Spin1Params
 from common import (
     DIFFUSION_SCALE,
-    F_MAX,
-    F_MIN,
-    NUM_BINS,
     RF_GAUSSIAN_FWHM_R,
     RF_LORENTZIAN_FWHM_R,
     RF_MODE_PHYSICAL_VOIGT,
@@ -29,14 +25,17 @@ from model_bridge import (
     full_spectrum_intensities,
 )
 
+NUM_BINS = 701
+F_MIN = -3.0
+F_MAX = 3.0
 DT = 0.0055
 GAUSSIAN_FWHM_R = RF_GAUSSIAN_FWHM_R
 LORENTZIAN_FWHM_R = RF_LORENTZIAN_FWHM_R
 MAX_BURN_STEPS = 500
 # Per-bin γ_RF search grid (applied power / rate strength).
 GAMMA_RF_MIN = 0.0
-GAMMA_RF_MAX = 100.0
-N_GAMMA_STEPS = 100
+GAMMA_RF_MAX = 20.0
+N_GAMMA_STEPS = 20
 
 
 def q_polarization(iplus, iminus):
@@ -52,24 +51,34 @@ def total_signal_area(iplus, iminus):
 
 
 def initially_negative_q_bins(iplus, iminus):
-    """Burn-window bins where unburned spectral Q = I+ - I- is negative."""
+    """Bins where unburned spectral Q = I+ - I- is negative."""
     q_profile = iplus - iminus
-    return [
-        i
-        for i in np.flatnonzero(q_profile < 0.0)
-        if is_manipulation_shard_bin(i)
-    ]
+    return [i for i in np.flatnonzero(q_profile < 0.0)]
 
 
 def equilibrium_spin1_intensities(polarization, f):
-    """Dulya equilibrium lineshape scaled into Spin1 intensity units."""
-    _, ip_fit, im_fit = equilibrium_lineshape(
-        polarization,
-        f,
-        get_shape_params(),
+    """ssRF-beta analytic Pake (Boltzmann) lineshape in Spin1 intensity units.
+
+    Dulya fit (commented):
+        from bin_setup import equilibrium_lineshape, get_shape_params, spin1_scale_factors
+        _, ip_fit, im_fit = equilibrium_lineshape(polarization, f, get_shape_params())
+        to_spin1, _ = spin1_scale_factors(polarization, ip_fit, im_fit)
+        return ip_fit * to_spin1, im_fit * to_spin1
+    """
+    f = np.asarray(f, dtype=float)
+    params = Spin1Params(
+        n_bins=int(f.size),
+        r_min=float(f[0]),
+        r_max=float(f[-1]),
+        p0=float(polarization),
+        q0=None,
+        line_gamma=0.05,
+        line_asym=0.04,
+        rf_enabled=False,
     )
-    to_spin1, _ = spin1_scale_factors(polarization, ip_fit, im_fit)
-    return ip_fit * to_spin1, im_fit * to_spin1
+    model = Spin1Model(params)
+    ip, im, _ = model.physical_intensities()
+    return np.asarray(ip), np.asarray(im)
 
 
 class BurnConfig:
