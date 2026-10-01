@@ -261,7 +261,7 @@ def plot_discrete_vs_physical_compare(out):
 
 def plot_v2_vs_voigt_burn_package(out):
     """Overlay v2 and spin1_ssrf_realtime_voigt_burn trajectories (must match)."""
-    from ssrf_realtime.model import Spin1Model as RefModel, Spin1Params as RefParams
+    from physics.rf.model import Spin1Model as RefModel, Spin1Params as RefParams
     ref = RefModel(RefParams(gamma_rf=BURN_GAMMA_RF, diffusion_scale=5.0, dnp_enabled=False, t1_rate=0.0))
     v2 = create_voigt_burn_model(gamma_rf=BURN_GAMMA_RF)
     burn_R = v2.params.rf_burn_R

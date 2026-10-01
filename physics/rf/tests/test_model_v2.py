@@ -83,7 +83,7 @@ def test_afp_one_shot_in_step():
 
 def test_load_from_physical_intensities_roundtrip():
     m = Spin1Model(Spin1Params(p0=0.45, n_bins=101))
-    assert m.display_cal == pytest.approx(0.45)
+    assert m.display_cal == pytest.approx(m._plot_signal_reference_calibration())
     (Iplus, Iminus, _) = m.physical_intensities()
     m.load_from_physical_intensities(Iplus, Iminus)
     (Iplus2, Iminus2, _) = m.physical_intensities()
@@ -91,6 +91,7 @@ def test_load_from_physical_intensities_roundtrip():
     assert np.allclose(Iminus, Iminus2, rtol=1e-10)
 
 def test_ssrf_mirror_burn_ratios_approximate_half():
+    # RF-only 2:1 burn/mirror ratios (legacy d_same_* recovery is off; Lorentzian/DQ diffusion is disabled by rf_only).
     f = np.linspace(-3.0, 3.0, 500)
     (_, Iplus, Iminus) = GenerateVectorLineshape(0.48, f)
     burn_idx = np.argmin(np.abs(f - -0.92))
@@ -100,6 +101,7 @@ def test_ssrf_mirror_burn_ratios_approximate_half():
     assert abs(result['ratios']['iminus_burn_over_iplus_mirror'] - 2.0) / 2.0 < 0.1
 
 def test_integrated_burn_area_mirror_ratios():
+    # Same RF-only 2:1 kinematics as above after an integrated Voigt burn.
     f = np.linspace(-3.0, 3.0, 500)
     (_, Iplus, Iminus) = GenerateVectorLineshape(0.48, f)
     burn_idx = np.argmin(np.abs(f - -0.92))

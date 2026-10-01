@@ -33,7 +33,6 @@ def bins_with_intensity_delta(iplus, iminus, iplus_sim, iminus_sim, candidates, 
 def physical_voigt_rf_support_bins(R, burn_idx, *, gaussian_fwhm_R, lorentzian_fwhm_R, rel_threshold=PROFILE_REL_THRESHOLD):
     """Bins with non-negligible physical-R Voigt RF at the burn center."""
     grid = np.asarray(R)
-    burn_idx = burn_idx
     dR = grid[1] - grid[0] if grid.size > 1 else 1.0
     profile = bin_averaged_voigt(grid, center_R=grid[burn_idx], bin_width_R=dR, gaussian_fwhm_R=gaussian_fwhm_R, lorentzian_fwhm_R=lorentzian_fwhm_R, normalization='center_bin')
     peak = np.max(profile) if profile.size else 0.0
@@ -45,7 +44,6 @@ def physical_voigt_rf_support_bins(R, burn_idx, *, gaussian_fwhm_R, lorentzian_f
 
 def burn_commit_touched_bins(n_bins, burn_idx, *, rf_mode, R=None, gaussian_fwhm_R=RF_GAUSSIAN_FWHM_R, lorentzian_fwhm_R=RF_LORENTZIAN_FWHM_R, iplus=None, iminus=None, iplus_sim=None, iminus_sim=None, include_diffusion_spillover=True, zq_width_R=ZQ_WIDTH_R):
     """Bins whose intensities should be committed after a burn trial."""
-    burn_idx = burn_idx
     if rf_mode == RF_MODE_SINGLE_BIN:
         return ssrf_touched_bins(n_bins, [burn_idx])
     support = physical_voigt_rf_support_bins(R, burn_idx, gaussian_fwhm_R=gaussian_fwhm_R, lorentzian_fwhm_R=lorentzian_fwhm_R)
@@ -116,15 +114,58 @@ def afp_window_indices(bin_idx, n_bins, window):
         hi = n - 1
     return list(range(lo, hi + 1))
 
-def build_spin1_model(iplus, iminus, *, polarization, num_bins, dt, rf_enabled=False, relax_enabled=True, diffusion_scale=DIFFUSION_SCALE, rf_gaussian_fwhm_R=RF_GAUSSIAN_FWHM_R, rf_lorentzian_fwhm_R=RF_LORENTZIAN_FWHM_R, r_min=None, r_max=None):
-    """Build a capacity-weighted Spin1 model loaded from physical intensities."""
+def _spin1_params(*, polarization, num_bins, dt, rf_enabled=False, relax_enabled=True, diffusion_scale=DIFFUSION_SCALE, rf_gaussian_fwhm_R=RF_GAUSSIAN_FWHM_R, rf_lorentzian_fwhm_R=RF_LORENTZIAN_FWHM_R, r_min=None, r_max=None, legacy_spectral_recovery=True):
+    """ssRF-beta kinetic defaults for data-generation models."""
     P = polarization
     near_zero_p = abs(P) < 1e-12
-    params = Spin1Params(n_bins=num_bins, r_min=F_MIN if r_min is None else r_min, r_max=F_MAX if r_max is None else r_max, p0=P if not near_zero_p else 0.0, q0=None, p_dnp_sat=P if not near_zero_p else 0.0, dnp_enabled=False, rf_enabled=rf_enabled, relax_enabled=relax_enabled, afp_enabled=False, gamma_rf=0.0, dt=dt, capacity_rate_power=1.0, plot_signal_units=not near_zero_p, display_scale=1.0, use_physical_voigt_rf=False, rf_gaussian_fwhm_R=rf_gaussian_fwhm_R, rf_lorentzian_fwhm_R=rf_lorentzian_fwhm_R, rf_profile_normalization='center_bin', diffusion_scale=diffusion_scale, zq_width_R=ZQ_WIDTH_R, d_same_plus0=D_SAME_PLUS0 if relax_enabled else 0.0, d_same_0minus=D_SAME_0MINUS if relax_enabled else 0.0, d_spec_plus0=D_SPEC_PLUS0 if relax_enabled else 0.0, d_spec_0minus=D_SPEC_0MINUS if relax_enabled else 0.0)
+    use_legacy = legacy_spectral_recovery and relax_enabled
+    return (use_legacy, Spin1Params(
+        n_bins=num_bins,
+        r_min=F_MIN if r_min is None else r_min,
+        r_max=F_MAX if r_max is None else r_max,
+        p0=P if not near_zero_p else 0.0,
+        q0=None,
+        p_dnp_sat=P if not near_zero_p else 0.0,
+        dnp_enabled=False,
+        rf_enabled=rf_enabled,
+        relax_enabled=use_legacy,
+        afp_enabled=False,
+        gamma_rf=0.0,
+        dt=dt,
+        capacity_rate_power=1.0,
+        plot_signal_units=not near_zero_p,
+        display_scale=1.0,
+        use_physical_voigt_rf=False,
+        rf_gaussian_fwhm_R=rf_gaussian_fwhm_R,
+        rf_lorentzian_fwhm_R=rf_lorentzian_fwhm_R,
+        rf_profile_normalization='center_bin',
+        diffusion_enabled=True,
+        diffusion_scale=diffusion_scale,
+        diffusion_overlap='lorentzian',
+        zq_width_R=ZQ_WIDTH_R,
+        cross_branch_ratio=1.0,
+        double_quantum_ratio=0.10,
+        kernel_cutoff_widths=0.0,
+        line_gamma=0.05,
+        line_asym=0.04,
+        d_same_plus0=D_SAME_PLUS0 if use_legacy else 0.0,
+        d_same_0minus=D_SAME_0MINUS if use_legacy else 0.0,
+        d_spec_plus0=D_SPEC_PLUS0 if use_legacy else 0.0,
+        d_spec_0minus=D_SPEC_0MINUS if use_legacy else 0.0,
+    ))
+
+def build_equilibrium_spin1_model(*, polarization, num_bins, dt, rf_enabled=False, relax_enabled=True, diffusion_scale=DIFFUSION_SCALE, rf_gaussian_fwhm_R=RF_GAUSSIAN_FWHM_R, rf_lorentzian_fwhm_R=RF_LORENTZIAN_FWHM_R, r_min=None, r_max=None, legacy_spectral_recovery=True):
+    """Boltzmann Pake equilibrium on the ssRF-beta ODE (no Dulya intensity remap)."""
+    use_legacy, params = _spin1_params(polarization=polarization, num_bins=num_bins, dt=dt, rf_enabled=rf_enabled, relax_enabled=relax_enabled, diffusion_scale=diffusion_scale, rf_gaussian_fwhm_R=rf_gaussian_fwhm_R, rf_lorentzian_fwhm_R=rf_lorentzian_fwhm_R, r_min=r_min, r_max=r_max, legacy_spectral_recovery=legacy_spectral_recovery)
     model = Spin1Model(params)
-    model.load_from_physical_intensities(np.asarray(iplus), np.asarray(iminus))
-    if relax_enabled:
+    if use_legacy:
         apply_shared_spectral_recovery(model)
+    return model
+
+def build_spin1_model(iplus, iminus, *, polarization, num_bins, dt, rf_enabled=False, relax_enabled=True, diffusion_scale=DIFFUSION_SCALE, rf_gaussian_fwhm_R=RF_GAUSSIAN_FWHM_R, rf_lorentzian_fwhm_R=RF_LORENTZIAN_FWHM_R, r_min=None, r_max=None, legacy_spectral_recovery=True):
+    """Build a capacity-weighted Spin1 model loaded from physical intensities."""
+    model = build_equilibrium_spin1_model(polarization=polarization, num_bins=num_bins, dt=dt, rf_enabled=rf_enabled, relax_enabled=relax_enabled, diffusion_scale=diffusion_scale, rf_gaussian_fwhm_R=rf_gaussian_fwhm_R, rf_lorentzian_fwhm_R=rf_lorentzian_fwhm_R, r_min=r_min, r_max=r_max, legacy_spectral_recovery=legacy_spectral_recovery)
+    model.load_from_physical_intensities(np.asarray(iplus), np.asarray(iminus))
     return model
 
 def apply_shared_spectral_recovery(model):
@@ -135,28 +176,23 @@ def apply_shared_spectral_recovery(model):
     model.params.d_spec_plus0 = D_SPEC_PLUS0
     model.params.d_spec_0minus = D_SPEC_0MINUS
 
-def configure_ssrf_burn(model, burn_idx, gamma_rf, *, rf_mode=RF_MODE_PHYSICAL_VOIGT, gaussian_fwhm_R=None, lorentzian_fwhm_R=None):
-    """Install RF for one burn bin with shared spectral recovery."""
+def configure_ssrf_burn(model, burn_idx, gamma_rf, *, rf_mode=RF_MODE_PHYSICAL_VOIGT, gaussian_fwhm_R=None, lorentzian_fwhm_R=None, legacy_spectral_recovery=True):
+    """Install RF for one burn bin; optional legacy D_SAME/D_SPEC refill."""
     mode = str(rf_mode)
-    apply_shared_spectral_recovery(model)
-    burn_idx = burn_idx
-    gamma = gamma_rf
+    if legacy_spectral_recovery:
+        apply_shared_spectral_recovery(model)
     if mode == RF_MODE_SINGLE_BIN:
-        configure_single_bin_ssrf(model, burn_idx, gamma, apply_demo_recovery=False)
+        configure_single_bin_ssrf(model, burn_idx, gamma_rf, apply_demo_recovery=False)
     else:
-        configure_physical_voigt_ssrf(model, burn_idx, gamma, gaussian_fwhm_R=RF_GAUSSIAN_FWHM_R if gaussian_fwhm_R is None else gaussian_fwhm_R, lorentzian_fwhm_R=RF_LORENTZIAN_FWHM_R if lorentzian_fwhm_R is None else lorentzian_fwhm_R, full_spectrum_recovery=True)
-    apply_shared_spectral_recovery(model)
-    model._sync_level_populations(capture_initial=False)
-    p_init = model.n_plus - model.n_minus
-    model.set_recovery_boltzmann_P(p_init)
+        configure_physical_voigt_ssrf(model, burn_idx, gamma_rf, gaussian_fwhm_R=RF_GAUSSIAN_FWHM_R if gaussian_fwhm_R is None else gaussian_fwhm_R, lorentzian_fwhm_R=RF_LORENTZIAN_FWHM_R if lorentzian_fwhm_R is None else lorentzian_fwhm_R, full_spectrum_recovery=True)
+    if legacy_spectral_recovery:
+        apply_shared_spectral_recovery(model)
+        model._sync_level_populations(capture_initial=False)
+        model.set_recovery_boltzmann_P(model.n_plus - model.n_minus)
     return mode
 
 def configure_afp_recovery(model):
-    """Post-AFP relaxation: Boltzmann at the manipulated (post-AFP) vector P.
-
-    Recovery drives Q → Q_boltz(P_AFP). Uses the same ``D_SAME_*`` / ``D_SPEC_*``
-    rates as ssRF, no spin diffusion, and uniform capacity weighting.
-    """
+    """Post-AFP relaxation back to the pre-sweep packet (initial P and Q)."""
     model.params.relax_enabled = True
     model.params.d_same_plus0 = D_SAME_PLUS0
     model.params.d_same_0minus = D_SAME_0MINUS
@@ -165,7 +201,7 @@ def configure_afp_recovery(model):
     model.params.diffusion_scale = 0.0
     model.params.capacity_rate_power = 0.0
     model._active_idx = None
-    model.install_boltzmann_recovery_at_current_P()
+    model.install_recovery_to_pre_afp_state()
 
 def level_pq(model):
     """Return current vector P and tensor Q from stored level populations."""

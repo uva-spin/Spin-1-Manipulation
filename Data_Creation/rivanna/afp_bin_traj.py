@@ -5,35 +5,72 @@ from bin_paths import afp_shard_path
 from shard_store import save_afp_shard
 from train_bins import organize_afp_shards
 from burn_selection import is_manipulation_shard_bin, neighbor_border_offsets, positive_polarization_grid
-from bin_setup import equilibrium_lineshape, get_shape_params, print_shape_banner, resolve_bin_idx, shape_meta, spin1_scale_factors
+from bin_setup import get_shape_params, print_shape_banner, resolve_bin_idx, shape_meta
 from common import AFP_CENTER_MARGIN, AFP_EFFICIENCY, AFP_N_RELAX, AFP_SHARD_DIR, AFP_TRAIN_DIR, AFP_WINDOW, BURN_R_MAX, BURN_R_MIN, DIFFUSION_SCALE, DT, F_MAX, F_MIN, NUM_BINS, P_MAX, P_MIN, P_STEP, is_burn_bin
-from model_bridge import afp_touched_bins, afp_window_indices, build_spin1_model, commit_touched_bins_only, configure_afp_recovery, full_spectrum_intensities, intensities_at_bins, intensity_at_bin, level_pq, mirror_bin_idx, restore_touched_intensity_area
+from model_bridge import afp_touched_bins, afp_window_indices, build_equilibrium_spin1_model, commit_touched_bins_only, configure_afp_recovery, full_spectrum_intensities, intensities_at_bins, intensity_at_bin, level_pq, mirror_bin_idx
 R_MIN = F_MIN
 R_MAX = F_MAX
 N_RELAX = AFP_N_RELAX
 DEFAULT_SHARD_DIR = AFP_SHARD_DIR
 DEFAULT_TRAIN_DIR = AFP_TRAIN_DIR
 
-def run_one_polarization(bin_idx, polarization, *, num_bins=NUM_BINS, dt=DT, n_relax=N_RELAX, afp_window=AFP_WINDOW, afp_efficiency=AFP_EFFICIENCY, diffusion_scale=DIFFUSION_SCALE, shape_params=None, capture_spectrum=False):
+def qneg_sweep_indices(q, allowed=None):
+    """Bins with Q < 0, keeping at most one index from each mirror pair.
+
+    ``allowed`` restricts the sweep to a burn window. Passing both a bin and
+    its mirror would apply AFP twice, so the more negative bin is kept.
+    """
+    q = np.asarray(q)
+    neg = np.flatnonzero(q < 0.0)
+    if allowed is not None:
+        allow = np.zeros(q.size, dtype=bool)
+        idx = np.asarray(list(allowed), dtype=int)
+        idx = idx[(idx >= 0) & (idx < q.size)]
+        allow[idx] = True
+        neg = neg[allow[neg]]
+    if neg.size == 0:
+        return []
+    n = q.size
+    chosen = []
+    blocked = set()
+    for i in neg[np.argsort(q[neg])]:
+        i = int(i)
+        mirror = n - 1 - i
+        if i in blocked:
+            continue
+        chosen.append(i)
+        blocked.add(i)
+        blocked.add(mirror)
+    return sorted(chosen)
+
+def run_one_polarization(bin_idx, polarization, *, num_bins=NUM_BINS, dt=DT, n_relax=N_RELAX, afp_window=AFP_WINDOW, afp_efficiency=AFP_EFFICIENCY, diffusion_scale=DIFFUSION_SCALE, shape_params=None, capture_spectrum=False, r_min=None, r_max=None, legacy_spectral_recovery=True, subset_indices=None, qneg_bins=None):
     P = polarization
-    shape = shape_params if shape_params is not None else get_shape_params()
-    f = np.linspace(F_MIN, F_MAX, num_bins)
-    (_, ip_fit, im_fit) = equilibrium_lineshape(P, f, shape)
+    r_lo = F_MIN if r_min is None else r_min
+    r_hi = F_MAX if r_max is None else r_max
+    model = build_equilibrium_spin1_model(polarization=P, num_bins=num_bins, dt=dt, rf_enabled=False, relax_enabled=True, diffusion_scale=diffusion_scale, r_min=r_lo, r_max=r_hi, legacy_spectral_recovery=legacy_spectral_recovery)
+    f = np.asarray(model.Rplus)
+    (ip_fit, im_fit, _) = full_spectrum_intensities(model)
     ip_fit = np.asarray(ip_fit)
     im_fit = np.asarray(im_fit)
     q_eq = ip_fit - im_fit
-    subset = afp_window_indices(bin_idx, num_bins, window=afp_window)
-    (to_spin1, from_spin1) = spin1_scale_factors(P, ip_fit, im_fit)
-    iplus0 = ip_fit * to_spin1
-    iminus0 = im_fit * to_spin1
+    if qneg_bins is not None:
+        subset = qneg_sweep_indices(q_eq, qneg_bins)
+    elif subset_indices is None:
+        subset = afp_window_indices(bin_idx, num_bins, window=afp_window)
+    else:
+        subset = [int(i) for i in subset_indices if 0 <= int(i) < num_bins]
+    if subset and (qneg_bins is not None or subset_indices is not None):
+        bin_idx = int(subset[int(np.argmin(q_eq[subset]))])
+    if not subset:
+        return {'polarization': polarization, 'skipped': True, 'n_steps': 0, 'afp_subset': [], 'p_full': None, 'q_full': None, 'iplus_full': None, 'iminus_full': None, 'center_bin': bin_idx}
+    iplus0 = ip_fit
+    iminus0 = im_fit
     mirror_idx = mirror_bin_idx(num_bins, bin_idx)
     touched = afp_touched_bins(num_bins, subset)
-    area0 = np.sum(iplus0 + iminus0)
-    model = build_spin1_model(iplus0, iminus0, polarization=P, num_bins=num_bins, dt=dt, rf_enabled=False, relax_enabled=True, diffusion_scale=diffusion_scale)
     model.params.afp_enabled = True
     model.params.afp_efficiency = afp_efficiency
     model.params.afp_center_margin = AFP_CENTER_MARGIN
-    model.params.afp_preserve_intensity_area = True
+    model.params.afp_preserve_intensity_area = False
     model.params.afp_subset_indices = [i for i in subset]
     model._afp_pending = True
     (p_initial, q_initial) = level_pq(model)
@@ -45,7 +82,6 @@ def run_one_polarization(bin_idx, polarization, *, num_bins=NUM_BINS, dt=DT, n_r
     model._afp_pending = False
     (ip_sim, im_sim, _) = model.physical_intensities()
     (base_ip, base_im) = commit_touched_bins_only(iplus0, iminus0, ip_sim, im_sim, touched)
-    (base_ip, base_im) = restore_touched_intensity_area(base_ip, base_im, touched, area0)
     model.load_from_physical_intensities(base_ip, base_im)
     configure_afp_recovery(model)
     t_len = n_relax + 1
@@ -71,6 +107,8 @@ def run_one_polarization(bin_idx, polarization, *, num_bins=NUM_BINS, dt=DT, n_r
         iplus_hi = np.empty(t_len)
         iminus_hi = np.empty(t_len)
     ps_full = iplus_full = iminus_full = None
+    p_full = np.empty(t_len)
+    q_full = np.empty(t_len)
     if capture_spectrum:
         ps_full = np.empty((t_len, num_bins))
         iplus_full = np.empty((t_len, num_bins))
@@ -80,6 +118,9 @@ def run_one_polarization(bin_idx, polarization, *, num_bins=NUM_BINS, dt=DT, n_r
         (ip, im, ps0, ip_m, im_m, ps_m0) = intensities_at_bins(model, bin_idx, mirror_idx)
         (iplus[k], iminus[k], ps[k]) = (ip, im, ps0)
         (iplus_m[k], iminus_m[k], ps_m[k]) = (ip_m, im_m, ps_m0)
+        pol = model.polarizations()
+        p_full[k] = pol['P']
+        q_full[k] = pol['Q']
         if track_lo and ps_lo is not None:
             (ip_n, im_n, ps_n) = intensity_at_bin(model, nb_lo)
             (iplus_lo[k], iminus_lo[k], ps_lo[k]) = (ip_n, im_n, ps_n)
@@ -95,35 +136,26 @@ def run_one_polarization(bin_idx, polarization, *, num_bins=NUM_BINS, dt=DT, n_r
     for k in range(1, t_len):
         model.step_once(dt=dt, rf_on=False, dnp_on=False, copy=False)
         _record_step(k)
-    scale = from_spin1
     ip_spec = im_spec = None
     if capture_spectrum:
-        ip_spec0 = None if ip_spec0 is None else ip_spec0 * scale
-        im_spec0 = None if im_spec0 is None else im_spec0 * scale
         if iplus_full is not None:
-            iplus_full *= scale
-            iminus_full *= scale
-            ps_full *= scale
             ip_spec = iplus_full[-1].copy()
             im_spec = iminus_full[-1].copy()
         else:
-            (ip_end, im_end, _) = full_spectrum_intensities(model)
-            ip_spec = ip_end * scale
-            im_spec = im_end * scale
+            (ip_spec, im_spec, _) = full_spectrum_intensities(model)
     (p_final, q_final) = level_pq(model)
-    out = {'polarization': polarization, 'skipped': False, 'n_steps': t_len, 'ps': ps * scale, 'iplus': iplus * scale, 'iminus': iminus * scale, 'ps_m': ps_m * scale, 'iplus_m': iplus_m * scale, 'iminus_m': iminus_m * scale, 'afp_subset': subset, 'ip_spectrum0': ip_spec0, 'im_spectrum0': im_spec0, 'ip_spectrum': ip_spec, 'im_spectrum': im_spec, 'ps_full': ps_full, 'iplus_full': iplus_full, 'iminus_full': iminus_full, 'frequency': f, 'diffusion_scale': model.params.diffusion_scale, 'p_initial': p_initial, 'q_initial': q_initial, 'p_final': p_final, 'q_final': q_final, 'center_bin': bin_idx, 'track_lo': track_lo, 'track_hi': track_hi}
+    out = {'polarization': polarization, 'skipped': False, 'n_steps': t_len, 'ps': ps, 'iplus': iplus, 'iminus': iminus, 'ps_m': ps_m, 'iplus_m': iplus_m, 'iminus_m': iminus_m, 'afp_subset': subset, 'ip_spectrum0': ip_spec0, 'im_spectrum0': im_spec0, 'ip_spectrum': ip_spec, 'im_spectrum': im_spec, 'ps_full': ps_full, 'iplus_full': iplus_full, 'iminus_full': iminus_full, 'p_full': p_full, 'q_full': q_full, 'frequency': f, 'diffusion_scale': model.params.diffusion_scale, 'p_initial': p_initial, 'q_initial': q_initial, 'p_final': p_final, 'q_final': q_final, 'center_bin': bin_idx, 'track_lo': track_lo, 'track_hi': track_hi}
     if track_lo and ps_lo is not None:
-        out['ps_lo'] = ps_lo * scale
-        out['iplus_lo'] = iplus_lo * scale
-        out['iminus_lo'] = iminus_lo * scale
+        out['ps_lo'] = ps_lo
+        out['iplus_lo'] = iplus_lo
+        out['iminus_lo'] = iminus_lo
     if track_hi and ps_hi is not None:
-        out['ps_hi'] = ps_hi * scale
-        out['iplus_hi'] = iplus_hi * scale
-        out['iminus_hi'] = iminus_hi * scale
+        out['ps_hi'] = ps_hi
+        out['iplus_hi'] = iplus_hi
+        out['iminus_hi'] = iminus_hi
     return out
 
 def run_one_bin(bin_idx, *, p_values, num_bins=NUM_BINS, dt=DT, n_relax=N_RELAX, afp_window=AFP_WINDOW, afp_efficiency=AFP_EFFICIENCY, capture_spectrum=False, step_subsample=1):
-    bin_idx = bin_idx
     mirror_idx = mirror_bin_idx(num_bins, bin_idx)
     p_values = np.asarray(p_values)
     n_p = p_values.size

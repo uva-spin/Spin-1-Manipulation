@@ -204,7 +204,19 @@ def build_model_for_intensities(Iplus, Iminus, *, params=None, rf_burn_R=None, p
 def solve_rate_equations(Iplus, Iminus, dt, gamma_rf, burn_idx, *, params=None, p0=None, rf_only=True, full_dynamics=False):
     step_params = params or Spin1Params()
     if rf_only:
-        step_params = step_params.replace(d_same_plus0=0.0, d_same_0minus=0.0, d_spec_plus0=0.0, d_spec_0minus=0.0)
+        # Isolate discrete RF 2:1 kinematics from ssRF-beta recovery
+        # (Lorentzian ZQ, cross-branch, and double-quantum diffusion).
+        step_params = step_params.replace(
+            d_same_plus0=0.0,
+            d_same_0minus=0.0,
+            d_spec_plus0=0.0,
+            d_spec_0minus=0.0,
+            relax_enabled=False,
+            diffusion_enabled=False,
+            diffusion_scale=0.0,
+            double_quantum_ratio=0.0,
+            cross_branch_ratio=0.0,
+        )
     model = build_model_for_intensities(Iplus, Iminus, params=step_params, p0=p0)
     configure_voigt_ssrf(model, burn_idx, gamma_rf)
     Iplus_cur = np.asarray(Iplus).copy()

@@ -1,5 +1,9 @@
-"""Physical Voigt RF profiles and population-dependent spin diffusion (voigt_burn port)."""
+"""Physical Voigt RF profiles and population-dependent spin diffusion (ssRF-beta ODE)."""
 import numpy as np
+try:
+    from scipy.sparse import coo_matrix as _coo_matrix
+except ImportError:
+    _coo_matrix = None
 from .voigt_physical import approximate_voigt_fwhm, bin_averaged_voigt, implementation_name as voigt_implementation_name
 (PLUS, ZERO, MINUS) = (0, 1, 2)
 
@@ -84,30 +88,52 @@ class VoigtBurnPhysicsMixin:
         return dn
 
     def _effective_theta(self):
-        s = self.params.line_asym
+        s = float(self.params.line_asym)
         cos2 = np.clip((1.0 - s - self.Rplus) / 3.0, 0.0, 1.0)
         return np.arccos(np.sqrt(cos2))
 
     def _diffusion_key(self):
         p = self.params
-        return (p.zq_width_R, p.cross_branch_ratio, p.orientation_corr_fraction, p.orientation_corr_width_deg, p.kernel_cutoff_widths, p.line_asym, p.n_bins, p.r_min, p.r_max)
+        return (
+            float(p.zq_width_R),
+            str(getattr(p, 'diffusion_overlap', 'lorentzian')),
+            float(p.cross_branch_ratio),
+            float(p.orientation_corr_fraction),
+            float(p.orientation_corr_width_deg),
+            float(p.kernel_cutoff_widths),
+            float(p.line_asym),
+            float(p.n_bins),
+            float(p.r_min),
+            float(p.r_max),
+        )
 
     def _spectral_overlap(self, delta_R):
-        width = max(self.params.zq_width_R, 1e-12)
-        x = np.asarray(delta_R) / width
-        out = np.exp(-0.5 * x * x)
-        cutoff = max(self.params.kernel_cutoff_widths, 1.0)
-        out[np.abs(x) > cutoff] = 0.0
+        width = float(self.params.zq_width_R)
+        if not np.isfinite(width) or width <= 0:
+            raise ValueError('zq_width_R must be finite and positive')
+        x = np.asarray(delta_R, dtype=float) / width
+        shape = str(getattr(self.params, 'diffusion_overlap', 'lorentzian')).lower()
+        if shape == 'lorentzian':
+            out = 1.0 / (1.0 + x * x)
+        elif shape == 'gaussian':
+            out = np.exp(-0.5 * x * x)
+        else:
+            raise ValueError("diffusion_overlap must be 'lorentzian' or 'gaussian'")
+        cutoff = float(self.params.kernel_cutoff_widths)
+        if not np.isfinite(cutoff) or cutoff < 0:
+            raise ValueError('kernel_cutoff_widths must be finite and nonnegative')
+        if cutoff > 0:
+            out[np.abs(x) > cutoff] = 0.0
         return out
 
     def _orientation_factor(self, i, j, theta):
-        f = np.clip(self.params.orientation_corr_fraction, 0.0, 1.0)
+        f = float(np.clip(self.params.orientation_corr_fraction, 0.0, 1.0))
         if f == 0.0:
-            return np.ones_like(i)
-        sigma = np.deg2rad(max(self.params.orientation_corr_width_deg, 1e-06))
+            return np.ones_like(i, dtype=float)
+        sigma = np.deg2rad(max(float(self.params.orientation_corr_width_deg), 1e-6))
         dtheta = theta[i] - theta[j]
         gaussian = np.exp(-0.5 * (dtheta / sigma) ** 2)
-        return 1.0 - f + f * gaussian
+        return (1.0 - f) + f * gaussian
 
     def _ensure_diffusion_kernel(self):
         key = self._diffusion_key()
@@ -115,10 +141,10 @@ class VoigtBurnPhysicsMixin:
             return
         N = len(self.Rplus)
         theta = self._effective_theta()
-        width = max(self.params.zq_width_R, 1e-12)
-        cutoff = max(self.params.kernel_cutoff_widths, 1.0)
-        max_delta = cutoff * width
-        max_offset = max(1, int(np.ceil(max_delta / max(self.dR, 1e-15))))
+        width = max(float(self.params.zq_width_R), 1e-12)
+        cutoff = float(self.params.kernel_cutoff_widths)
+        max_delta = cutoff * width if cutoff > 0 else np.inf
+        max_offset = (N - 1 if not np.isfinite(max_delta) else max(1, int(np.ceil(max_delta / max(self.dR, 1e-15)))))
         same_i_parts = []
         same_j_parts = []
         same_w_parts = []
@@ -146,16 +172,16 @@ class VoigtBurnPhysicsMixin:
         else:
             self._same_i = np.empty(0, dtype=np.int64)
             self._same_j = np.empty(0, dtype=np.int64)
-            self._same_base = np.empty(0)
+            self._same_base = np.empty(0, dtype=float)
         cross_i_parts = []
         cross_j_parts = []
         cross_w_parts = []
-        if self.params.cross_branch_ratio != 0.0:
+        if float(self.params.cross_branch_ratio) != 0.0:
             R = self.Rplus
             for ii in range(N):
                 target = -R[ii]
-                lo = np.searchsorted(R, target - max_delta, side='left')
-                hi = np.searchsorted(R, target + max_delta, side='right')
+                lo = int(np.searchsorted(R, target - max_delta, side='left'))
+                hi = int(np.searchsorted(R, target + max_delta, side='right'))
                 if hi <= lo:
                     continue
                 jj = np.arange(lo, hi, dtype=np.int64)
@@ -182,38 +208,128 @@ class VoigtBurnPhysicsMixin:
         else:
             self._cross_i = np.empty(0, dtype=np.int64)
             self._cross_j = np.empty(0, dtype=np.int64)
-            self._cross_base = np.empty(0)
+            self._cross_base = np.empty(0, dtype=float)
+        self._same_row = (
+            np.bincount(self._same_i, weights=self._same_base, minlength=N)
+            + np.bincount(self._same_j, weights=self._same_base, minlength=N)
+        )
+        self._cross_row_plus = np.bincount(self._cross_i, weights=self._cross_base, minlength=N)
+        self._cross_row_minus = np.bincount(self._cross_j, weights=self._cross_base, minlength=N)
+        self._same_matrix = self._cross_matrix = None
+        if _coo_matrix is not None:
+            if self._same_base.size:
+                self._same_matrix = _coo_matrix(
+                    (np.r_[self._same_base, self._same_base],
+                     (np.r_[self._same_i, self._same_j], np.r_[self._same_j, self._same_i])),
+                    shape=(N, N),
+                ).tocsr()
+            if self._cross_base.size:
+                self._cross_matrix = _coo_matrix(
+                    (self._cross_base, (self._cross_i, self._cross_j)),
+                    shape=(N, N),
+                ).tocsr()
         self._diffusion_kernel_key = key
+
+    def _dq_correlation_matrix(self):
+        fraction = float(np.clip(self.params.orientation_corr_fraction, 0.0, 1.0))
+        if fraction == 0.0:
+            return None
+        key = (fraction, float(self.params.orientation_corr_width_deg), float(self.params.line_asym), len(self.Rplus))
+        if getattr(self, '_dq_correlation_key', None) != key:
+            theta = self._effective_theta()
+            sigma = np.deg2rad(max(float(self.params.orientation_corr_width_deg), 1e-6))
+            d = (theta[:, None] - theta[None, :]) / sigma
+            matrix = (1.0 - fraction) + fraction * np.exp(-0.5 * d * d)
+            np.fill_diagonal(matrix, 0.0)
+            self._dq_correlation = matrix
+            self._dq_correlation_key = key
+        return self._dq_correlation
+
+    def _double_quantum_term(self, scale):
+        ratio = float(getattr(self.params, 'double_quantum_ratio', 0.0))
+        if not np.isfinite(ratio) or ratio < 0:
+            raise ValueError('double_quantum_ratio must be finite and nonnegative')
+        result = np.zeros_like(self.n)
+        if scale == 0.0 or ratio == 0.0:
+            return result
+        C = self._dq_correlation_matrix()
+        if C is None:
+            incoming_plus = float(np.sum(self.n[:, PLUS]))
+            incoming_minus = float(np.sum(self.n[:, MINUS]))
+        else:
+            incoming_plus = C @ self.n[:, PLUS]
+            incoming_minus = C @ self.n[:, MINUS]
+        flow = (scale * ratio) * (self.n[:, MINUS] * incoming_plus - self.n[:, PLUS] * incoming_minus)
+        result[:, PLUS] = flow
+        result[:, MINUS] = -flow
+        return result
+
+    def _dq_connectivity(self, scale):
+        C = self._dq_correlation_matrix()
+        weights = 1.0 - self.mu if C is None else C @ self.mu
+        return scale * float(getattr(self.params, 'double_quantum_ratio', 0.0)) * weights
 
     def diffusion_connectivity(self, dnp_on=None):
         self._ensure_diffusion_kernel()
         if dnp_on is None:
             dnp_on = self.params.dnp_enabled
-        mw = self.params.microwave_diffusion_factor if dnp_on else 1.0
-        scale = self.params.diffusion_scale * mw
-        conn_same = np.zeros(len(self.Rplus))
-        if self._same_base.size:
-            np.add.at(conn_same, self._same_i, self._same_base)
-            np.add.at(conn_same, self._same_j, self._same_base)
-        conn_cross_plus = np.zeros_like(conn_same)
-        conn_cross_minus = np.zeros_like(conn_same)
-        if self._cross_base.size:
-            np.add.at(conn_cross_plus, self._cross_i, self._cross_base)
-            np.add.at(conn_cross_minus, self._cross_j, self._cross_base)
+        mw = float(self.params.microwave_diffusion_factor) if dnp_on else 1.0
+        enabled = bool(getattr(self.params, 'diffusion_enabled', True))
+        scale = (float(self.params.diffusion_scale) * mw) if enabled else 0.0
         mu_safe = np.maximum(self.mu, 1e-30)
-        return {'same_plus0': scale * conn_same / mu_safe, 'same_0minus': scale * conn_same / mu_safe, 'cross_plus': scale * self.params.cross_branch_ratio * conn_cross_plus / mu_safe, 'cross_minus': scale * self.params.cross_branch_ratio * conn_cross_minus / mu_safe}
+        return {
+            'same_plus0': scale * self._same_row / mu_safe,
+            'same_0minus': scale * self._same_row / mu_safe,
+            'cross_plus': scale * float(self.params.cross_branch_ratio) * self._cross_row_plus / mu_safe,
+            'cross_minus': scale * float(self.params.cross_branch_ratio) * self._cross_row_minus / mu_safe,
+            'double_quantum': self._dq_connectivity(scale),
+        }
 
     def _spin_diffusion_terms(self, dnp_on):
         self._ensure_diffusion_kernel()
-        if self.params.diffusion_scale == 0.0:
+        enabled = bool(getattr(self.params, 'diffusion_enabled', True))
+        if (not enabled) or float(self.params.diffusion_scale) == 0.0:
             z = np.zeros_like(self.n)
-            return {'diff_plus0': z.copy(), 'diff_0minus': z.copy(), 'diff_cross': z.copy()}
+            return {
+                'diff_plus0': z.copy(),
+                'diff_0minus': z.copy(),
+                'diff_cross': z.copy(),
+                'diff_double_quantum': z.copy(),
+            }
         frac = self.n / np.maximum(self.mu[:, None], 1e-30)
         pp = frac[:, PLUS]
         p0 = frac[:, ZERO]
         pm = frac[:, MINUS]
-        mw = self.params.microwave_diffusion_factor if dnp_on else 1.0
-        scale = self.params.diffusion_scale * mw
+        mw = float(self.params.microwave_diffusion_factor) if dnp_on else 1.0
+        scale = float(self.params.diffusion_scale) * mw
+        if getattr(self, '_same_matrix', None) is not None:
+            H = self._same_matrix
+            Hp = H @ frac
+            plus_flow = scale * (p0 * Hp[:, PLUS] - pp * Hp[:, ZERO])
+            minus_flow = scale * (pm * Hp[:, ZERO] - p0 * Hp[:, MINUS])
+            dn_p = np.zeros_like(self.n)
+            dn_m = np.zeros_like(self.n)
+            dn_x = np.zeros_like(self.n)
+            dn_p[:, PLUS] = plus_flow
+            dn_p[:, ZERO] = -plus_flow
+            dn_m[:, ZERO] = minus_flow
+            dn_m[:, MINUS] = -minus_flow
+            if self._cross_base.size and float(self.params.cross_branch_ratio) > 0 and self._cross_matrix is not None:
+                X = self._cross_matrix
+                Xp = X @ frac
+                Xtp = X.T @ frac
+                kx = scale * float(self.params.cross_branch_ratio)
+                cross_plus = kx * (p0 * Xp[:, ZERO] - pp * Xp[:, MINUS])
+                cross_minus = kx * (p0 * Xtp[:, ZERO] - pm * Xtp[:, PLUS])
+                dn_x[:, PLUS] = cross_plus
+                dn_x[:, MINUS] = cross_minus
+                dn_x[:, ZERO] = -cross_plus - cross_minus
+            return {
+                'diff_plus0': dn_p,
+                'diff_0minus': dn_m,
+                'diff_cross': dn_x,
+                'diff_double_quantum': self._double_quantum_term(scale),
+            }
         dn_p = np.zeros_like(self.n)
         if self._same_base.size:
             i = self._same_i
@@ -235,7 +351,7 @@ class VoigtBurnPhysicsMixin:
             np.add.at(dn_m[:, ZERO], j, -Jm)
             np.add.at(dn_m[:, MINUS], j, Jm)
         dn_x = np.zeros_like(self.n)
-        cross_ratio = self.params.cross_branch_ratio
+        cross_ratio = float(self.params.cross_branch_ratio)
         if cross_ratio != 0.0 and self._cross_base.size:
             i = self._cross_i
             j = self._cross_j
@@ -245,7 +361,12 @@ class VoigtBurnPhysicsMixin:
             np.add.at(dn_x[:, ZERO], i, -Jx)
             np.add.at(dn_x[:, MINUS], j, Jx)
             np.add.at(dn_x[:, ZERO], j, -Jx)
-        return {'diff_plus0': dn_p, 'diff_0minus': dn_m, 'diff_cross': dn_x}
+        return {
+            'diff_plus0': dn_p,
+            'diff_0minus': dn_m,
+            'diff_cross': dn_x,
+            'diff_double_quantum': self._double_quantum_term(scale),
+        }
 
     def local_diffusion_diagnostics(self, R=None, dnp_on=None):
         if R is None:
@@ -255,12 +376,13 @@ class VoigtBurnPhysicsMixin:
         (kp, km) = self.branch_indices(R)
         conn = self.diffusion_connectivity(dnp_on=dnp_on)
         terms = self._spin_diffusion_terms(dnp_on)
-        net = terms['diff_plus0'] + terms['diff_0minus'] + terms['diff_cross']
+        net = terms['diff_plus0'] + terms['diff_0minus'] + terms['diff_cross'] + terms.get('diff_double_quantum', 0)
         scale_obs = self.display_cal / self.dR
 
         def val(arr, idx):
             return np.nan if idx is None else arr[idx]
-        out = {'R': R, 'conn_Iplus': val(conn['same_plus0'] + conn['cross_plus'], kp), 'conn_Iminus': val(conn['same_0minus'] + conn['cross_minus'], km), 'dIplus_diff_dt': np.nan, 'dIminus_diff_dt': np.nan, 'lambda_Iplus': np.nan, 'lambda_Iminus': np.nan}
+        dq = conn.get('double_quantum', 0)
+        out = {'R': R, 'conn_Iplus': val(conn['same_plus0'] + conn['cross_plus'] + dq, kp), 'conn_Iminus': val(conn['same_0minus'] + conn['cross_minus'] + dq, km), 'dIplus_diff_dt': np.nan, 'dIminus_diff_dt': np.nan, 'lambda_Iplus': np.nan, 'lambda_Iminus': np.nan}
         if kp is not None:
             slope = scale_obs * (net[kp, PLUS] - net[kp, ZERO])
             out['dIplus_diff_dt'] = slope
