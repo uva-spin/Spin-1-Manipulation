@@ -62,7 +62,9 @@ python ml/rivanna/test-binning.py
 
 ```bash
 # Generate training spectra
-python Data_Creation/create_dae_voigt_burn_spectra.py --quick
+python Data_Creation/create_data.py --quick
+# Optional: include unmanipulated equilibrium spectra (source=2)
+python Data_Creation/create_data.py --ssrf --unmanipulated
 
 # Train
 python ml/spectrum_pq.py \

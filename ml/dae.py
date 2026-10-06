@@ -15,7 +15,7 @@ For use with the DAE+combined pipeline (dae_combined_pipeline.py), train with
 Usage:
   python ml/dae.py
   python ml/dae.py --spectra Data_Creation/dae_voigt_burn_spectra/spectra.npz --noise-std 0.1
-  python ml/dae.py --test-only --checkpoint dae_denoise_results/dae_denoise_500.pth
+  python ml/dae.py --test-only --checkpoint ml/results/dae/dae_denoise_results/dae_denoise_500.pth
 """
 import argparse
 import json
@@ -31,7 +31,7 @@ import torch.utils.data as data
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parent
 DEFAULT_SPECTRA_CANDIDATES = (REPO_ROOT / 'Data_Creation' / 'dae_voigt_burn_spectra' / 'spectra.npz', SCRIPT_DIR / 'dae_voigt_burn_spectra' / 'spectra.npz')
-DEFAULT_OUTPUT_DIR = SCRIPT_DIR / 'dae_denoise_results'
+DEFAULT_OUTPUT_DIR = SCRIPT_DIR / 'results' / 'dae' / 'dae_denoise_results'
 
 class DenoisingAutoencoder(nn.Module):
     """
@@ -524,7 +524,7 @@ def main():
     optimizer = optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=1e-05)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.num_epochs, eta_min=1e-06)
     loss_fn = nn.MSELoss()
-    best_val_loss = 'inf'
+    best_val_loss = float('inf')
     epochs_no_improve = 0
     best_state = None
     for epoch in range(args.num_epochs):
@@ -538,6 +538,9 @@ def main():
         else:
             epochs_no_improve += 1
         print(f'Epoch {epoch + 1}: train={train_loss:.6f} val={val_loss:.6f} lr={scheduler.get_last_lr()[0]:.2e}')
+        if epochs_no_improve >= args.patience:
+            print(f'Early stopping at epoch {epoch + 1}')
+            break
     if best_state is not None:
         model.load_state_dict(best_state)
     test_loss = evaluate(model, test_loader, loss_fn, device)
