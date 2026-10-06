@@ -7,9 +7,9 @@ both RF and recovery.  Burn durations are chosen to preserve I-(R) >= I+(R) at
 the burn center in the moderate-power regime.
 
 Run from repo root:
-  python physics/ssrf_realtime/tests/plot_voigt_burn_physics_demo.py
-  python physics/ssrf_realtime/tests/plot_voigt_burn_physics_demo.py --all
-  python physics/ssrf_realtime/tests/plot_voigt_burn_physics_demo.py --single-bin
+  python physics/rf/tests/plot_voigt_burn_physics_demo.py
+  python physics/rf/tests/plot_voigt_burn_physics_demo.py --all
+  python physics/rf/tests/plot_voigt_burn_physics_demo.py --single-bin
 """
 import argparse
 import sys
@@ -23,9 +23,9 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 if str(VOIGT_BURN_ROOT) not in sys.path:
     sys.path.insert(0, str(VOIGT_BURN_ROOT))
-from physics.ssrf_realtime import Spin1Model
-from physics.ssrf_realtime.rate_equations_realtime import configure_single_bin_ssrf, configure_voigt_burn_spectral_recovery, configure_voigt_ssrf, create_voigt_burn_model, voigt_burn_params
-from physics.ssrf_realtime.voigt_physical import approximate_voigt_fwhm
+from physics.rf import Spin1Model
+from physics.rf.rate_equations_realtime import configure_single_bin_ssrf, configure_voigt_burn_spectral_recovery, configure_voigt_ssrf, create_voigt_burn_model, voigt_burn_params
+from physics.rf.voigt_physical import approximate_voigt_fwhm
 OUTPUT_DIR = TESTS_DIR / 'output'
 GAUSS_FWHM_R = 0.03
 LORENTZ_FWHM_R = 0.015
@@ -284,9 +284,9 @@ def plot_v2_vs_voigt_burn_package(out):
     v2_im = np.asarray(v2_im)
     (fig, ax) = plt.subplots(figsize=(8.8, 4.2), layout='constrained')
     ax.plot(steps, ref_im, color='tab:blue', linewidth=1.3, label='voigt_burn package $I_-$')
-    ax.plot(steps, v2_im, color='tab:cyan', linestyle='--', linewidth=1.1, label='ssrf_realtime $I_-$')
+    ax.plot(steps, v2_im, color='tab:cyan', linestyle='--', linewidth=1.1, label='rf $I_-$')
     ax.plot(steps, ref_ip, color='tab:red', linewidth=1.3, label='voigt_burn package $I_+$')
-    ax.plot(steps, v2_ip, color='tab:orange', linestyle='--', linewidth=1.1, label='ssrf_realtime $I_+$')
+    ax.plot(steps, v2_ip, color='tab:orange', linestyle='--', linewidth=1.1, label='rf $I_+$')
     ax.set_xlabel('integration step')
     ax.set_ylabel(f'intensity at R={burn_R:.2f}')
     ax.set_title(f'Package parity at burn center  |  max |ΔI+|={np.max(np.abs(v2_ip - ref_ip)):.2e}  max |ΔI-|={np.max(np.abs(v2_im - ref_im)):.2e}')

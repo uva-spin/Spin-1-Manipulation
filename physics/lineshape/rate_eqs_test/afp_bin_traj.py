@@ -25,7 +25,7 @@ _REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 from physics.lineshape.Lineshape import GenerateVectorLineshape
-from physics.ssrf_realtime.model import Spin1Model, Spin1Params
+from physics.rf.model import Spin1Model, Spin1Params
 NUM_BINS = 500
 R_MIN = -3.0
 R_MAX = 3.0

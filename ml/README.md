@@ -18,10 +18,10 @@ These scripts search for burn sequences that maximize tensor polarization Q:
 
 | Script | Method | Physics backend |
 |--------|--------|-----------------|
-| `dqn.py` | Double DQN | `Data_Creation/rivanna` ssrf_realtime |
-| `sarsa.py` | Tabular SARSA | rivanna ssrf_realtime |
+| `dqn.py` | Double DQN | `Data_Creation/rivanna` and `physics.rf` |
+| `sarsa.py` | Tabular SARSA | rivanna and `physics.rf` |
 | `q-learning.py` | Tabular Q-learning | Legacy lookup-table mapper |
-| `opt_q.py` | Greedy incremental RF search | `physics/ssrf_realtime` |
+| `opt_q.py` | Greedy incremental RF search | `physics.rf` |
 
 ### Example: train a DQN burn policy
 

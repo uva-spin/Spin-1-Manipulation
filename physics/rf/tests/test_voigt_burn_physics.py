@@ -1,8 +1,8 @@
-"""Tests for voigt_burn physics in ssrf_realtime."""
+"""Tests for voigt_burn physics in physics.rf."""
 import numpy as np
 import pytest
-from physics.ssrf_realtime import Spin1Model, Spin1Params
-from physics.ssrf_realtime.rate_equations_realtime import configure_single_bin_ssrf, configure_voigt_burn_spectral_recovery, create_voigt_burn_model, verify_burn_response, voigt_burn_recovery_param_snapshot
+from physics.rf import Spin1Model, Spin1Params
+from physics.rf.rate_equations_realtime import configure_single_bin_ssrf, configure_voigt_burn_spectral_recovery, create_voigt_burn_model, verify_burn_response, voigt_burn_recovery_param_snapshot
 
 def _physical_params(**overrides):
     base = dict(use_physical_voigt_rf=True, diffusion_scale=0.0, dnp_enabled=False, t1_rate=0.0)
@@ -145,7 +145,6 @@ def test_post_burn_population_currents_fill_both_direct_holes_and_reduce_mirror_
     assert abs(d['dP_dt']) < 1e-12
 
 def test_branch_order_preserved_at_moderate_burn():
-    from physics.ssrf_realtime.rate_equations_realtime import create_voigt_burn_model
     m = create_voigt_burn_model(gamma_rf=1.0)
     burn_R = m.params.rf_burn_R
     for _ in range(100):

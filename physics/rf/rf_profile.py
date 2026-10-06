@@ -1,5 +1,5 @@
 """
-Multi-bin ssRF burn profiles for ssrf_realtime.
+Multi-bin ssRF burn profiles for physics.rf.
 
 Each bin in the local support receives RF power from a discretized Voigt
 envelope peaked at the burn center. ssRF is applied independently at every

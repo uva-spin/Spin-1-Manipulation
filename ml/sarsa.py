@@ -1,5 +1,5 @@
 """
-Tabular SARSA for sequential bin-wise ssRF burns using Data_Creation/rivanna ssrf_realtime.
+Tabular SARSA for sequential bin-wise ssRF burns using Data_Creation/rivanna and physics.rf.
 
 Maximizes integrated Q polarization  Q = sum(I_+ - I_-)  by choosing a frequency
 bin and gamma_rf burn strength. Burns are only applied at bins whose initial
@@ -192,7 +192,7 @@ def build_spin1_from_polarization(config, polarization):
     return build_spin1_model(np.asarray(iplus), np.asarray(iminus), polarization=polarization, num_bins=config.num_bins, dt=config.dt, rf_enabled=False, relax_enabled=True, diffusion_scale=config.diffusion_scale, rf_gaussian_fwhm_R=config.gaussian_fwhm_R, rf_lorentzian_fwhm_R=config.lorentzian_fwhm_R, r_min=config.f_min, r_max=config.f_max)
 
 class Spin1BurnEnv:
-    """RL environment for sequential ssRF burns with ssrf_realtime physics."""
+    """RL environment for sequential ssRF burns with physics.rf."""
 
     def __init__(self, config):
         self.config = config
@@ -432,7 +432,7 @@ def train(config, episodes=5000, polarizations=None, seed=0, eps_start=1.0, eps_
             state = next_state
             action = next_action
         history.append(ep_return)
-    stats = {'q_lo': q_lo, 'q_hi': q_hi, 'p_lo': np.min(polarizations), 'p_hi': np.max(polarizations), 'final_q_gain': env.current_q - env.initial_q, 'episode_returns': np.asarray(history), 'physics_model': 'ssrf_realtime', 'rf_mode': config.rf_mode}
+    stats = {'q_lo': q_lo, 'q_hi': q_hi, 'p_lo': np.min(polarizations), 'p_hi': np.max(polarizations), 'final_q_gain': env.current_q - env.initial_q, 'episode_returns': np.asarray(history), 'physics_model': 'physics.rf', 'rf_mode': config.rf_mode}
     return (agent, env, stats)
 
 def greedy_episode(env, agent, polarization):
@@ -460,7 +460,7 @@ def plot_training_returns(returns, output_path):
     ax.plot(np.arange(window - 1, window - 1 + len(smoothed)), smoothed, color='C1', linewidth=2, label=f'{window}-ep moving avg')
     ax.set_xlabel('episode')
     ax.set_ylabel('sum of Q rewards')
-    ax.set_title('SARSA: ssrf_realtime bin-wise ssRF burn policy')
+    ax.set_title('SARSA: physics.rf bin-wise ssRF burn policy')
     ax.legend()
     ax.grid(True, alpha=0.3)
     fig.tight_layout()
@@ -524,7 +524,7 @@ def plot_q_table(q_table, output_path):
 def main():
     config = BurnConfig(max_burns=MAX_BURNS, enforce_full_spectrum=FREE_BIN_SELECTION)
     polarizations = np.linspace(0.4, 0.5, 20)
-    print(f'Training SARSA agent with rivanna ssrf_realtime ({config.rf_mode}, only_Q<0 bins={config.only_negative_initial_q}, theta_Q_filter={config.q_filter_use_theta})...')
+    print(f'Training SARSA agent with rivanna physics.rf ({config.rf_mode}, only_Q<0 bins={config.only_negative_initial_q}, theta_Q_filter={config.q_filter_use_theta})...')
     (agent, env, stats) = train(config, episodes=EPISODES, polarizations=polarizations, seed=SEED)
     np.save(OUTPUT_DIR / 'sarsa_table.npy', agent.q_table)
     plot_training_returns(stats['episode_returns'], OUTPUT_DIR / 'training_returns.png')

@@ -31,8 +31,8 @@ Some scripts import modules that may not be present in the current repo (for exa
 
 ## Tests
 
-Physics unit tests live in [`physics/ssrf_realtime/`](../ssrf_realtime/README.md):
+Physics unit tests live in [`physics/rf/`](../../rf/README.md):
 
 ```bash
-cd physics/ssrf_realtime && pytest -q
+cd physics/rf && pytest -q
 ```

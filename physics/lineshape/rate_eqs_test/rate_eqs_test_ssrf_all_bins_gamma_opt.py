@@ -15,8 +15,8 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 from physics.afp import AFP
 from physics.lineshape.Lineshape import GenerateVectorLineshape
-from physics.ssrf_realtime import Spin1Params
-from physics.ssrf_realtime.rate_equations_realtime import build_model_for_intensities
+from physics.rf import Spin1Params
+from physics.rf.rate_equations_realtime import build_model_for_intensities
 P = 0.4
 NUM_BINS = 500
 DT = 0.05

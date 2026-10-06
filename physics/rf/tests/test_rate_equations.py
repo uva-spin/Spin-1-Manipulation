@@ -1,8 +1,8 @@
 import numpy as np
 import pytest
 from physics.lineshape.Lineshape import GenerateVectorLineshape
-from physics.ssrf_realtime import Spin1Params
-from physics.ssrf_realtime.rate_equations_realtime import build_model_for_intensities, solve_rate_equations, verify_burn_response, verify_rates_response
+from physics.rf import Spin1Params
+from physics.rf.rate_equations_realtime import build_model_for_intensities, solve_rate_equations, verify_burn_response, verify_rates_response
 
 def _lineshape(polarization=0.45, n_bins=500):
     f = np.linspace(-3.0, 3.0, n_bins)

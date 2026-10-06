@@ -1,9 +1,10 @@
-"""Tests for capacity-weighted v2 ssrf_realtime model."""
+"""Tests for the capacity-weighted v2 physics.rf model."""
 import numpy as np
 import pytest
 from physics.lineshape.Lineshape import GenerateVectorLineshape
-from physics.ssrf_realtime import Spin1Model, Spin1Params
-from physics.ssrf_realtime.rate_equations_realtime import verify_burn_response, verify_rates_response
+from physics.rf import Spin1Model, Spin1Params
+from physics.rf.rate_equations_realtime import burn_preserves_branch_order, configure_voigt_ssrf, solve_rate_equations, verify_burn_response, verify_rates_response
+from physics.rf.rf_profile import make_voigt_rf_profile
 
 def _recovery_params(**overrides):
     base = dict(d_same_plus0=0.18, d_same_0minus=0.1, d_spec_plus0=2.0, d_spec_0minus=1.0, t2_width_R=0.05, dnp_enabled=False)
@@ -107,7 +108,6 @@ def test_integrated_burn_area_mirror_ratios():
     burn_idx = np.argmin(np.abs(f - -0.92))
     mirror_idx = len(Iplus) - 1 - burn_idx
     params = Spin1Params(capacity_rate_power=1.0, gamma_rf=2.0, d_same_plus0=0.0, d_same_0minus=0.0, d_spec_plus0=0.0, d_spec_0minus=0.0, steps=80, dt=0.0015)
-    from physics.ssrf_realtime.rate_equations_realtime import solve_rate_equations
     (Iplus_new, Iminus_new, _, _, _) = solve_rate_equations(Iplus, Iminus, dt=0.0015, gamma_rf=2.0, burn_idx=burn_idx, params=params, p0=0.48, rf_only=True)
     check = verify_burn_response(Iplus, Iminus, Iplus_new, Iminus_new, burn_idx, rtol=0.1)
     d_ip_burn = check['d_iplus_burn']
@@ -125,13 +125,11 @@ def test_voigt_burn_preserves_iminus_above_iplus_at_burn_bin():
     burn_idx = np.argmin(np.abs(f - -0.92))
     assert Iminus[burn_idx] > Iplus[burn_idx]
     params = Spin1Params(p0=0.48, n_bins=500, capacity_rate_power=1.0, gamma_rf=1.0, d_same_plus0=0.0, d_same_0minus=0.0, d_spec_plus0=0.0, d_spec_0minus=0.0, steps=400, dt=0.0015)
-    from physics.ssrf_realtime.rate_equations_realtime import burn_preserves_branch_order, solve_rate_equations
     (Iplus_new, Iminus_new, _, _, _) = solve_rate_equations(Iplus, Iminus, dt=0.0015, gamma_rf=1.0, burn_idx=burn_idx, params=params, p0=0.48, rf_only=True)
     assert burn_preserves_branch_order(Iplus, Iminus, Iplus_new, Iminus_new, burn_idx)
     assert Iminus_new[burn_idx] >= Iplus_new[burn_idx]
 
 def test_voigt_multi_bin_uses_center_pair_capacity_weights():
-    from physics.ssrf_realtime.rate_equations_realtime import configure_voigt_ssrf
     f = np.linspace(-3.0, 3.0, 500)
     (_, ip, im) = GenerateVectorLineshape(0.48, f)
     burn_idx = np.argmin(np.abs(f - -0.92))
@@ -150,7 +148,6 @@ def test_voigt_multi_bin_uses_center_pair_capacity_weights():
     assert profile[burn_idx] == pytest.approx(1.0)
 
 def test_voigt_rf_profile_peak_at_center_rounded_falloff():
-    from physics.ssrf_realtime.rf_profile import make_voigt_rf_profile
     (profile, support) = make_voigt_rf_profile(500, 250, 10.0, half_width=5)
     assert 250 in support
     assert profile[250] == pytest.approx(10.0)

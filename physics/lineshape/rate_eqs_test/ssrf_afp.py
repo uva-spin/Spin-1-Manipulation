@@ -7,7 +7,7 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 from physics.lineshape.Lineshape import GenerateVectorLineshape
 from physics.lineshape.rate_eqs_test.ssrf_bin_traj import SIGMA_BINS, VOIGT_GAMMA_BINS, freeze_rf_profile, make_voigt_rf_profile, ssrf_touched_bins as traj_ssrf_touched_bins
-from physics.ssrf_realtime.model import MINUS, PLUS, ZERO, Spin1Model, Spin1Params
+from physics.rf.model import MINUS, PLUS, ZERO, Spin1Model, Spin1Params
 P = 0.5
 NUM_BINS = 500
 DT = 0.005

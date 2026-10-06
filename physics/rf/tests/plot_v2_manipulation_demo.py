@@ -1,15 +1,15 @@
 """
-Demo plots for ssrf_realtime: baseline, ssRF burn, and AFP.
+Demo plots for physics.rf: baseline, ssRF burn, and AFP.
 
 Run from repo root:
-  python physics/ssrf_realtime/tests/plot_v2_manipulation_demo.py
-  python physics/ssrf_realtime/tests/plot_v2_manipulation_demo.py -m single
-  python physics/ssrf_realtime/tests/plot_v2_manipulation_demo.py -m voigt
-  python physics/ssrf_realtime/tests/plot_v2_manipulation_demo.py -m both
-  python physics/ssrf_realtime/tests/plot_v2_manipulation_demo.py --neighbor-bins
-  python physics/ssrf_realtime/tests/plot_v2_manipulation_demo.py --compare-ssrf-modes
-  python physics/ssrf_realtime/tests/plot_v2_manipulation_demo.py --compare-ssrf-rf-only
-  python physics/ssrf_realtime/tests/plot_v2_manipulation_demo.py --compare-voigt-renorm
+  python physics/rf/tests/plot_v2_manipulation_demo.py
+  python physics/rf/tests/plot_v2_manipulation_demo.py -m single
+  python physics/rf/tests/plot_v2_manipulation_demo.py -m voigt
+  python physics/rf/tests/plot_v2_manipulation_demo.py -m both
+  python physics/rf/tests/plot_v2_manipulation_demo.py --neighbor-bins
+  python physics/rf/tests/plot_v2_manipulation_demo.py --compare-ssrf-modes
+  python physics/rf/tests/plot_v2_manipulation_demo.py --compare-ssrf-rf-only
+  python physics/rf/tests/plot_v2_manipulation_demo.py --compare-voigt-renorm
 """
 import argparse
 import sys
@@ -22,9 +22,9 @@ REPO_ROOT = TESTS_DIR.parent.parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 from physics.lineshape.Lineshape import GenerateVectorLineshape
-from physics.ssrf_realtime import Spin1Model, Spin1Params
-from physics.ssrf_realtime.rate_equations_realtime import burn_preserves_branch_order, configure_discrete_bins_ssrf, configure_single_bin_ssrf, configure_voigt_ssrf, verify_burn_response
-from physics.ssrf_realtime.rf_profile import HALF_WIDTH, SIGMA_BINS, VOIGT_GAMMA_BINS, make_voigt_rf_profile
+from physics.rf import Spin1Model, Spin1Params
+from physics.rf.rate_equations_realtime import burn_preserves_branch_order, configure_discrete_bins_ssrf, configure_single_bin_ssrf, configure_voigt_ssrf, verify_burn_response
+from physics.rf.rf_profile import HALF_WIDTH, SIGMA_BINS, VOIGT_GAMMA_BINS, make_voigt_rf_profile
 OUTPUT_DIR = TESTS_DIR / 'output'
 P = 0.48
 N_BINS = 500
@@ -513,7 +513,7 @@ def compare_voigt_renorm():
     print(f'Saved: {out_profile}')
 
 def _parse_args():
-    p = argparse.ArgumentParser(description='ssrf_realtime manipulation demo plots')
+    p = argparse.ArgumentParser(description='physics.rf manipulation demo plots')
     p.add_argument('-m', '--ssrf-mode', choices=('single', 'voigt', 'both'), default='both', help='ssRF profile: single-bin, Voigt multi-bin, or both (default: both)')
     p.add_argument('--neighbor-bins', action='store_true', help='Flat single-bin-style RF on neighboring bins 173 and 174')
     p.add_argument('--compare-ssrf-modes', action='store_true', help='Overlay single-bin vs Voigt multi-bin ssRF burn comparison')

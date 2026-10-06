@@ -35,7 +35,7 @@ You need **Python 3.10+** and a working **PyTorch** install (CPU is fine for sma
 ### 2. Verify the physics model
 
 ```bash
-cd physics/ssrf_realtime
+cd physics/rf
 pytest -q
 ```
 
