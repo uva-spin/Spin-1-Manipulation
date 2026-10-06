@@ -1,4 +1,4 @@
-"""DAE generator uses ssRF-beta physics and independent profile events."""
+"""DAE generator uses ssRF-beta physics and independent profile / unmanip events."""
 import sys
 from pathlib import Path
 
@@ -12,46 +12,40 @@ for path in (_ROOT, _DATA, _RIVANNA):
     if str(path) not in sys.path:
         sys.path.insert(0, str(path))
 
-from create_dae_voigt_burn_spectra import (
+from create_data import (
     F_MAX,
     F_MIN,
     NUM_BINS,
-    P_STEP,
     PROFILE_CENTER_BIN,
+    UNMANIP_CENTER_BIN,
     _resolve_modes,
     generate_spectra,
-    polarization_grid,
 )
 from physics.rf.lineshape import boltzmann_Q
-from common import SOURCE_AFP, SOURCE_PROFILE, SOURCE_SSRF
+from common import SOURCE_AFP, SOURCE_PROFILE, SOURCE_SSRF, SOURCE_UNMANIP
 from physics.rf.optimal_profile import OptimizerSettings
 
 
 def test_resolve_modes_profile_is_independent():
-    assert _resolve_modes(ssrf=None, afp=None, afp_relax=False, profile=None, quick=False) == (
-        True,
-        False,
-        False,
-        False,
-    )
-    assert _resolve_modes(ssrf=None, afp=None, afp_relax=False, profile=None, quick=True) == (
-        True,
-        True,
-        False,
-        True,
-    )
-    assert _resolve_modes(ssrf=None, afp=None, afp_relax=False, profile=True, quick=False) == (
-        False,
-        False,
-        False,
-        True,
-    )
-    assert _resolve_modes(ssrf=True, afp=None, afp_relax=False, profile=True, quick=False) == (
-        True,
-        False,
-        False,
-        True,
-    )
+    # (ssrf, afp, afp_relax, afp_profile, profile, unmanipulated)
+    assert _resolve_modes(
+        ssrf=None, afp=None, afp_relax=False, afp_profile=False, profile=None, unmanipulated=None, quick=False,
+    ) == (True, False, False, False, False, False)
+    assert _resolve_modes(
+        ssrf=None, afp=None, afp_relax=False, afp_profile=False, profile=None, unmanipulated=None, quick=True,
+    ) == (True, True, False, False, True, False)
+    assert _resolve_modes(
+        ssrf=None, afp=None, afp_relax=False, afp_profile=False, profile=True, unmanipulated=None, quick=False,
+    ) == (False, False, False, False, True, False)
+    assert _resolve_modes(
+        ssrf=True, afp=None, afp_relax=False, afp_profile=False, profile=True, unmanipulated=None, quick=False,
+    ) == (True, False, False, False, True, False)
+    assert _resolve_modes(
+        ssrf=None, afp=None, afp_relax=False, afp_profile=False, profile=None, unmanipulated=True, quick=False,
+    ) == (False, False, False, False, False, True)
+    assert _resolve_modes(
+        ssrf=True, afp=None, afp_relax=False, afp_profile=False, profile=None, unmanipulated=True, quick=False,
+    ) == (True, False, False, False, False, True)
 
 
 def test_generate_spectra_keeps_profile_events_separate():
@@ -83,6 +77,7 @@ def test_generate_spectra_keeps_profile_events_separate():
     assert SOURCE_SSRF in sources
     assert SOURCE_PROFILE in sources
     assert SOURCE_AFP not in sources
+    assert SOURCE_UNMANIP not in sources
     assert data["spectra"].shape[-1] == 21
     profile = data["source"] == SOURCE_PROFILE
     ssrf = data["source"] == SOURCE_SSRF
@@ -108,6 +103,27 @@ def test_generate_spectra_keeps_profile_events_separate():
     )
 
 
+def test_generate_unmanipulated_events():
+    data = generate_spectra(
+        do_ssrf=False,
+        do_afp=False,
+        do_unmanipulated=True,
+        p_values=np.asarray([0.3, 0.45]),
+        num_bins=21,
+        r_min=-3.0,
+        r_max=3.0,
+        dt=0.02,
+    )
+    assert data["spectra"].shape == (2, 2, 21)
+    assert np.all(data["source"] == SOURCE_UNMANIP)
+    assert np.all(data["n_steps"] == 0)
+    assert np.all(data["applied_power"] == 0.0)
+    assert np.all(data["center_bin"] == UNMANIP_CENTER_BIN)
+    assert np.all(data["power_profile"] == 0.0)
+    np.testing.assert_allclose(data["P_total"], [0.3, 0.45], atol=5e-3)
+    np.testing.assert_allclose(data["Q_total"], [boltzmann_Q(0.3), boltzmann_Q(0.45)], atol=5e-3)
+
+
 def test_default_spectrum_grid_is_500_bins_pm6():
     assert NUM_BINS == 500
     assert F_MIN == pytest.approx(-6.0)
@@ -117,7 +133,7 @@ def test_default_spectrum_grid_is_500_bins_pm6():
 def test_burn_centers_are_q_negative_inside_inner_window():
     from burn_selection import equilibrium_q_profile
     from common import BURN_BIN_CHOICES, BURN_R_MAX, BURN_R_MIN, EXCLUDED_MANIPULATION_BURN_BINS
-    from create_dae_voigt_burn_spectra import _burn_window_bins, q_negative_bins_for_p0
+    from create_data import _burn_window_bins, q_negative_bins_for_p0
 
     burn_window = _burn_window_bins()
     expected = np.asarray(
@@ -138,7 +154,7 @@ def test_burn_centers_are_q_negative_inside_inner_window():
 
 
 def test_ssrf_voigt_power_profile_peaks_at_center():
-    from create_dae_voigt_burn_spectra import ssrf_voigt_power_profile, zero_power_profile
+    from create_data import ssrf_voigt_power_profile, zero_power_profile
 
     zeros = zero_power_profile(21)
     assert zeros.shape == (21,)
@@ -151,8 +167,41 @@ def test_ssrf_voigt_power_profile_peaks_at_center():
 
 
 def test_polarization_grid_is_denser_than_v4_npz():
+    from create_data import P_STEP, UNMANIP_P_STEP, polarization_grid
+
     values = polarization_grid(0.2, 0.6, P_STEP)
     assert P_STEP == pytest.approx(0.025)
     assert values.size >= 16
     np.testing.assert_allclose(values[0], 0.2, atol=1e-12)
     np.testing.assert_allclose(values[-1], 0.6, atol=1e-12)
+    assert UNMANIP_P_STEP < P_STEP
+    unmanip = polarization_grid(0.2, 0.6, UNMANIP_P_STEP)
+    assert unmanip.size > values.size
+
+
+def test_unmanipulated_uses_finer_p_step_than_ssrf():
+    data = generate_spectra(
+        do_ssrf=True,
+        do_afp=False,
+        do_unmanipulated=True,
+        p_min=0.2,
+        p_max=0.3,
+        p_step=0.05,
+        unmanip_p_step=0.025,
+        min_burn_steps=0,
+        max_burn_steps=0,
+        burn_steps_step=1,
+        max_centers_per_p=1,
+        num_bins=21,
+        r_min=-3.0,
+        r_max=3.0,
+        dt=0.02,
+        gamma_rf=2.0,
+    )
+    ssrf = data['source'] == SOURCE_SSRF
+    unmanip = data['source'] == SOURCE_UNMANIP
+    # ssRF: one center × one step × 3 polarizations (0.20, 0.25, 0.30)
+    assert len(np.unique(np.round(data['p0'][ssrf], 5))) == 3
+    # unmanipulated: finer grid → 5 polarizations (0.20 .. 0.30 step 0.025)
+    assert len(np.unique(np.round(data['p0'][unmanip], 5))) == 5
+    assert unmanip.sum() == 5

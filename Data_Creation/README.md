@@ -39,10 +39,24 @@ Each row is one simulated event **as seen at spectral bin XXXX** (`p0`, `gamma_r
 For [`ml/spectrum_pq.py`](../ml/README.md) and [`ml/dae.py`](../ml/README.md):
 
 ```bash
-python Data_Creation/create_dae_voigt_burn_spectra.py --quick
+python Data_Creation/create_data.py --quick
+python Data_Creation/create_data.py --unmanipulated
+python Data_Creation/create_data.py --ssrf --unmanipulated
+python Data_Creation/create_data.py --unmanipulated --unmanip-p-step 0.001
 ```
 
-Writes `Data_Creation/dae_voigt_burn_spectra/spectra.npz` with shape `(N, 2, 500)` (I+ / I−).
+Writes `Data_Creation/spectra_data/spectra.npz` with shape `(N, 2, 500)` (I+ / I−).
+Source codes: `0=ssRF`, `1=AFP`, `2=unmanipulated`, `3=optimal profile`, `4=AFP Profile`, `5=ssRF+AFP combined` (see `combo_scenario` / `combo_layout` in NPZ meta).
+
+```bash
+python Data_Creation/create_data.py --ssrf-afp-combined --no-ssrf --no-afp --max-burn-steps 50 --max-relax-steps 50
+```
+
+Combined mode caps selective centers (default 5/region, zipped pairs) and post-AFP
+relax at `min(max-relax, max-burn)` so it does not inherit AFP Profile’s long
+relax grid. Override with `--combined-max-centers` / `--combined-max-relax-steps`.
+
+Manipulated modes use `--p-step` (default 0.025); unmanipulated uses `--unmanip-p-step` (default 0.0005).
 
 ## Tabular Q-learning lookup (optional)
 
