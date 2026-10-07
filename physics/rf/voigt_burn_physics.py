@@ -87,6 +87,78 @@ class VoigtBurnPhysicsMixin:
         dn[:, MINUS] += J_minus
         return dn
 
+    def apply_voigt_burn(self, center_R, gaussian_fwhm_R, lorentzian_fwhm_R, gamma_rf, n_steps, *, dt=None, window_R=None, rel_threshold=0.01):
+        """Burn the loaded lineshape with a physical Voigt, as in create_data.
+
+        ``gaussian_fwhm_R`` and ``lorentzian_fwhm_R`` set the shape. ``gamma_rf``
+        is the peak height. The Voigt is a continuous rate, and the same spectral
+        recovery as the spectra_data ssRF burns rounds the hole. Long-range spin
+        diffusion stays off so an external lineshape is not walked across the
+        band. ``window_R`` clips RF to ``center_R ± window_R``. Returns
+        ``(I+, I-, signal, support)``.
+        """
+        n_steps = int(n_steps)
+        if n_steps < 0:
+            raise ValueError('n_steps must be nonnegative')
+        if not 0.0 <= rel_threshold < 1.0:
+            raise ValueError('rel_threshold must be in [0, 1)')
+        p = self.params
+        saved = (p.relax_enabled, p.diffusion_enabled, p.dnp_enabled, p.d_same_plus0, p.d_same_0minus, p.d_spec_plus0, p.d_spec_0minus, p.diffusion_scale, p.t2_width_R, p.zq_width_R, self._active_idx)
+        p.use_physical_voigt_rf = True
+        p.rf_gaussian_fwhm_R = float(gaussian_fwhm_R)
+        p.rf_lorentzian_fwhm_R = float(lorentzian_fwhm_R)
+        p.gamma_rf = float(gamma_rf)
+        p.rf_burn_R = float(center_R)
+        p.rf_enabled = True
+        p.ssrf_subset_indices = None
+        p.relax_enabled = True
+        p.diffusion_enabled = False
+        p.dnp_enabled = False
+        p.d_same_plus0 = 0.18
+        p.d_same_0minus = 0.1
+        p.d_spec_plus0 = 2.0
+        p.d_spec_0minus = 1.0
+        p.diffusion_scale = 5.0
+        p.t2_width_R = 0.05
+        p.zq_width_R = 0.05
+        self._rf_profile_frozen = False
+        self.invalidate_rf_profile()
+        burn_idx = int(self.burn_index(center_R))
+        (_, profile) = self.rf_profile_physical(center_R)
+        peak = float(np.max(profile)) if profile.size else 0.0
+        if peak <= 0.0:
+            support = [burn_idx]
+        else:
+            support = [int(i) for i in np.flatnonzero(profile >= rel_threshold * peak)]
+        if window_R is not None:
+            half = abs(float(window_R))
+            center = float(self.Rplus[burn_idx])
+            support = [i for i in support if abs(float(self.Rplus[i]) - center) <= half]
+            if burn_idx not in support:
+                support.append(burn_idx)
+            support = sorted(support)
+            margin = 4.0 * p.t2_width_R
+            n_bins = len(self.Rplus)
+            touched = []
+            for i in support:
+                for j in range(n_bins):
+                    if abs(float(self.Rplus[j]) - float(self.Rplus[i])) <= margin:
+                        touched.append(j)
+                        touched.append(n_bins - 1 - j)
+            self._active_idx = np.asarray(sorted(set(touched)), dtype=int)
+        else:
+            self._active_idx = None
+        step_dt = p.dt if dt is None else float(dt)
+        gdt = abs(float(gamma_rf)) * step_dt
+        n_sub = 1 if gdt <= 0.05 or step_dt <= 0.0 else min(20, int(np.ceil(gdt / 0.05)))
+        dt_sub = step_dt / n_sub
+        for _ in range(n_steps):
+            for _ in range(n_sub):
+                self.step_once(dt=dt_sub, rf_on=True, dnp_on=False)
+        (p.relax_enabled, p.diffusion_enabled, p.dnp_enabled, p.d_same_plus0, p.d_same_0minus, p.d_spec_plus0, p.d_spec_0minus, p.diffusion_scale, p.t2_width_R, p.zq_width_R, self._active_idx) = saved
+        (ip, im, signal) = self.physical_intensities()
+        return (ip, im, signal, support)
+
     def _effective_theta(self):
         s = float(self.params.line_asym)
         cos2 = np.clip((1.0 - s - self.Rplus) / 3.0, 0.0, 1.0)

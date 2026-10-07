@@ -1,8 +1,9 @@
 """Tests for voigt_burn physics in physics.rf."""
 import numpy as np
 import pytest
+from physics.lineshape.Lineshape import GenerateVectorLineshape
 from physics.rf import Spin1Model, Spin1Params
-from physics.rf.rate_equations_realtime import configure_single_bin_ssrf, configure_voigt_burn_spectral_recovery, create_voigt_burn_model, verify_burn_response, voigt_burn_recovery_param_snapshot
+from physics.rf.rate_equations_realtime import build_model_for_intensities, configure_single_bin_ssrf, configure_voigt_burn_spectral_recovery, create_voigt_burn_model, verify_burn_response, voigt_burn_recovery_param_snapshot
 
 def _physical_params(**overrides):
     base = dict(use_physical_voigt_rf=True, diffusion_scale=0.0, dnp_enabled=False, t1_rate=0.0)
@@ -70,6 +71,27 @@ def test_voigt_and_single_bin_share_spectral_recovery_during_burn():
         (_, parts) = model.derivative(rf_on=True, dnp_on=False, breakdown=True)
         spec = parts['spectral_neighbors']
         assert abs(spec['dIminus_R_dt']) > 0.0 or abs(spec['dIplus_R_dt']) > 0.0
+
+def test_apply_voigt_burn_width_follows_fwhm_on_external_lineshape():
+    f = np.linspace(-3.0, 3.0, 500)
+    (_, ip, im) = GenerateVectorLineshape(0.45, f)
+    params = Spin1Params(n_bins=500, r_min=-3.0, r_max=3.0, p0=0.45, relax_enabled=True, diffusion_enabled=True)
+
+    def burned(gauss, lorentz):
+        model = build_model_for_intensities(ip, im, params=params, p0=0.45, rf_burn_R=-1.0)
+        return model.apply_voigt_burn(-1.0, gauss, lorentz, 10.0, 40, dt=0.0015)
+
+    (ip_n, im_n, _, support_n) = burned(0.02, 0.01)
+    (ip_w, im_w, _, support_w) = burned(0.20, 0.08)
+    assert len(support_w) > len(support_n) > 0
+    burn = int(np.argmin(np.abs(f + 1.0)))
+    dps = (ip_w + im_w) - (ip + im)
+    depth = np.max(np.abs(dps))
+    assert np.max(np.abs(dps[:40])) < 0.02 * depth
+    seg = dps[burn - 12:burn + 13]
+    flips = np.sum(np.diff(np.sign(np.diff(seg, n=2))) != 0)
+    assert flips <= 4
+    assert abs(dps[burn]) > 0.5 * abs((ip_n[burn] + im_n[burn]) - (ip[burn] + im[burn]))
 
 def test_zero_width_profile_is_exact_legacy_one_bin_selector():
     m = Spin1Model(_physical_params(rf_burn_R=0.417, rf_gaussian_fwhm_R=0.0, rf_lorentzian_fwhm_R=0.0))
