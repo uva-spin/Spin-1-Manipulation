@@ -28,25 +28,22 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from utils.constants import (
+    BATCH_SIZE, DEFAULT_SPECTRA_PATH, DEVICE, LEARNING_RATE, ML_DIR,
+    N_EXAMPLE_PLOTS, NOISE_STD, NUM_EPOCHS, SEED, STATS_KEYS,
+)
+
 SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
 import lstm as lstm_pq
 
-DEFAULT_SPECTRA_PATH = lstm_pq.DEFAULT_SPECTRA_PATH
-DEFAULT_OUTPUT_DIR = SCRIPT_DIR / 'results' / 'old_model' / 'old_model_pq_results_v1'
-SEED = lstm_pq.SEED
-DEVICE = lstm_pq.DEVICE
-NUM_EPOCHS = lstm_pq.NUM_EPOCHS
-BATCH_SIZE = lstm_pq.BATCH_SIZE
-LEARNING_RATE = lstm_pq.LEARNING_RATE
+DEFAULT_OUTPUT_DIR = ML_DIR / 'results' / 'old_model' / 'old_model_pq_results_v1'
 NUM_RESIDUAL_BLOCKS = 3
 USE_SE_BLOCK = True
 FC_HIDDEN = 32
 DROPOUT = 0.0
-NOISE_STD = lstm_pq.NOISE_STD
-N_EXAMPLE_PLOTS = lstm_pq.N_EXAMPLE_PLOTS
 
 
 class InceptionBlock(nn.Module):
@@ -302,7 +299,7 @@ def main():
     (train_ds, val_ds, test_ds, stats) = lstm_pq.prepare_datasets(
         arrays, max_samples=args.max_samples, noise_std=args.noise_std,
     )
-    dataset_stats = {k: stats[k] for k in lstm_pq.STATS_KEYS if k in stats}
+    dataset_stats = {k: stats[k] for k in STATS_KEYS if k in stats}
     print(
         f"Train={stats['n_train']} Val={stats['n_val']} Test={stats['n_test']} bins={stats['num_bins']}",
         flush=True,
