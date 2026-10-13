@@ -1,8 +1,8 @@
 import numpy as np
 import pytest
 from physics.lineshape.Lineshape import GenerateVectorLineshape
-from physics.ssrf_realtime import Spin1Params
-from physics.ssrf_realtime.rate_equations_realtime import build_model_for_intensities, solve_rate_equations, verify_burn_response, verify_rates_response
+from physics.rf import Spin1Params
+from physics.rf.rate_equations_realtime import build_model_for_intensities, solve_rate_equations, verify_burn_response, verify_rates_response
 
 def _lineshape(polarization=0.45, n_bins=500):
     f = np.linspace(-3.0, 3.0, n_bins)
@@ -27,7 +27,7 @@ def test_build_model_for_intensities_matches_grid_length():
     (f, Iplus, Iminus) = _lineshape(n_bins=200)
     model = build_model_for_intensities(Iplus, Iminus, p0=0.45)
     assert len(model.Rplus) == 200
-    assert model.display_cal == pytest.approx(0.45)
+    assert model.display_cal == pytest.approx(model._plot_signal_reference_calibration())
     (Iplus_out, Iminus_out, _) = model.physical_intensities()
     assert np.allclose(Iplus, Iplus_out, rtol=1e-10)
     assert np.allclose(Iminus, Iminus_out, rtol=1e-10)

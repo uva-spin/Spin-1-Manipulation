@@ -1,12 +1,10 @@
 """
-Tabular SARSA for sequential bin-wise ssRF burns using Data_Creation/rivanna ssrf_realtime.
+Tabular SARSA for sequential bin-wise ssRF burns using physics.rf.
 
 Maximizes integrated Q polarization  Q = sum(I_+ - I_-)  by choosing a frequency
 bin and gamma_rf burn strength. Burns are only applied at bins whose initial
 spectral Q = I_+ - I_- is negative (or theta-summed Q when q_filter_use_theta);
 other bins may only be skipped.
-Burns integrate the shared rate-equation model (physical Voigt RF + spectral
-recovery) from Data_Creation/rivanna.
 """
 import copy
 import sys
@@ -16,17 +14,26 @@ import matplotlib.pyplot as plt
 import numpy as np
 import tqdm
 REPO_ROOT = Path(__file__).resolve().parents[1]
-RIVANNA = REPO_ROOT / 'Data_Creation' / 'rivanna'
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
-if str(RIVANNA) not in sys.path:
-    sys.path.insert(0, str(RIVANNA))
-from common import DIFFUSION_SCALE, RF_GAUSSIAN_FWHM_R, RF_LORENTZIAN_FWHM_R, RF_MODE_PHYSICAL_VOIGT, RF_MODE_SINGLE_BIN
-from model_bridge import build_spin1_model, burn_commit_touched_bins, commit_touched_bins_only, configure_ssrf_burn, euler_n_sub
+from Data_Creation.spectrum_gen.bridge import (
+    build_spin1_model,
+    burn_commit_touched_bins,
+    commit_touched_bins_only,
+    configure_ssrf_burn,
+    euler_n_sub,
+)
+from Data_Creation.spectrum_gen.constants import (
+    DIFFUSION_SCALE,
+    RF_GAUSSIAN_FWHM_R,
+    RF_LORENTZIAN_FWHM_R,
+    RF_MODE_PHYSICAL_VOIGT,
+    RF_MODE_SINGLE_BIN,
+)
 from physics.lineshape.Lineshape import GenerateVectorLineshape
-from ssrf_realtime.conversions import physical_intensities_to_packet_n
-from ssrf_realtime.model import Spin1Model
-from ssrf_realtime.rate_equations_realtime import _value_crosses_zero, burn_preserves_ps_sign
+from physics.rf.conversions import physical_intensities_to_packet_n
+from physics.rf.model import Spin1Model
+from physics.rf.rate_equations_realtime import _value_crosses_zero, burn_preserves_ps_sign
 OUTPUT_DIR = REPO_ROOT / 'results' / 'current' / 'sarsa'
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 SARSA_DT = 0.015
@@ -61,6 +68,11 @@ def clone_model(model):
     trial._populations_from_intensities = model._populations_from_intensities
     trial._recovery_boltzmann_P = model._recovery_boltzmann_P
     trial._force_boltzmann_recovery = model._force_boltzmann_recovery
+    trial._conserve_tensor_recovery = getattr(model, '_conserve_tensor_recovery', False)
+    trial._conserve_vector_recovery = getattr(model, '_conserve_vector_recovery', True)
+    trial._restore_initial_recovery = getattr(model, '_restore_initial_recovery', False)
+    trial._pre_afp_state = None if getattr(model, '_pre_afp_state', None) is None else np.asarray(model._pre_afp_state).copy()
+    trial._recovery_hold_Q = getattr(model, '_recovery_hold_Q', None)
     trial._active_idx = None if model._active_idx is None else np.asarray(model._active_idx).copy()
     trial.n_plus = model.n_plus
     trial.n_zero = model.n_zero
@@ -132,24 +144,24 @@ def apply_spin1_burn(model, bin_idx, gamma_rf, n_steps, *, rf_mode, gaussian_fwh
 
 @dataclass
 class BurnConfig:
-    num_bins = 249
-    f_min = -3.0
-    f_max = 3.0
-    dt = SARSA_DT
-    burn_steps = 100
-    gamma_min = 0.0
-    gamma_max = 50.0
-    n_gamma_bins = 10
-    max_burns = MAX_BURNS
-    enforce_full_spectrum = FREE_BIN_SELECTION
-    only_negative_initial_q = True
-    q_filter_use_theta = False
-    n_q_bins = MAX_BURNS
-    x_values = None
-    rf_mode = RF_MODE_PHYSICAL_VOIGT
-    diffusion_scale = DIFFUSION_SCALE
-    gaussian_fwhm_R = RF_GAUSSIAN_FWHM_R
-    lorentzian_fwhm_R = RF_LORENTZIAN_FWHM_R
+    num_bins: int = 249
+    f_min: float = -3.0
+    f_max: float = 3.0
+    dt: float = SARSA_DT
+    burn_steps: int = 100
+    gamma_min: float = 0.0
+    gamma_max: float = 50.0
+    n_gamma_bins: int = 10
+    max_burns: int = MAX_BURNS
+    enforce_full_spectrum: bool = FREE_BIN_SELECTION
+    only_negative_initial_q: bool = True
+    q_filter_use_theta: bool = False
+    n_q_bins: int = MAX_BURNS
+    x_values: np.ndarray | None = None
+    rf_mode: str = RF_MODE_PHYSICAL_VOIGT
+    diffusion_scale: float = DIFFUSION_SCALE
+    gaussian_fwhm_R: float = RF_GAUSSIAN_FWHM_R
+    lorentzian_fwhm_R: float = RF_LORENTZIAN_FWHM_R
 
     def __post_init__(self):
         if self.x_values is None or len(self.x_values) == 0:
@@ -187,7 +199,7 @@ def build_spin1_from_polarization(config, polarization):
     return build_spin1_model(np.asarray(iplus), np.asarray(iminus), polarization=polarization, num_bins=config.num_bins, dt=config.dt, rf_enabled=False, relax_enabled=True, diffusion_scale=config.diffusion_scale, rf_gaussian_fwhm_R=config.gaussian_fwhm_R, rf_lorentzian_fwhm_R=config.lorentzian_fwhm_R, r_min=config.f_min, r_max=config.f_max)
 
 class Spin1BurnEnv:
-    """RL environment for sequential ssRF burns with ssrf_realtime physics."""
+    """RL environment for sequential ssRF burns with physics.rf."""
 
     def __init__(self, config):
         self.config = config
@@ -427,7 +439,7 @@ def train(config, episodes=5000, polarizations=None, seed=0, eps_start=1.0, eps_
             state = next_state
             action = next_action
         history.append(ep_return)
-    stats = {'q_lo': q_lo, 'q_hi': q_hi, 'p_lo': np.min(polarizations), 'p_hi': np.max(polarizations), 'final_q_gain': env.current_q - env.initial_q, 'episode_returns': np.asarray(history), 'physics_model': 'ssrf_realtime', 'rf_mode': config.rf_mode}
+    stats = {'q_lo': q_lo, 'q_hi': q_hi, 'p_lo': np.min(polarizations), 'p_hi': np.max(polarizations), 'final_q_gain': env.current_q - env.initial_q, 'episode_returns': np.asarray(history), 'physics_model': 'physics.rf', 'rf_mode': config.rf_mode}
     return (agent, env, stats)
 
 def greedy_episode(env, agent, polarization):
@@ -455,7 +467,7 @@ def plot_training_returns(returns, output_path):
     ax.plot(np.arange(window - 1, window - 1 + len(smoothed)), smoothed, color='C1', linewidth=2, label=f'{window}-ep moving avg')
     ax.set_xlabel('episode')
     ax.set_ylabel('sum of Q rewards')
-    ax.set_title('SARSA: ssrf_realtime bin-wise ssRF burn policy')
+    ax.set_title('SARSA: physics.rf bin-wise ssRF burn policy')
     ax.legend()
     ax.grid(True, alpha=0.3)
     fig.tight_layout()
@@ -519,7 +531,7 @@ def plot_q_table(q_table, output_path):
 def main():
     config = BurnConfig(max_burns=MAX_BURNS, enforce_full_spectrum=FREE_BIN_SELECTION)
     polarizations = np.linspace(0.4, 0.5, 20)
-    print(f'Training SARSA agent with rivanna ssrf_realtime ({config.rf_mode}, only_Q<0 bins={config.only_negative_initial_q}, theta_Q_filter={config.q_filter_use_theta})...')
+    print(f'Training SARSA agent with rivanna physics.rf ({config.rf_mode}, only_Q<0 bins={config.only_negative_initial_q}, theta_Q_filter={config.q_filter_use_theta})...')
     (agent, env, stats) = train(config, episodes=EPISODES, polarizations=polarizations, seed=SEED)
     np.save(OUTPUT_DIR / 'sarsa_table.npy', agent.q_table)
     plot_training_returns(stats['episode_returns'], OUTPUT_DIR / 'training_returns.png')

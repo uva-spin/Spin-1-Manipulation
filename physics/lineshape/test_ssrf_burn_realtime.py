@@ -17,7 +17,7 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 from physics.burn_lookup_realtime import BurnTrajectoryConfig, burn_trajectory_realtime
 from physics.lineshape.Lineshape import GenerateVectorLineshape
-from physics.ssrf_realtime.rate_equations_realtime import solve_rate_equations, verify_burn_response, verify_rates_response
+from physics.rf.rate_equations_realtime import solve_rate_equations, verify_burn_response, verify_rates_response
 P = 0.6
 P_REF = 0.45
 P_REF2 = 0.3

@@ -10,7 +10,7 @@ physics/
 │   ├── Lineshape.py     Core equilibrium lineshape: GenerateVectorLineshape(P, f)
 │   ├── ssRFMapper.py    Legacy lookup-table ssRF mapper
 │   └── rate_eqs_test/   Research scripts (gamma optimization, fitting, SLURM arrays)
-└── ssrf_realtime/       Primary realtime physics package (see its README)
+└── rf/                  Primary realtime physics package (see its README)
 ```
 
 ## Core concepts
@@ -30,7 +30,7 @@ P  = integrated Ps  (vector polarization over the spectrum)
 
 Manipulations (ssRF burns, AFP flips) change I+ and I− over time. The realtime model integrates spin-population rate equations under RF, recovery, and optional diffusion.
 
-## `ssrf_realtime/` — main simulation package
+## `rf/` — main simulation package
 
 This is the physics engine used by `Data_Creation/rivanna/` and several ML scripts (`dqn.py`, `sarsa.py`, `opt_q.py`).
 
@@ -42,12 +42,12 @@ Key entry points:
 | `rate_equations_realtime.py` | Build models from intensities, configure single-bin ssRF |
 | `voigt_burn_physics.py` | Voigt RF profile in physical R-space |
 
-See [`ssrf_realtime/README.md`](ssrf_realtime/README.md) for parameters and usage.
+See [`rf/README.md`](rf/README.md) for parameters and usage.
 
 ### Run tests
 
 ```bash
-cd physics/ssrf_realtime
+cd physics/rf
 pytest -q
 ```
 
@@ -73,4 +73,4 @@ Contains its own SLURM arrays (`ssrf_traj_array.slurm`, `gamma_opt_array.slurm`,
 
 ## Relationship to data generation
 
-`Data_Creation/rivanna/` vendors a copy of `ssrf_realtime/` so the cluster pipeline is self-contained. Changes to the physics model should be made in `physics/ssrf_realtime/` and then copied or synced to `Data_Creation/rivanna/ssrf_realtime/` if the pipelines should stay aligned.
+`Data_Creation/rivanna/` imports the model from `physics.rf`. Changes to the physics model belong in `physics/rf/`.

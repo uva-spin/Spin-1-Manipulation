@@ -30,6 +30,18 @@ def boltzmann_Q(P):
     """Spin-1 Boltzmann relation Q(P) = 2 - sqrt(4 - 3 P^2)."""
     return 2.0 - np.sqrt(max(0.0, 4.0 - 3.0 * P * P))
 
+def boltzmann_P_from_Q(Q, sign=1.0):
+    """Vector polarization whose Boltzmann tensor polarization is ``Q``.
+
+    Inverts ``boltzmann_Q``. The relation is even in ``P``, so ``sign`` selects
+    the branch. ``Q`` outside ``[0, 1]`` is clipped before the inversion.
+    """
+    q = float(np.clip(Q, 0.0, 1.0))
+    magnitude = float(np.sqrt(max(0.0, 4.0 - (2.0 - q) ** 2) / 3.0))
+    if sign < 0.0:
+        return -magnitude
+    return magnitude
+
 def boltzmann_branch_ratio(P):
     """
     Boltzmann equilibrium area ratio I_plus/I_minus for a spin-1 doublet.

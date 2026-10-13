@@ -27,19 +27,19 @@ def q_polarization(iplus, iminus):
 
 @dataclass
 class BurnConfig:
-    num_bins = 249
-    f_min = -3.0
-    f_max = 3.0
-    sigma = 0.16
-    gamma = 0.05
-    amp_min = 0.0
-    amp_max = 0.005
-    n_amp_bins = 165
-    max_burns = 10
-    enforce_full_spectrum = True
-    n_q_bins = 20
-    x_values = None
-    lookup_path = None
+    num_bins: int = 249
+    f_min: float = -3.0
+    f_max: float = 3.0
+    sigma: float = 0.16
+    gamma: float = 0.05
+    amp_min: float = 0.0
+    amp_max: float = 0.005
+    n_amp_bins: int = 165
+    max_burns: int = 10
+    enforce_full_spectrum: bool = True
+    n_q_bins: int = 20
+    x_values: np.ndarray | None = None
+    lookup_path: Path | None = None
 
     def __post_init__(self):
         if self.lookup_path is None:

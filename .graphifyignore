@@ -1,0 +1,42 @@
+# Graph source scripts only. Skip saved runs, weights, caches, and plot artifacts.
+
+__pycache__/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+results/
+models/
+performance/
+output/
+data/
+spectra_data/
+
+# Saved training / eval runs that live outside results/
+*results*/
+*result*/
+*_pub/
+*_pub_smoke/
+example_comparisons/
+pred_vs_true_by_snr/
+pred_vs_true_outliers_more_examples/
+lstm_eval_*/
+
+# Generated plots, weights, and logs
+*.png
+*.pdf
+*.npz
+*.npy
+*.pkl
+*.pth
+*.pt
+*.ckpt
+*.gif
+*.log
+*.out
+
+# Numeric dumps, not scripts
+n0_unmanipulated_stats.txt
+panel_info.txt
+metrics.json
+history.json
