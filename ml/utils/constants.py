@@ -1,8 +1,3 @@
-"""Shared constants for the P/Q training scripts.
-
-Single source of truth — imported by ``utils.helpers`` and re-exported
-through ``lstm`` (sibling scripts do ``import lstm as lstm_pq``).
-"""
 from pathlib import Path
 
 import torch
@@ -13,7 +8,7 @@ DEFAULT_OUTPUT_DIR = ML_DIR / 'results' / 'lstm' / 'lstm_result_ssrf_afp_combine
 SEED = 42
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 NUM_EPOCHS = 500
-BATCH_SIZE = 1024
+BATCH_SIZE = 256
 LEARNING_RATE = 0.005
 WEIGHT_DECAY = 0.001
 MIN_DELTA = 1e-06

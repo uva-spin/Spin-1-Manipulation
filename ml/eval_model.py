@@ -137,7 +137,7 @@ def main():
 
     norm_stats = norm_stats_from_checkpoint(ckpt)
     print(f'Loading spectra from {args.spectra} (full dataset) ...', flush=True)
-    arrays = lstm_pq.load_lstm_npz(args.spectra)
+    arrays = lstm_pq.load_npz(args.spectra)
     n_events = int(arrays['spectra'].shape[0])
     print(
         f'Preparing datasets (split_seed={args.split_seed}, noise_seed={args.noise_seed}, '

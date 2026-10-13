@@ -192,7 +192,7 @@ def main():
     checkpoint_path = args.checkpoint or args.out_dir / 'cnn_pq_best.pth'
     spectra_path = args.spectra or DEFAULT_SPECTRA_PATH
     print(f'Loading spectra from {spectra_path} ...', flush=True)
-    arrays = lstm_pq.load_lstm_npz(spectra_path)
+    arrays = lstm_pq.load_npz(spectra_path)
     print('Preparing datasets...', flush=True)
     (train_ds, val_ds, test_ds, stats) = lstm_pq.prepare_datasets(arrays, max_samples=args.max_samples, noise_std=args.noise_std)
     dataset_stats = {k: stats[k] for k in STATS_KEYS if k in stats}

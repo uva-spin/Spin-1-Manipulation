@@ -33,7 +33,7 @@ from utils.constants import (
 )
 from utils.helpers import (
     _stats_for_checkpoint, clone_state_dict, json_ready, load_history_json,
-    load_lstm_npz, make_pq_loaders, parse_int_tuple, prepare_datasets,
+    load_npz, make_pq_loaders, parse_int_tuple, prepare_datasets,
     reload_checkpoint, resolve_power_profile, save_history_json,
 )
 from analysis.pq_report import (
@@ -304,7 +304,7 @@ def main():
     checkpoint_path = out_dir / 'lstm_best.pth'
     spectra_path = DEFAULT_SPECTRA_PATH
     print(f'Loading spectra from {spectra_path} ...', flush=True)
-    arrays = load_lstm_npz(spectra_path)
+    arrays = load_npz(spectra_path)
     print('Preparing datasets...', flush=True)
     (train_ds, val_ds, test_ds, stats) = prepare_datasets(arrays, max_samples=None, noise_std=NOISE_STD)
     dataset_stats = {k: stats[k] for k in STATS_KEYS if k in stats}

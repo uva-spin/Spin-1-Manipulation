@@ -162,7 +162,7 @@ def select_example_events(wide: pd.DataFrame, n_examples: int, *, seed: int = SE
 def load_noisy_test_spectra(spectra_path: Path, event_indices: np.ndarray) -> dict[int, np.ndarray]:
     """Rebuild the same noisy test inputs used during evaluation."""
     print(f"Loading spectra from {spectra_path} ...", flush=True)
-    arrays = lstm_pq.load_lstm_npz(spectra_path)
+    arrays = lstm_pq.load_npz(spectra_path)
     print("Rebuilding noisy test split (same seed/noise as training) ...", flush=True)
     _train_ds, _val_ds, test_ds, stats = lstm_pq.prepare_datasets(
         arrays, noise_std=NOISE_STD, seed=SEED,

@@ -53,7 +53,7 @@ def resolve_power_profile(arrays):
     scalar = sanitize_applied_power(arrays['applied_power'], source)
     return np.broadcast_to(scalar.reshape(n, 1), (n, n_bins)).astype(np.float32, copy=True)
 
-def load_lstm_npz(path):
+def load_npz(path):
     """Load spectra from a ``.npz`` file, fully into RAM."""
     path = Path(path)
     required = ('spectra', 'applied_power', 'n_steps', 'P_total', 'Q_total')

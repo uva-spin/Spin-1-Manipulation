@@ -176,7 +176,7 @@ def build_eval_batch(
     device: torch.device,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Fixed (x, y_p_z, y_q_z) batch using checkpoint normalization stats."""
-    arrays = lstm_pq.load_lstm_npz(spectra_path)
+    arrays = lstm_pq.load_npz(spectra_path)
     spectra = arrays["spectra"]
     n = int(spectra.shape[0])
     n_bins = int(spectra.shape[2])

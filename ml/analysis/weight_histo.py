@@ -613,7 +613,7 @@ def build_activation_batch(
     seed: int = 42,
 ) -> torch.Tensor:
     """Pack a small (N, bins, 3) batch normalized with checkpoint stats."""
-    arrays = lstm_pq.load_lstm_npz(spectra_path)
+    arrays = lstm_pq.load_npz(spectra_path)
     spectra = np.asarray(arrays["spectra"])
     ps = np.asarray(spectra[:, 0, :] + spectra[:, 1, :], dtype=np.float32, copy=True)
     power_profile = lstm_pq.resolve_power_profile(arrays)
