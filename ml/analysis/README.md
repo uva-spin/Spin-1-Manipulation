@@ -1,22 +1,20 @@
 # Analysis
 
-Small standalone visualization scripts. These are not part of the main data → train → evaluate pipeline.
+Plotting and reporting helpers for full-spectrum P/Q models. Trainers import
+`pq_report.py`; the `plot_*.py` scripts are standalone diagnostics.
 
-## Scripts
-
-| File | Purpose |
-|------|---------|
-| `pq_report.py` | Pipeline evaluation/reporting imported by the training scripts (`evaluate_model`, plots, CSVs, `write_pq_report`) |
-| `binning/binning_plot.py` | Animated lineshape / binning visualization |
-| `binning/sgd.py` | SGD trajectory visualization |
-
-## Usage
+| Script | Purpose |
+|--------|---------|
+| `pq_report.py` | Eval / CSV / example plots used by `lstm.py`, `gru.py`, etc. |
+| `plot_loss_landscapes.py` | Loss landscape visualizations |
+| `plot_model_example_comparisons.py` | Pred vs true example spectra |
+| `plot_pred_vs_true_by_snr.py` | Predictions stratified by SNR |
+| `plot_pred_vs_true_outliers.py` | Outlier examples |
+| `plot_val_loss_overlay.py` | Overlay validation loss curves |
+| `plot_bias_variance_vs_snr.py` | Bias / variance vs SNR |
+| `weight_histo.py` | Weight histograms |
 
 ```bash
-python ml/analysis/binning/binning_plot.py
-python ml/analysis/binning/sgd.py
+python ml/analysis/plot_loss_landscapes.py
+python ml/analysis/plot_model_example_comparisons.py
 ```
-
-Both scripts are self-contained and use matplotlib. No training data or model checkpoints are required.
-
-For production evaluation plots, use [`ml/rivanna/test-binning.py`](../rivanna/README.md) instead.

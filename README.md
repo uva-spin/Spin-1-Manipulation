@@ -11,8 +11,7 @@ Simulations and machine-learning tools for manipulating **spin-1** (deuteron) so
 |-----------|--------------|
 | [`physics/`](physics/README.md) | NMR lineshape math and the realtime spin-1 rate-equation model |
 | [`Data_Creation/`](Data_Creation/README.md) | Full-spectrum training data (`create_data.py` + `spectrum_gen/`) |
-| [`ml/`](ml/README.md) | Full-spectrum models, RL burn policies, Seq2Seq models |
-| [`analysis/`](analysis/README.md) | Small visualization utilities (optional) |
+| [`ml/`](ml/README.md) | Full-spectrum models, analysis plots, RL burn policies |
 
 ## Quick start
 
@@ -37,7 +36,7 @@ Edit **USER PARAMETERS** in [`Data_Creation/create_data.py`](Data_Creation/creat
 
 | Goal | Where to start |
 |------|----------------|
-| Full-spectrum P/Q prediction | [`ml/README.md`](ml/README.md) → `spectrum_pq.py` |
+| Full-spectrum P/Q prediction | [`ml/README.md`](ml/README.md) → `lstm.py` / `gru.py` / `cnn.py` |
 | Denoising autoencoder on Ps | [`ml/README.md`](ml/README.md) → `dae.py` |
 | RL burn policy (DQN) | `python ml/dqn.py --episodes 100 --polarization 0.45` |
 | Greedy incremental Q optimizer | `python ml/opt_q.py` |
