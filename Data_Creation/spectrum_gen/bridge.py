@@ -1,6 +1,6 @@
 """Bridge Dulya equilibrium lineshapes to physics.rf."""
 import numpy as np
-from common import D_SAME_0MINUS, D_SAME_PLUS0, D_SPEC_0MINUS, D_SPEC_PLUS0, DIFFUSION_SCALE, F_MAX, F_MIN, MAX_GDT, MAX_NSUB, MIRROR_AMP_EPS, MIRROR_AMP_RTOL, RF_GAUSSIAN_FWHM_R, RF_LORENTZIAN_FWHM_R, RF_MODE_PHYSICAL_VOIGT, RF_MODE_SINGLE_BIN, ZQ_WIDTH_R
+from .constants import D_SAME_0MINUS, D_SAME_PLUS0, D_SPEC_0MINUS, D_SPEC_PLUS0, DIFFUSION_SCALE, F_MAX, F_MIN, MAX_GDT, MAX_NSUB, MIRROR_AMP_EPS, MIRROR_AMP_RTOL, RF_GAUSSIAN_FWHM_R, RF_LORENTZIAN_FWHM_R, RF_MODE_PHYSICAL_VOIGT, RF_MODE_SINGLE_BIN, ZQ_WIDTH_R
 from physics.rf import Spin1Model, Spin1Params, bin_averaged_voigt, configure_physical_voigt_ssrf, configure_single_bin_ssrf, configure_voigt_burn_spectral_recovery, mirror_bin_idx, ssrf_touched_bins
 afp_touched_bins = ssrf_touched_bins
 PROFILE_REL_THRESHOLD = 0.01

@@ -3,8 +3,8 @@ from __future__ import annotations
 
 import numpy as np
 
-from afp_bin_traj import qneg_sweep_indices
-from common import (
+from .afp_traj import qneg_sweep_indices
+from .constants import (
     AFP_CENTER_MARGIN,
     AFP_EFFICIENCY,
     COMBO_CENTER_BIN,
@@ -24,7 +24,7 @@ from common import (
     RF_LORENTZIAN_FWHM_R,
     RF_MODE_PHYSICAL_VOIGT,
 )
-from model_bridge import (
+from .bridge import (
     afp_touched_bins,
     afp_window_indices,
     burn_commit_touched_bins,

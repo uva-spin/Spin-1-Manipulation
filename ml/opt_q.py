@@ -5,24 +5,21 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-RIVANNA = REPO_ROOT / "Data_Creation" / "rivanna"
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
-if str(RIVANNA) not in sys.path:
-    sys.path.insert(0, str(RIVANNA))
 
 from physics.rf.model import Spin1Model, Spin1Params
-from common import (
-    DIFFUSION_SCALE,
-    RF_GAUSSIAN_FWHM_R,
-    RF_LORENTZIAN_FWHM_R,
-    RF_MODE_PHYSICAL_VOIGT,
-)
-from model_bridge import (
+from Data_Creation.spectrum_gen.bridge import (
     build_spin1_model,
     configure_ssrf_burn,
     euler_n_sub,
     full_spectrum_intensities,
+)
+from Data_Creation.spectrum_gen.constants import (
+    DIFFUSION_SCALE,
+    RF_GAUSSIAN_FWHM_R,
+    RF_LORENTZIAN_FWHM_R,
+    RF_MODE_PHYSICAL_VOIGT,
 )
 
 NUM_BINS = 701

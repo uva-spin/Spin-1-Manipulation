@@ -1,12 +1,10 @@
 """
-Tabular SARSA for sequential bin-wise ssRF burns using Data_Creation/rivanna and physics.rf.
+Tabular SARSA for sequential bin-wise ssRF burns using physics.rf.
 
 Maximizes integrated Q polarization  Q = sum(I_+ - I_-)  by choosing a frequency
 bin and gamma_rf burn strength. Burns are only applied at bins whose initial
 spectral Q = I_+ - I_- is negative (or theta-summed Q when q_filter_use_theta);
 other bins may only be skipped.
-Burns integrate the shared rate-equation model (physical Voigt RF + spectral
-recovery) from Data_Creation/rivanna.
 """
 import copy
 import sys
@@ -16,13 +14,22 @@ import matplotlib.pyplot as plt
 import numpy as np
 import tqdm
 REPO_ROOT = Path(__file__).resolve().parents[1]
-RIVANNA = REPO_ROOT / 'Data_Creation' / 'rivanna'
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
-if str(RIVANNA) not in sys.path:
-    sys.path.insert(0, str(RIVANNA))
-from common import DIFFUSION_SCALE, RF_GAUSSIAN_FWHM_R, RF_LORENTZIAN_FWHM_R, RF_MODE_PHYSICAL_VOIGT, RF_MODE_SINGLE_BIN
-from model_bridge import build_spin1_model, burn_commit_touched_bins, commit_touched_bins_only, configure_ssrf_burn, euler_n_sub
+from Data_Creation.spectrum_gen.bridge import (
+    build_spin1_model,
+    burn_commit_touched_bins,
+    commit_touched_bins_only,
+    configure_ssrf_burn,
+    euler_n_sub,
+)
+from Data_Creation.spectrum_gen.constants import (
+    DIFFUSION_SCALE,
+    RF_GAUSSIAN_FWHM_R,
+    RF_LORENTZIAN_FWHM_R,
+    RF_MODE_PHYSICAL_VOIGT,
+    RF_MODE_SINGLE_BIN,
+)
 from physics.lineshape.Lineshape import GenerateVectorLineshape
 from physics.rf.conversions import physical_intensities_to_packet_n
 from physics.rf.model import Spin1Model

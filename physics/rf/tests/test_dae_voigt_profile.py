@@ -6,25 +6,38 @@ import numpy as np
 import pytest
 
 _ROOT = Path(__file__).resolve().parents[3]
-_DATA = _ROOT / "Data_Creation"
-_RIVANNA = _DATA / "rivanna"
-for path in (_ROOT, _DATA, _RIVANNA):
-    if str(path) not in sys.path:
-        sys.path.insert(0, str(path))
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
 
-from create_data import (
+from Data_Creation.create_data import (
+    P_STEP,
+    UNMANIP_P_STEP,
+    _burn_window_bins,
+    q_negative_bins_for_p0,
+)
+from Data_Creation.spectrum_gen.constants import (
+    BURN_R_MAX,
+    BURN_R_MIN,
+    EXCLUDED_MANIPULATION_BURN_BINS,
     F_MAX,
     F_MIN,
     NUM_BINS,
+    SOURCE_AFP,
+    SOURCE_PROFILE,
+    SOURCE_SSRF,
+    SOURCE_UNMANIP,
+)
+from Data_Creation.spectrum_gen.eq import equilibrium_q_profile, polarization_grid
+from Data_Creation.spectrum_gen.events import (
     PROFILE_CENTER_BIN,
     UNMANIP_CENTER_BIN,
     _resolve_modes,
     generate_spectra,
+    ssrf_voigt_power_profile,
+    zero_power_profile,
 )
 from physics.rf.lineshape import boltzmann_Q
-from common import SOURCE_AFP, SOURCE_PROFILE, SOURCE_SSRF, SOURCE_UNMANIP
 from physics.rf.optimal_profile import OptimizerSettings
-
 
 def test_resolve_modes_profile_is_independent():
     # (ssrf, afp, afp_relax, afp_profile, profile, unmanipulated)
@@ -131,13 +144,11 @@ def test_default_spectrum_grid_is_500_bins_pm6():
 
 
 def test_burn_centers_are_q_negative_inside_inner_window():
-    from burn_selection import equilibrium_q_profile
-    from common import BURN_BIN_CHOICES, BURN_R_MAX, BURN_R_MIN, EXCLUDED_MANIPULATION_BURN_BINS
-    from create_data import _burn_window_bins, q_negative_bins_for_p0
-
     burn_window = _burn_window_bins()
+    freq = np.linspace(F_MIN, F_MAX, NUM_BINS)
+    burn_choices = np.flatnonzero((freq > BURN_R_MIN) & (freq < BURN_R_MAX)).astype(np.int32)
     expected = np.asarray(
-        [b for b in BURN_BIN_CHOICES if b not in EXCLUDED_MANIPULATION_BURN_BINS],
+        [b for b in burn_choices if b not in EXCLUDED_MANIPULATION_BURN_BINS],
         dtype=np.int32,
     )
     np.testing.assert_array_equal(burn_window, expected)
@@ -154,8 +165,6 @@ def test_burn_centers_are_q_negative_inside_inner_window():
 
 
 def test_ssrf_voigt_power_profile_peaks_at_center():
-    from create_data import ssrf_voigt_power_profile, zero_power_profile
-
     zeros = zero_power_profile(21)
     assert zeros.shape == (21,)
     assert np.all(zeros == 0.0)
@@ -167,8 +176,6 @@ def test_ssrf_voigt_power_profile_peaks_at_center():
 
 
 def test_polarization_grid_is_denser_than_v4_npz():
-    from create_data import P_STEP, UNMANIP_P_STEP, polarization_grid
-
     values = polarization_grid(0.2, 0.6, P_STEP)
     assert P_STEP == pytest.approx(0.025)
     assert values.size >= 16

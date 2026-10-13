@@ -1,15 +1,22 @@
 """Non-overlapping selective ssRF and AFP windows in combined trajectories."""
-import sys
-from pathlib import Path
-
 import numpy as np
 import pytest
 
-_V2 = Path(__file__).resolve().parents[1]
-if str(_V2) not in sys.path:
-    sys.path.insert(0, str(_V2))
-
-from common import (
+from Data_Creation.create_data import (
+    _burn_window_bins,
+    _combo_max_relax,
+    _combined_center_pairs,
+    q_negative_bins_for_p0,
+)
+from Data_Creation.spectrum_gen.combined_traj import (
+    afp_influence_bins,
+    combined_row_clock,
+    run_combined_polarization,
+    selective_manipulation_overlap,
+    split_q_negative_regions,
+    ssrf_influence_bins,
+)
+from Data_Creation.spectrum_gen.constants import (
     COMBO_LAYOUT_PROFILE_AFP_SELECTIVE,
     COMBO_LAYOUT_PROFILE_PROFILE,
     COMBO_LAYOUT_SELECTIVE_SELECTIVE,
@@ -22,25 +29,7 @@ from common import (
     RF_GAUSSIAN_FWHM_R,
     RF_LORENTZIAN_FWHM_R,
 )
-from ssrf_afp_combined_traj import (
-    afp_influence_bins,
-    combined_row_clock,
-    run_combined_polarization,
-    selective_manipulation_overlap,
-    split_q_negative_regions,
-    ssrf_influence_bins,
-)
-
-_REPO = Path(__file__).resolve().parents[3]
-if str(_REPO) not in sys.path:
-    sys.path.insert(0, str(_REPO))
-from Data_Creation.create_data import (
-    _burn_window_bins,
-    _combo_max_relax,
-    _combined_center_pairs,
-    q_negative_bins_for_p0,
-)
-from burn_selection import equilibrium_q_profile
+from Data_Creation.spectrum_gen.eq import equilibrium_q_profile
 
 
 def _all_qneg_bins(p0):
@@ -49,7 +38,7 @@ def _all_qneg_bins(p0):
     centers = q_negative_bins_for_p0(p0, burn_window)
     regions = split_q_negative_regions(centers, frequency)
     if len(regions) < 2:
-        pytest.skip("P has fewer than two Q<0 regions")
+        pytest.skip('P has fewer than two Q<0 regions')
     return np.concatenate(regions)
 
 
@@ -59,16 +48,14 @@ def _two_regions(p0):
     centers = q_negative_bins_for_p0(p0, burn_window)
     regions = split_q_negative_regions(centers, frequency)
     if len(regions) < 2:
-        pytest.skip("P has fewer than two Q<0 regions")
+        pytest.skip('P has fewer than two Q<0 regions')
     return regions[0], regions[1]
 
 
 def test_selective_overlap_detects_shared_bins():
-    ssrf_center = 211
-    afp_center = 211
     assert selective_manipulation_overlap(
-        ssrf_center,
-        afp_center,
+        211,
+        211,
         num_bins=NUM_BINS,
         r_min=F_MIN,
         r_max=F_MAX,
@@ -78,7 +65,7 @@ def test_selective_overlap_detects_shared_bins():
     )
 
 
-@pytest.mark.parametrize("p0", [0.3, 0.5])
+@pytest.mark.parametrize('p0', [0.3, 0.5])
 def test_combined_selective_afp_avoids_ssrf_influence(p0):
     region = _all_qneg_bins(p0)
     traj = run_combined_polarization(
@@ -94,27 +81,22 @@ def test_combined_selective_afp_avoids_ssrf_influence(p0):
         profile_settings={},
         max_centers_per_region=3,
     )
-    if traj.get("skipped"):
-        pytest.skip(traj.get("reason", "skipped"))
-    ssrf_center = int(traj["ssrf_center"])
-    ssrf_block = ssrf_influence_bins(
-        ssrf_center,
-        num_bins=NUM_BINS,
-        r_min=F_MIN,
-        r_max=F_MAX,
-    )
-    afp_frame = int(traj["afp_frame"])
-    ssrf_start = int(traj["ssrf_start"])
-    n_ssrf = int(traj["n_ssrf_frames"])
+    if traj.get('skipped'):
+        pytest.skip(traj.get('reason', 'skipped'))
+    ssrf_center = int(traj['ssrf_center'])
+    ssrf_block = ssrf_influence_bins(ssrf_center, num_bins=NUM_BINS, r_min=F_MIN, r_max=F_MAX)
+    afp_frame = int(traj['afp_frame'])
+    ssrf_start = int(traj['ssrf_start'])
+    n_ssrf = int(traj['n_ssrf_frames'])
     assert afp_frame < ssrf_start
-    afp_prof = np.asarray(traj["power_profiles"][afp_frame])
-    ssrf_prof = np.asarray(traj["power_profiles"][ssrf_start])
+    afp_prof = np.asarray(traj['power_profiles'][afp_frame])
+    ssrf_prof = np.asarray(traj['power_profiles'][ssrf_start])
     assert np.max(afp_prof) > 0.0
     assert np.max(np.abs(ssrf_prof)) > 0.0
     assert not np.any((afp_prof > 0.0) & (np.abs(ssrf_prof) > 1e-8))
     for frame in range(ssrf_start, ssrf_start + n_ssrf):
-        assert not np.any((afp_prof > 0.0) & (np.abs(traj["power_profiles"][frame]) > 1e-8))
-    afp_center = int(traj["afp_center"])
+        assert not np.any((afp_prof > 0.0) & (np.abs(traj['power_profiles'][frame]) > 1e-8))
+    afp_center = int(traj['afp_center'])
     assert not (afp_influence_bins(afp_center, num_bins=NUM_BINS, afp_window=8) & ssrf_block)
 
 
@@ -145,34 +127,46 @@ def test_combined_center_pairs_are_bounded_not_cartesian():
         scenario=COMBO_SCENARIO_SSRF_FIRST_REGION,
     )
     assert 1 <= len(sel) <= cap
-    # Must not explode to |A|×|B|.
     assert len(sel) < region_a.size * region_b.size
-    assert len(_combined_center_pairs(
-        COMBO_LAYOUT_PROFILE_PROFILE,
-        region_a,
-        region_b,
-        q,
-        max_centers=cap,
-        scenario=COMBO_SCENARIO_SSRF_FIRST_REGION,
-    )) == 1
-    afp_sel = _combined_center_pairs(
-        COMBO_LAYOUT_PROFILE_AFP_SELECTIVE,
-        region_a,
-        region_b,
-        q,
-        max_centers=cap,
-        scenario=COMBO_SCENARIO_SSRF_FIRST_REGION,
+    assert (
+        len(
+            _combined_center_pairs(
+                COMBO_LAYOUT_PROFILE_PROFILE,
+                region_a,
+                region_b,
+                q,
+                max_centers=cap,
+                scenario=COMBO_SCENARIO_SSRF_FIRST_REGION,
+            )
+        )
+        == 1
     )
-    assert len(afp_sel) <= cap
-    ssrf_sel = _combined_center_pairs(
-        COMBO_LAYOUT_SSRF_SELECTIVE_PROFILE,
-        region_a,
-        region_b,
-        q,
-        max_centers=cap,
-        scenario=COMBO_SCENARIO_SSRF_FIRST_REGION,
+    assert (
+        len(
+            _combined_center_pairs(
+                COMBO_LAYOUT_PROFILE_AFP_SELECTIVE,
+                region_a,
+                region_b,
+                q,
+                max_centers=cap,
+                scenario=COMBO_SCENARIO_SSRF_FIRST_REGION,
+            )
+        )
+        <= cap
     )
-    assert len(ssrf_sel) <= cap
+    assert (
+        len(
+            _combined_center_pairs(
+                COMBO_LAYOUT_SSRF_SELECTIVE_PROFILE,
+                region_a,
+                region_b,
+                q,
+                max_centers=cap,
+                scenario=COMBO_SCENARIO_SSRF_FIRST_REGION,
+            )
+        )
+        <= cap
+    )
     assert _combined_center_pairs(
         COMBO_LAYOUT_SELECTIVE_SELECTIVE,
         region_a,
