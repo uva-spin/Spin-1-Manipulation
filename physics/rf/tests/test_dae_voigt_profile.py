@@ -137,6 +137,32 @@ def test_generate_unmanipulated_events():
     np.testing.assert_allclose(data["Q_total"], [boltzmann_Q(0.3), boltzmann_Q(0.45)], atol=5e-3)
 
 
+def test_dt_list_and_range_like_other_knobs():
+    listed = generate_spectra(
+        do_ssrf=False,
+        do_afp=False,
+        do_unmanipulated=True,
+        p_values=np.asarray([0.3]),
+        num_bins=21,
+        r_min=-3.0,
+        r_max=3.0,
+        dt=[0.01, 0.02],
+    )
+    assert listed["spectra"].shape[0] == 2
+    ranged = generate_spectra(
+        do_ssrf=False,
+        do_afp=False,
+        do_unmanipulated=True,
+        p_values=np.asarray([0.3, 0.45]),
+        num_bins=21,
+        r_min=-3.0,
+        r_max=3.0,
+        dt=(0.01, 0.03),
+        seed=0,
+    )
+    assert ranged["spectra"].shape == (2, 2, 21)
+
+
 def test_default_spectrum_grid_is_500_bins_pm6():
     assert NUM_BINS == 500
     assert F_MIN == pytest.approx(-6.0)

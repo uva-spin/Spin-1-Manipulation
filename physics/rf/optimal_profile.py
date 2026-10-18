@@ -36,7 +36,7 @@ class OptimizerSettings:
     max_iterations: int = 30
     starts: int = 2
     search_dt: float = 0.004
-    max_steps: int = 20000
+    max_steps: int = 100000
     max_wall_seconds: float = 300.0
     q_absolute_tolerance: float = 1e-6
     q_relative_tolerance: float = 0.002
@@ -55,8 +55,8 @@ class OptimizerSettings:
             raise ValueError("duration_refinements must be 0..20")
         if not 1 <= self.max_iterations <= 1000 or not 1 <= self.starts <= 10:
             raise ValueError("Invalid iterations/starts")
-        if not 2 <= self.max_steps <= 100000:
-            raise ValueError("max_steps must be 2..100000")
+        if not 2 <= self.max_steps <= 200000:
+            raise ValueError("max_steps must be 2..200000")
         if self.candidate_mode not in ("union", "tensor_deficit", "rf_gain", "all"):
             raise ValueError("Unknown candidate mode")
         return self

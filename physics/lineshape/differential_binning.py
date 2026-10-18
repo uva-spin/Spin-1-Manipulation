@@ -94,9 +94,9 @@ fig, (ax_left, ax_right) = plt.subplots(1, 2, figsize=(18, 7), sharey=False)
 
 # Left: intensity curves
 ax_left.step(x_step, signal_step, color=COLOR_SIGNAL, zorder=3, **step_kw)
-# ax_left.step(x_step, iplus_step, color=COLOR_IPLUS, zorder=2, **step_kw)
-# ax_left.step(x_step, iminus_step, color=COLOR_IMINUS, zorder=2, **step_kw)
-draw_bin_borders(ax_left, [signal_step])
+ax_left.step(x_step, iplus_step, color=COLOR_IPLUS, zorder=2, **step_kw)
+ax_left.step(x_step, iminus_step, color=COLOR_IMINUS, zorder=2, **step_kw)
+draw_bin_borders(ax_left, [signal_step, iplus_step, iminus_step])
 style_axes(ax_left, np.concatenate([signal]), ylabel=True)
 
 # Right: intensity curves + I+ − I−

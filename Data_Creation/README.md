@@ -13,7 +13,7 @@ python Data_Creation/create_data.py --ssrf-afp-combined --no-ssrf --no-afp --max
 Edit **USER PARAMETERS** at the top of [`create_data.py`](create_data.py) for grids and flexible RF knobs:
 
 - scalar → fixed value
-- `(lo, hi)` → sample once per polarization
+- `(lo, hi)` → sample once per burn bin (constant through that burn)
 - `[...]` → iterate (Cartesian product of list knobs)
 
 Helpers live in [`spectrum_gen/`](spectrum_gen/).

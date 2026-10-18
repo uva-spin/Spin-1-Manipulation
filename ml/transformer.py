@@ -38,7 +38,7 @@ if str(SCRIPT_DIR) not in sys.path:
 
 import lstm as lstm_pq
 
-DEFAULT_OUTPUT_DIR = ML_DIR / 'results' / 'transformer' / 'transformer_pq_results_v2'
+DEFAULT_OUTPUT_DIR = ML_DIR / 'results' / 'transformer' / 'transformer_pq_results_v3'
 D_MODEL = 128
 NHEAD = 8
 NUM_LAYERS = 2

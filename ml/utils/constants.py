@@ -3,12 +3,12 @@ from pathlib import Path
 import torch
 
 ML_DIR = Path(__file__).resolve().parent.parent
-DEFAULT_SPECTRA_PATH = ML_DIR / 'data' / 'spectra_combined.npz'
-DEFAULT_OUTPUT_DIR = ML_DIR / 'results' / 'lstm' / 'lstm_result_ssrf_afp_combined_v3'
+DEFAULT_SPECTRA_PATH = ML_DIR / 'data' / 'spectra.npz'
+DEFAULT_OUTPUT_DIR = ML_DIR / 'results' / 'lstm' / 'lstm_result_ssrf_afp_combined_v6'
 SEED = 42
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 NUM_EPOCHS = 500
-BATCH_SIZE = 256
+BATCH_SIZE = 128
 LEARNING_RATE = 0.005
 WEIGHT_DECAY = 0.001
 MIN_DELTA = 1e-06
@@ -28,6 +28,7 @@ RPE_ABS_EPS = 1e-10
 NOISE_STD = 0.01
 N_EXAMPLE_PLOTS = 36
 POL_ABS_BANDS = tuple(((lo / 100.0, (lo + 5) / 100.0) for lo in range(5, 95, 5)))
+POL_ABS_BANDS_PLOT_EXCLUDE = frozenset({(0.60, 0.65)})
 SOURCE_SSRF = 0
 SOURCE_AFP = 1
 SOURCE_UNMANIP = 2
