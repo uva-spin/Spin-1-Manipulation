@@ -4,10 +4,10 @@ Generate full-spectrum manipulated lineshapes for DAE training.
 Edit the USER PARAMETERS block below, then run this script. Helpers live in
 ``Data_Creation/spectrum_gen/``.
 
-Flexible RF knobs (``GAMMA_RF``, ``AFP_WINDOW``, ``GAUSSIAN_FWHM_R``,
-``LORENTZIAN_FWHM_R``):
+Flexible knobs (``GAMMA_RF``, ``AFP_WINDOW``, ``GAUSSIAN_FWHM_R``,
+``LORENTZIAN_FWHM_R``, ``DT``):
   - scalar: use that value
-  - tuple ``(lo, hi)``: sample uniformly once per unique polarization ``p``
+  - tuple ``(lo, hi)``: sample uniformly once per burn bin (held for every step of that burn)
   - list ``[...]``: iterate (Cartesian product across list knobs)
 
 Examples (from repo root):
@@ -55,7 +55,6 @@ from Data_Creation.spectrum_gen.constants import (  # noqa: E402
     COMBO_SCENARIO_AFP_FIRST_REGION,
     COMBO_SCENARIO_BOTH_SELECTIVE,
     COMBO_SCENARIO_SSRF_FIRST_REGION,
-    DT,
     F_MAX,
     F_MIN,
     NUM_BINS,
@@ -78,12 +77,18 @@ P_MAX = 0.6
 P_STEP = 0.025
 UNMANIP_P_STEP = 0.00005
 
-# scalar | (lo, hi) sample-per-p | list of values to iterate
-GAMMA_RF = 10.0
-GAUSSIAN_FWHM_R = RF_GAUSSIAN_FWHM_R
-LORENTZIAN_FWHM_R = RF_LORENTZIAN_FWHM_R
+# scalar | (lo, hi) sample once per selective ssRF burn | list of values to iterate.
+# Optimal-profile ssRF keeps the designed per-bin rates (not this knob).
+GAMMA_RF = (5, 10.0)
+# GAUSSIAN_FWHM_R = (0.03, 3*0.03)
+# LORENTZIAN_FWHM_R = (0.015, 3*0.015)
+GAUSSIAN_FWHM_R = 0.03
+LORENTZIAN_FWHM_R = 0.015
 AFP_WINDOW = 8
-
+# AFP-only: 0 keeps every Q<0 bin; n>0 keeps every nth affected bin
+AFP_BIN_STRIDE = 0
+# DT = (0.0015*0.8, 0.0015*1.2)
+DT = 0.0015
 MIN_BURN_STEPS = 0
 MAX_BURN_STEPS = 400
 BURN_STEPS_STEP = 1
@@ -97,6 +102,7 @@ DEFAULT_SEED = 42
 
 __all__ = [
     'AFP_WINDOW',
+    'DT',
     'GAUSSIAN_FWHM_R',
     'GAMMA_RF',
     'LORENTZIAN_FWHM_R',
@@ -114,8 +120,8 @@ def parse_args():
     parser = argparse.ArgumentParser(
         description=(
             'Generate full-spectrum ssRF / AFP / profile / unmanipulated lineshapes. '
-            'Edit USER PARAMETERS for flexible GAMMA_RF / AFP_WINDOW / FWHM '
-            '(scalar, range tuple, or list). CLI --gamma-rf / --afp-window are optional scalar overrides.'
+            'Edit USER PARAMETERS for flexible GAMMA_RF / AFP_WINDOW / FWHM / DT '
+            '(scalar, range tuple, or list). CLI --gamma-rf / --afp-window / --dt are optional scalar overrides.'
         )
     )
     parser.add_argument('--ssrf', action=argparse.BooleanOptionalAction, default=None)
@@ -126,7 +132,7 @@ def parse_args():
     parser.add_argument('--unmanipulated', action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument('--ssrf-afp-combined', action='store_true')
     parser.add_argument('--combined-max-centers', type=int, default=None)
-    parser.add_argument('--combined-max-relax-steps', type=int, default=500)
+    parser.add_argument('--combined-max-relax-steps', type=int, default=4000)
     parser.add_argument('--output', type=Path, default=DEFAULT_OUTPUT)
     parser.add_argument('--plot-dir', type=Path, default=None)
     parser.add_argument('--no-plots', action='store_true')
@@ -142,6 +148,13 @@ def parse_args():
     parser.add_argument('--relax-steps-step', type=int, default=RELAX_STEPS_STEP)
     parser.add_argument('--gamma-rf', type=float, default=None)
     parser.add_argument('--afp-window', type=int, default=None)
+    parser.add_argument(
+        '--afp-bin-stride',
+        type=int,
+        default=AFP_BIN_STRIDE,
+        help='AFP-only: keep every nth Q<0 bin. 0 keeps every affected bin.',
+    )
+    parser.add_argument('--dt', type=float, default=None)
     parser.add_argument('--seed', type=int, default=DEFAULT_SEED)
     parser.add_argument('--quick', action='store_true')
     return parser.parse_args()
@@ -167,6 +180,7 @@ def main():
     afp_window = args.afp_window if args.afp_window is not None else AFP_WINDOW
     gaussian_fwhm_R = GAUSSIAN_FWHM_R
     lorentzian_fwhm_R = LORENTZIAN_FWHM_R
+    dt = args.dt if args.dt is not None else DT
 
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -203,9 +217,13 @@ def main():
         f'step={args.p_step} | gamma_rf={describe_param(gamma_rf)} | '
         f'AFP window={describe_param(afp_window)} | '
         f'FWHM G={describe_param(gaussian_fwhm_R)} L={describe_param(lorentzian_fwhm_R)} | '
-        f'dt={DT} n={NUM_BINS} R∈[{F_MIN},{F_MAX}] burn R∈({BURN_R_MIN},{BURN_R_MAX}) | seed={args.seed}',
+        f'dt={describe_param(dt)} n={NUM_BINS} R∈[{F_MIN},{F_MAX}] burn R∈({BURN_R_MIN},{BURN_R_MAX}) | seed={args.seed}',
         flush=True,
     )
+    if do_afp:
+        afp_stride = int(args.afp_bin_stride)
+        afp_bins = 'every affected bin' if afp_stride <= 0 else f'every {afp_stride}th affected bin'
+        print(f'  AFP centers: {afp_bins}', flush=True)
     if do_ssrf_afp_combined:
         print(
             f'  combined: centers/region <= {_combo_centers_cap(max_centers_per_p, combined_max_centers)}; '
@@ -235,8 +253,10 @@ def main():
             relax_steps_step=relax_steps_step,
             gamma_rf=gamma_rf,
             afp_window=afp_window,
+            afp_bin_stride=args.afp_bin_stride,
             gaussian_fwhm_R=gaussian_fwhm_R,
             lorentzian_fwhm_R=lorentzian_fwhm_R,
+            dt=dt,
             max_centers_per_p=max_centers_per_p,
             combined_max_centers=combined_max_centers,
             combined_max_relax_steps=combined_max_relax_steps,
@@ -292,6 +312,7 @@ def main():
         'afp_window': describe_param(afp_window),
         'gaussian_fwhm_R': describe_param(gaussian_fwhm_R),
         'lorentzian_fwhm_R': describe_param(lorentzian_fwhm_R),
+        'dt': describe_param(dt),
         'seed': int(args.seed),
     }
     data['meta_json'] = np.asarray(json.dumps(metadata))

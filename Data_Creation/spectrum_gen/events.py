@@ -42,7 +42,7 @@ from .constants import (
     STORE_DTYPE,
 )
 from .eq import equilibrium_q_profile, polarization_grid
-from .params import ensure_rng, expand_param_product, resolve_for_polarization
+from .params import describe_param, ensure_rng, expand_param_product, resolve_for_polarization
 from .ssrf_traj import run_one_polarization as run_ssrf_one
 
 NOISE_LEVEL = 0.0
@@ -210,8 +210,9 @@ def generate_ssrf_events(
     index in ``steps_grid`` (index 0 = pre-burn equilibrium). Observation noise
     is added only when saving spectra, after P/Q totals are computed.
 
-    ``gamma_rf`` / FWHM may be scalars or ``(lo, hi)`` ranges (sampled once per
-    unique ``p``). Discrete list grids are expanded by ``generate_spectra``.
+    ``gamma_rf`` / FWHM / ``dt`` may be scalars or ``(lo, hi)`` ranges (sampled
+    once per center bin and held for every step of that burn). Discrete list
+    grids are expanded by ``generate_spectra``.
     """
     rows = _empty_rows()
     if steps_grid.size == 0:
@@ -219,20 +220,23 @@ def generate_ssrf_events(
     rng = ensure_rng(rng)
     max_burn = np.max(steps_grid)
     step_set = {s for s in steps_grid}
-    grid_kwargs = _traj_grid_kwargs(num_bins=num_bins, r_min=r_min, r_max=r_max, dt=dt)
     for (ip, p0) in enumerate(np.asarray(p_values)):
-        gamma = resolve_for_polarization(gamma_rf, rng)
-        g_fwhm = resolve_for_polarization(gaussian_fwhm_R, rng)
-        l_fwhm = resolve_for_polarization(lorentzian_fwhm_R, rng)
         centers = q_negative_bins_for_p0(p0, burn_window, num_bins=num_bins, r_min=r_min, r_max=r_max)
         if max_centers_per_p is not None and centers.size > max_centers_per_p:
             centers = centers[:max_centers_per_p]
         print(
             f'  ssRF P={p0:.3f} ({ip + 1}/{len(p_values)}): {centers.size} Q<0 centers × '
-            f'{steps_grid.size} step spectra (γ={gamma:.3g}, G={g_fwhm:.4g}, L={l_fwhm:.4g})',
+            f'{steps_grid.size} step spectra (γ={describe_param(gamma_rf)}, '
+            f'G={describe_param(gaussian_fwhm_R)}, L={describe_param(lorentzian_fwhm_R)}, '
+            f'dt={describe_param(dt)})',
             flush=True,
         )
         for bin_idx in centers:
+            gamma = resolve_for_polarization(gamma_rf, rng)
+            g_fwhm = resolve_for_polarization(gaussian_fwhm_R, rng)
+            l_fwhm = resolve_for_polarization(lorentzian_fwhm_R, rng)
+            dt_p = resolve_for_polarization(dt, rng)
+            grid_kwargs = _traj_grid_kwargs(num_bins=num_bins, r_min=r_min, r_max=r_max, dt=dt_p)
             traj = run_ssrf_one(
                 bin_idx,
                 p0,
@@ -288,6 +292,7 @@ def generate_afp_events(
     *,
     afp_window,
     max_centers_per_p=None,
+    bin_stride=0,
     num_bins=NUM_BINS,
     r_min=F_MIN,
     r_max=F_MAX,
@@ -305,7 +310,9 @@ def generate_afp_events(
     Relaxation, when requested, holds the post-flip tensor polarization and
     moves vector polarization toward the Boltzmann state for that Q.
 
-    ``afp_window`` may be a scalar or ``(lo, hi)`` range (sampled once per ``p``).
+    ``afp_window`` / ``dt`` may be a scalar or ``(lo, hi)`` range (sampled once per center bin and held through relaxation).
+
+    ``bin_stride`` 0 keeps every Q<0 bin. ``n > 0`` keeps every nth affected bin.
     """
     rows = _empty_rows()
     if relax_steps_grid.size == 0:
@@ -313,20 +320,24 @@ def generate_afp_events(
     rng = ensure_rng(rng)
     max_relax = np.max(relax_steps_grid)
     step_set = {s for s in relax_steps_grid}
-    grid_kwargs = _traj_grid_kwargs(num_bins=num_bins, r_min=r_min, r_max=r_max, dt=dt)
     afp_profile = zero_power_profile(num_bins)
+    bin_stride = int(bin_stride or 0)
     for (ip, p0) in enumerate(np.asarray(p_values)):
-        window = resolve_for_polarization(afp_window, rng, as_int=True)
         centers = q_negative_bins_for_p0(p0, burn_window, num_bins=num_bins, r_min=r_min, r_max=r_max)
+        if bin_stride > 0:
+            centers = centers[::bin_stride]
         if max_centers_per_p is not None and centers.size > max_centers_per_p:
             centers = centers[:max_centers_per_p]
         print(
             f"  AFP P={p0:.3f} ({ip + 1}/{len(p_values)}): {centers.size} Q<0 centers × "
             f"{relax_steps_grid.size} {('relax' if max_relax > 0 else 'post-flip')} spectra "
-            f"(window={window}, n_relax={max_relax})",
+            f"(window={describe_param(afp_window)}, n_relax={max_relax}, dt={describe_param(dt)})",
             flush=True,
         )
         for bin_idx in centers:
+            window = resolve_for_polarization(afp_window, rng, as_int=True)
+            dt_p = resolve_for_polarization(dt, rng)
+            grid_kwargs = _traj_grid_kwargs(num_bins=num_bins, r_min=r_min, r_max=r_max, dt=dt_p)
             traj = run_afp_one(
                 bin_idx,
                 p0,
@@ -363,7 +374,7 @@ def generate_afp_events(
                 )
     return rows
 
-def generate_afp_qneg_events(p_values, burn_window, relax_steps_grid, *, num_bins=NUM_BINS, r_min=F_MIN, r_max=F_MAX, dt=DT):
+def generate_afp_qneg_events(p_values, burn_window, relax_steps_grid, *, num_bins=NUM_BINS, r_min=F_MIN, r_max=F_MAX, dt=DT, rng=None):
     """One AFP sweep over all initial Q < 0 bins, then relaxation to the pre-AFP state.
 
     A single trajectory per polarization covers the whole Q < 0 profile.
@@ -374,11 +385,13 @@ def generate_afp_qneg_events(p_values, burn_window, relax_steps_grid, *, num_bin
     rows = _empty_rows()
     if relax_steps_grid.size == 0:
         return rows
+    rng = ensure_rng(rng)
     max_relax = int(np.max(relax_steps_grid))
     step_set = {int(s) for s in relax_steps_grid}
-    grid_kwargs = _traj_grid_kwargs(num_bins=num_bins, r_min=r_min, r_max=r_max, dt=dt)
     for (ip, p0) in enumerate(np.asarray(p_values)):
-        print(f'  AFP Profile P={p0:.3f} ({ip + 1}/{len(p_values)}): sweep + {relax_steps_grid.size} relax spectra (n_relax={max_relax})', flush=True)
+        dt_p = resolve_for_polarization(dt, rng)
+        grid_kwargs = _traj_grid_kwargs(num_bins=num_bins, r_min=r_min, r_max=r_max, dt=dt_p)
+        print(f'  AFP Profile P={p0:.3f} ({ip + 1}/{len(p_values)}): sweep + {relax_steps_grid.size} relax spectra (n_relax={max_relax}, dt={dt_p:.4g})', flush=True)
         traj = run_afp_one(0, p0, n_relax=max_relax, qneg_bins=burn_window, capture_spectrum=True, legacy_spectral_recovery=False, **grid_kwargs)
         if traj.get('skipped', False):
             print(f'    skipped (no Q<0 bins)', flush=True)
@@ -402,7 +415,7 @@ def generate_afp_qneg_events(p_values, burn_window, relax_steps_grid, *, num_bin
             _append_event(rows, iplus=ip_spec, iminus=im_spec, p0=p0, p_total=p_total, q_total=q_total, applied_power=0.0, n_steps=k, center_bin=AFP_QNEG_CENTER, source=SOURCE_AFP_PROFILE, power_profile=profile, num_bins=num_bins)
     return rows
 
-def generate_unmanipulated_events(p_values, *, num_bins=NUM_BINS, r_min=F_MIN, r_max=F_MAX, dt=DT):
+def generate_unmanipulated_events(p_values, *, num_bins=NUM_BINS, r_min=F_MIN, r_max=F_MAX, dt=DT, rng=None):
     """Equilibrium full-spectrum events with no RF (source=SOURCE_UNMANIP).
 
     One event per polarization: ``n_steps=0``, ``applied_power=0``, zero
@@ -410,10 +423,12 @@ def generate_unmanipulated_events(p_values, *, num_bins=NUM_BINS, r_min=F_MIN, r
     equilibrium as the manipulated trajectories (no burn / flip).
     """
     rows = _empty_rows()
+    rng = ensure_rng(rng)
     profile = zero_power_profile(num_bins)
     for (ip, p0) in enumerate(np.asarray(p_values)):
-        print(f'  unmanipulated P={p0:.3f} ({ip + 1}/{len(p_values)})', flush=True)
-        model = build_equilibrium_spin1_model(polarization=float(p0), num_bins=num_bins, dt=dt, rf_enabled=False, relax_enabled=True, r_min=r_min, r_max=r_max, legacy_spectral_recovery=False)
+        dt_p = resolve_for_polarization(dt, rng)
+        print(f'  unmanipulated P={p0:.3f} ({ip + 1}/{len(p_values)}) dt={dt_p:.4g}', flush=True)
+        model = build_equilibrium_spin1_model(polarization=float(p0), num_bins=num_bins, dt=dt_p, rf_enabled=False, relax_enabled=True, r_min=r_min, r_max=r_max, legacy_spectral_recovery=False)
         (ip_spec, im_spec, _) = full_spectrum_intensities(model)
         (p_total, q_total) = level_pq(model)
         ip_spec = np.asarray(ip_spec, dtype=np.float64).copy()
@@ -423,7 +438,7 @@ def generate_unmanipulated_events(p_values, *, num_bins=NUM_BINS, r_min=F_MIN, r
         _append_event(rows, iplus=ip_spec, iminus=im_spec, p0=p0, p_total=float(p_total), q_total=float(q_total), applied_power=0.0, n_steps=0, center_bin=UNMANIP_CENTER_BIN, source=SOURCE_UNMANIP, power_profile=profile, num_bins=num_bins)
     return rows
 
-def generate_profile_events(p_values, steps_grid, *, settings=DATA_GEN_SETTINGS, num_bins=NUM_BINS, r_min=F_MIN, r_max=F_MAX, dt=DT):
+def generate_profile_events(p_values, steps_grid, *, settings=DATA_GEN_SETTINGS, num_bins=NUM_BINS, r_min=F_MIN, r_max=F_MAX, dt=DT, rng=None):
     """ssRF-beta optimal RF profile; save I+/I- at each requested Euler step.
 
     Independent of per-bin Voigt burns: one PulseProgram per polarization,
@@ -438,10 +453,12 @@ def generate_profile_events(p_values, steps_grid, *, settings=DATA_GEN_SETTINGS,
     profile_rates = {}
     if steps_grid.size == 0:
         return (rows, profile_rates)
+    rng = ensure_rng(rng)
     max_save = int(np.max(steps_grid))
     for (ip, p0) in enumerate(np.asarray(p_values)):
-        print(f'  profile P={p0:.3f} ({ip + 1}/{len(p_values)}): designing synchronized RF program', flush=True)
-        traj = run_optimal_profile_polarization(p0, n_steps=max_save, n_bins=num_bins, r_min=r_min, r_max=r_max, dt=dt, settings=settings)
+        dt_p = resolve_for_polarization(dt, rng)
+        print(f'  profile P={p0:.3f} ({ip + 1}/{len(p_values)}): designing synchronized RF program (dt={dt_p:.4g})', flush=True)
+        traj = run_optimal_profile_polarization(p0, n_steps=max_save, n_bins=num_bins, r_min=r_min, r_max=r_max, dt=dt_p, settings=settings)
         iplus_full = np.asarray(traj['iplus_full'])
         iminus_full = np.asarray(traj['iminus_full'])
         n_frames = iplus_full.shape[0]
@@ -563,7 +580,9 @@ def generate_combined_ssrf_afp_events(
     selective×selective pairs are zipped by Q depth — never a full cartesian
     product over all Q<0 bins.
 
-    RF knobs may be scalars or ``(lo, hi)`` ranges sampled once per unique ``p``.
+    ``gamma_rf`` is sampled once per selective ssRF burn. Profile ssRF layouts
+    ignore it and replay the designed optimal per-bin rates. Other RF knobs
+    and ``dt`` may be scalars or ``(lo, hi)`` ranges sampled once per trajectory.
     """
     rows = _empty_rows()
     if burn_steps_grid.size == 0:
@@ -577,10 +596,6 @@ def generate_combined_ssrf_afp_events(
     profile_cache = {}
     n_p = len(np.asarray(p_values))
     for (ip, p0) in enumerate(np.asarray(p_values)):
-        gamma = resolve_for_polarization(gamma_rf, rng)
-        g_fwhm = resolve_for_polarization(gaussian_fwhm_R, rng)
-        l_fwhm = resolve_for_polarization(lorentzian_fwhm_R, rng)
-        window = resolve_for_polarization(afp_window, rng, as_int=True)
         centers = q_negative_bins_for_p0(p0, burn_window, num_bins=num_bins, r_min=r_min, r_max=r_max)
         regions = split_q_negative_regions(centers, frequency)
         if len(regions) < 2:
@@ -602,7 +617,9 @@ def generate_combined_ssrf_afp_events(
             f'  combined ssRF+AFP P={p0:.3f} ({ip + 1}/{n_p}): Q<0 regions '
             f'[{region_a.size}, {region_b.size}] bins; selective cap={centers_cap}; '
             f'max_burn={max_burn}; max_relax={int(max_relax)}; '
-            f'γ={gamma:.3g} window={window} G={g_fwhm:.4g} L={l_fwhm:.4g}',
+            f'γ={describe_param(gamma_rf)} window={describe_param(afp_window)} '
+            f'G={describe_param(gaussian_fwhm_R)} L={describe_param(lorentzian_fwhm_R)} '
+            f'dt={describe_param(dt)}',
             flush=True,
         )
         for (scenario, ssrf_region, afp_region, layouts) in scenario_jobs:
@@ -622,6 +639,16 @@ def generate_combined_ssrf_afp_events(
                     flush=True,
                 )
                 for (pair_i, (ssrf_center, afp_center)) in enumerate(center_pairs):
+                    # Profile ssRF uses design_optimal_profile rates, not this draw.
+                    gamma = (
+                        resolve_for_polarization(gamma_rf, rng)
+                        if _combined_uses_selective_ssrf(layout)
+                        else float(GAMMA_RF)
+                    )
+                    g_fwhm = resolve_for_polarization(gaussian_fwhm_R, rng)
+                    l_fwhm = resolve_for_polarization(lorentzian_fwhm_R, rng)
+                    window = resolve_for_polarization(afp_window, rng, as_int=True)
+                    dt_p = resolve_for_polarization(dt, rng)
                     if (
                         ssrf_center is not None
                         and afp_center is not None
@@ -657,7 +684,7 @@ def generate_combined_ssrf_afp_events(
                             num_bins=num_bins,
                             r_min=r_min,
                             r_max=r_max,
-                            dt=dt,
+                            dt=dt_p,
                             capture_spectrum=True,
                             max_centers_per_region=centers_cap,
                             legacy_spectral_recovery=False,
@@ -774,6 +801,7 @@ def generate_spectra(
     max_centers_per_p=None,
     combined_max_centers=None,
     combined_max_relax_steps=None,
+    afp_bin_stride=0,
     p_values=None,
     unmanip_p_values=None,
     profile_settings=DATA_GEN_SETTINGS,
@@ -792,10 +820,10 @@ def generate_spectra(
     ``unmanip_p_values`` is given, or ``p_values`` is given without a separate
     unmanipulated list (e.g. ``--quick`` smoke polarizations).
 
-    ``gamma_rf``, ``afp_window``, ``gaussian_fwhm_R``, and ``lorentzian_fwhm_R``
-    accept a scalar, a ``(lo, hi)`` sample range (drawn once per polarization),
-    or a list of discrete values (Cartesian product over list knobs for the
-    modes that use them).
+    ``gamma_rf`` varies selective ssRF burns only (scalar, ``(lo, hi)`` once
+    per burn, or a list). Optimal-profile ssRF keeps its designed per-bin
+    rates. ``afp_window``, FWHM, and ``dt`` accept the same forms and are
+    drawn once per burn or whole-spectrum trajectory.
 
     If ``profile_rates_out`` is a dict, it is filled with designed ``U(R)``
     envelopes keyed by rounded polarization for diagnostic plotting.
@@ -823,6 +851,7 @@ def generate_spectra(
                 'gamma_rf': gamma_rf,
                 'gaussian_fwhm_R': gaussian_fwhm_R,
                 'lorentzian_fwhm_R': lorentzian_fwhm_R,
+                'dt': dt,
             }
         ):
             groups.append(
@@ -833,11 +862,11 @@ def generate_spectra(
                     gamma_rf=combo['gamma_rf'],
                     gaussian_fwhm_R=combo['gaussian_fwhm_R'],
                     lorentzian_fwhm_R=combo['lorentzian_fwhm_R'],
+                    dt=combo['dt'],
                     max_centers_per_p=max_centers_per_p,
                     num_bins=num_bins,
                     r_min=r_min,
                     r_max=r_max,
-                    dt=dt,
                     rng=rng,
                 )
             )
@@ -848,38 +877,43 @@ def generate_spectra(
             max_relax_steps=max_relax_steps,
             relax_steps_step=relax_steps_step,
         )
-        for combo in expand_param_product({'afp_window': afp_window}):
+        for combo in expand_param_product({'afp_window': afp_window, 'dt': dt}):
             groups.append(
                 generate_afp_events(
                     manip_p,
                     burn_window,
                     relax_grid,
                     afp_window=combo['afp_window'],
+                    dt=combo['dt'],
                     max_centers_per_p=max_centers_per_p,
+                    bin_stride=afp_bin_stride,
                     num_bins=num_bins,
                     r_min=r_min,
                     r_max=r_max,
-                    dt=dt,
                     rng=rng,
                 )
             )
     if do_afp_profile:
         relax_grid = burn_steps_values(min_relax_steps, max_relax_steps, relax_steps_step)
-        groups.append(
-            generate_afp_qneg_events(
-                manip_p, burn_window, relax_grid, num_bins=num_bins, r_min=r_min, r_max=r_max, dt=dt
+        for combo in expand_param_product({'dt': dt}):
+            groups.append(
+                generate_afp_qneg_events(
+                    manip_p, burn_window, relax_grid, num_bins=num_bins, r_min=r_min, r_max=r_max, dt=combo['dt'], rng=rng
+                )
             )
-        )
     if do_profile:
         steps_grid = burn_steps_values(min_burn_steps, max_burn_steps, burn_steps_step)
-        (profile_rows, profile_rates) = generate_profile_events(
-            manip_p, steps_grid, settings=profile_settings, num_bins=num_bins, r_min=r_min, r_max=r_max, dt=dt
-        )
-        groups.append(profile_rows)
+        for combo in expand_param_product({'dt': dt}):
+            (profile_rows, rates) = generate_profile_events(
+                manip_p, steps_grid, settings=profile_settings, num_bins=num_bins, r_min=r_min, r_max=r_max, dt=combo['dt'], rng=rng
+            )
+            groups.append(profile_rows)
+            profile_rates.update(rates)
     if do_unmanipulated:
-        groups.append(
-            generate_unmanipulated_events(unmanip_p, num_bins=num_bins, r_min=r_min, r_max=r_max, dt=dt)
-        )
+        for combo in expand_param_product({'dt': dt}):
+            groups.append(
+                generate_unmanipulated_events(unmanip_p, num_bins=num_bins, r_min=r_min, r_max=r_max, dt=combo['dt'], rng=rng)
+            )
     if do_ssrf_afp_combined:
         steps_grid = burn_steps_values(min_burn_steps, max_burn_steps, burn_steps_step)
         combo_relax = _combo_max_relax(max_relax_steps, max_burn_steps, combined_max_relax_steps)
@@ -896,6 +930,7 @@ def generate_spectra(
                 'afp_window': afp_window,
                 'gaussian_fwhm_R': gaussian_fwhm_R,
                 'lorentzian_fwhm_R': lorentzian_fwhm_R,
+                'dt': dt,
             }
         ):
             groups.append(
@@ -909,13 +944,13 @@ def generate_spectra(
                     afp_window=combo['afp_window'],
                     gaussian_fwhm_R=combo['gaussian_fwhm_R'],
                     lorentzian_fwhm_R=combo['lorentzian_fwhm_R'],
+                    dt=combo['dt'],
                     profile_settings=profile_settings,
                     max_centers_per_p=max_centers_per_p,
                     combined_max_centers=combined_max_centers,
                     num_bins=num_bins,
                     r_min=r_min,
                     r_max=r_max,
-                    dt=dt,
                     rng=rng,
                 )
             )

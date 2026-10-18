@@ -4,9 +4,10 @@ LSTM sequence model: manipulated Ps spectrum → scalar P_total and Q_total.
 Input sequence (over frequency bins):
   [Ps, power_profile, n_steps]  (n_steps is broadcast to every bin)
 
-``power_profile`` is the per-bin RF envelope from the NPZ (ssRF Voigt,
-AFP zeros, optimal U(R)). Scalar ``applied_power`` is kept for diagnostics
-and as a fallback if ``power_profile`` is missing.
+``power_profile`` is ``log1p`` of the per-bin RF envelope from the NPZ
+(ssRF Voigt, AFP zeros, optimal U(R)), then z-scored. Scalar
+``applied_power`` is kept for diagnostics and as a fallback if
+``power_profile`` is missing.
 
 Targets:
   P_total, Q_total from ``spectra.npz`` (population n+−n− / n+−2n0+n−)
@@ -24,8 +25,8 @@ import torch.nn as nn
 import torch.optim as optim
 
 from utils.constants import (
-    BATCH_SIZE, ML_DIR, DEFAULT_SPECTRA_PATH, DEVICE, DROPOUT,
-    HIDDEN_SIZE, LEARNING_RATE, LR_MIN, MAX_GRAD_NORM, MIN_DELTA, NOISE_STD,
+    BATCH_SIZE, DEFAULT_OUTPUT_DIR, DEFAULT_SPECTRA_PATH, DEVICE, DROPOUT,
+    LEARNING_RATE, LR_MIN, MAX_GRAD_NORM, MIN_DELTA, NOISE_STD,
     NUM_EPOCHS, NUM_LAYERS, N_EXAMPLE_PLOTS, REL_LOSS_EPS, RESTART_LR_DECAY,
     RESTART_WARMUP_EPOCHS, SEED, SOURCE_PROFILE, SPECTRUM_R_MAX,
     SPECTRUM_R_MIN, SOURCE_NAME, STATS_KEYS, TEST_FRAC, T_0, T_MULT, VAL_FRAC,
@@ -42,7 +43,7 @@ from analysis.pq_report import (
     save_range_stats_csv, test_input_ps, write_pq_report,
 )
 
-DEFAULT_OUTPUT_DIR = ML_DIR / 'results' / 'lstm' / 'lstm_result_ssrf_afp_combined_v4'
+HIDDEN_SIZE = 32
 
 class LstmModel(nn.Module):
 
@@ -53,7 +54,7 @@ class LstmModel(nn.Module):
         self.num_layers = num_layers
         enc_dropout = dropout if num_layers > 1 else 0.0
         self.encoder = nn.LSTM(input_size=self.input_size, hidden_size=self.hidden_size, num_layers=self.num_layers, batch_first=True, bidirectional=True, dropout=enc_dropout, device=DEVICE)
-        trunk_dim = 2 * self.hidden_size
+        trunk_dim = 4 * self.hidden_size
         self.head_p = nn.Linear(trunk_dim, 1)
         self.head_q = nn.Linear(trunk_dim, 1)
         self._initialize_weights()
@@ -67,7 +68,7 @@ class LstmModel(nn.Module):
 
     def forward(self, x):
         (enc_out, _) = self.encoder(x)
-        ctx = enc_out.mean(dim=1)
+        ctx = torch.cat((enc_out.mean(dim=1), enc_out.amax(dim=1)), dim=1)
         return (self.head_p(ctx).squeeze(-1), self.head_q(ctx).squeeze(-1))
 
 def relative_weighted_loss(pred_z, true_z, *, mean, std, eps=REL_LOSS_EPS):
@@ -203,6 +204,7 @@ def train_model(train_dataset, val_dataset, stats, *, hidden_size, num_layers, d
     q_mean = stats['Q_mean']
     q_std = stats['Q_std']
     model = LstmModel(input_size=stats['input_size'], hidden_size=hidden_size, num_layers=num_layers, dropout=dropout).to(device)
+    print(f"Number of trainable parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad)}", flush=True)
     optimizer = optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=WEIGHT_DECAY)
     scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=T_0, T_mult=T_MULT, eta_min=LR_MIN)
     cycle_state = {'cycle': 0, 'base': float(learning_rate)}
@@ -310,6 +312,7 @@ def main():
     dataset_stats = {k: stats[k] for k in STATS_KEYS if k in stats}
     print(f"Train={stats['n_train']} Val={stats['n_val']} Test={stats['n_test']} bins={stats['num_bins']}", flush=True)
     history_path = out_dir / 'history.json'
+    print(f"Using device: {DEVICE}", flush=True)
     if args.test_only:
         print(f'Loading checkpoint {checkpoint_path} ...', flush=True)
         (model, ckpt) = load_checkpoint(checkpoint_path)

@@ -7,7 +7,7 @@ from typing import Any, Mapping
 
 import numpy as np
 
-# Sentinel: this knob is a per-polarization sample range (not expanded as a grid).
+# Sentinel: sample this range once per burn (not expanded as a grid).
 _RANGE = object()
 
 
@@ -48,7 +48,7 @@ def iteration_values(spec: Any) -> list[Any] | object:
 
 
 def resolve_for_polarization(spec: Any, rng: np.random.Generator, *, as_int: bool = False) -> float | int:
-    """Return the concrete value for one polarization event.
+    """Return one concrete draw. Caller samples once per burn and holds it for every step.
 
     - scalar: that value
     - 2-tuple range: uniform sample in ``[lo, hi]`` (ints if ``as_int``)

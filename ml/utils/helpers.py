@@ -141,7 +141,8 @@ def prepare_datasets(arrays, *, val_frac=VAL_FRAC, test_frac=TEST_FRAC, seed=SEE
     else:
         snr_all = np.full(n_keep, np.nan, dtype=np.float64)
         ps = clean
-    pwr = np.asarray(power_profile[keep], dtype=np.float32)
+    # pwr = np.asarray(power_profile[keep], dtype=np.float32)
+    pwr = np.log1p(np.maximum(np.asarray(power_profile[keep], dtype=np.float32), 0.0))
     n_steps_k = n_steps[keep]
     y_p_k = y_p[keep]
     y_q_k = y_q[keep]

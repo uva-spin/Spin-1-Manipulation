@@ -10,8 +10,8 @@ import torch
 import torch.utils.data as data
 
 from utils.constants import (
-    BATCH_SIZE, DEVICE, N_EXAMPLE_PLOTS, POL_ABS_BANDS, RPE_ABS_EPS, SEED,
-    SOURCE_NAME, SOURCE_PROFILE, SPECTRUM_R_MAX, SPECTRUM_R_MIN,
+    BATCH_SIZE, DEVICE, N_EXAMPLE_PLOTS, POL_ABS_BANDS, POL_ABS_BANDS_PLOT_EXCLUDE,
+    RPE_ABS_EPS, SEED, SOURCE_NAME, SOURCE_PROFILE, SPECTRUM_R_MAX, SPECTRUM_R_MIN,
 )
 from utils.helpers import json_ready
 
@@ -30,6 +30,24 @@ def _summary_stats(values):
     if v.size == 0:
         return {'n': 0.0, 'mean': 'nan', 'median': 'nan', 'std': 'nan', 'min': 'nan', 'max': 'nan', 'p25': 'nan', 'p75': 'nan'}
     return {'n': v.size, 'mean': np.mean(v), 'median': np.median(v), 'std': np.std(v), 'min': np.min(v), 'max': np.max(v), 'p25': np.percentile(v, 25), 'p75': np.percentile(v, 75)}
+
+def _nonnegative_sigma_yerr(center, std):
+    """Asymmetric yerr so mean - lower error never drops below zero (RPE is non-negative)."""
+    center = np.asarray(center, dtype=float)
+    std = np.asarray(std, dtype=float)
+    lower = np.minimum(std, center)
+    return np.vstack([lower, std])
+
+def _polarization_range_row_for_plot(row):
+    if int(row.get('n', 0)) <= 0:
+        return False
+    key = (float(row['lo']), float(row['hi']))
+    return key not in POL_ABS_BANDS_PLOT_EXCLUDE
+
+def nonempty_polarization_range_rows(metrics):
+    """Non-empty |P| bands included in polarization-band bar/overlay figures."""
+    rows = metrics.get('range_stats_by_P') or []
+    return [r for r in rows if _polarization_range_row_for_plot(r)]
 
 def polarization_range_stats(pred_p, true_p, pred_q, true_q, *, pol_ref, bands=POL_ABS_BANDS, ref_name='abs_P', snr=None):
     pred_p = np.asarray(pred_p).reshape(-1)
@@ -296,6 +314,46 @@ def _plot_loss_curves(history, plots_dir, *, best_val_loss=None):
     plt.close(fig)
     return path
 
+def save_rpe_by_polarization_range(metrics, plots_dir, *, color_p='#2f6fed', color_q='#c45c26', color_zero='#1f2933'):
+    """Bar chart of median/mean RPE by |P_total| band (from metrics['range_stats_by_P'])."""
+    plots_dir = Path(plots_dir)
+    plots_dir.mkdir(parents=True, exist_ok=True)
+    _configure_plot_style()
+    nonempty = nonempty_polarization_range_rows(metrics)
+    if not nonempty:
+        return None
+    labels = [r['range'] for r in nonempty]
+    x = np.arange(len(labels))
+    n_bands = sum((r['n'] for r in nonempty))
+    (fig, axes) = plt.subplots(2, 1, figsize=(11.5, 7.4), sharex=True)
+    for (ax, prefix, ylabel, title, color) in (
+        (axes[0], 'P', '$P$ RPE (\\%)', '$P$ RPE by $|P_{\\mathrm{total}}|$ band', color_p),
+        (axes[1], 'Q', '$Q$ RPE (\\%)', '$Q$ RPE by $|P_{\\mathrm{total}}|$ band', color_q),
+    ):
+        med = np.asarray([r[f'{prefix}_rpe_median'] for r in nonempty], dtype=float)
+        mean = np.asarray([r[f'{prefix}_rpe_mean'] for r in nonempty], dtype=float)
+        std = np.asarray([r[f'{prefix}_rpe_std'] for r in nonempty], dtype=float)
+        ax.bar(x - 0.18, med, width=0.32, color='#94a3b8', edgecolor='white', linewidth=0.6, label='median')
+        ax.bar(
+            x + 0.18, mean, width=0.32, color=color, edgecolor='white', linewidth=0.6, label='mean',
+            yerr=_nonnegative_sigma_yerr(mean, std),
+            error_kw={'ecolor': color_zero, 'elinewidth': 1.1, 'capsize': 3.0, 'capthick': 1.0, 'alpha': 0.85},
+        )
+        ax.set_ylim(bottom=0.0)
+        ax.set_ylabel(ylabel)
+        ax.set_title(title)
+        _apply_axes_style(ax)
+        ax.legend(frameon=False, fontsize=8, loc='upper right')
+        _annotate_stats_box(ax, ['error bars: $\\pm 1\\sigma$ of RPE', f'bands $n={n_bands}$'], loc='upper left')
+    axes[1].set_xticks(x)
+    axes[1].set_xticklabels(labels, rotation=40, ha='right')
+    axes[1].set_xlabel('$|P_{\\mathrm{total}}|$ band')
+    fig.tight_layout()
+    path = plots_dir / 'rpe_by_polarization_range.png'
+    fig.savefig(path, dpi=160, facecolor='white')
+    plt.close(fig)
+    return path
+
 def save_plots(history, metrics, plots_dir, *, best_val_loss=None):
     plots_dir.mkdir(parents=True, exist_ok=True)
     saved = []
@@ -419,32 +477,14 @@ def save_plots(history, metrics, plots_dir, *, best_val_loss=None):
     fig.savefig(path, dpi=160, facecolor='white')
     plt.close(fig)
     saved.append(path)
-    range_rows = list(metrics.get('range_stats_by_P') or [])
-    nonempty = [r for r in range_rows if r['n'] > 0]
+    nonempty = nonempty_polarization_range_rows(metrics)
     if nonempty:
+        path = save_rpe_by_polarization_range(metrics, plots_dir, color_p=color_p, color_q=color_q, color_zero=color_zero)
+        if path is not None:
+            saved.append(path)
         labels = [r['range'] for r in nonempty]
         x = np.arange(len(labels))
         n_bands = sum((r['n'] for r in nonempty))
-        (fig, axes) = plt.subplots(2, 1, figsize=(11.5, 7.4), sharex=True)
-        for (ax, prefix, ylabel, title, color) in ((axes[0], 'P', '$P$ RPE (\\%)', '$P$ RPE by $|P_{\\mathrm{total}}|$ band', color_p), (axes[1], 'Q', '$Q$ RPE (\\%)', '$Q$ RPE by $|P_{\\mathrm{total}}|$ band', color_q)):
-            med = np.asarray([r[f'{prefix}_rpe_median'] for r in nonempty])
-            mean = np.asarray([r[f'{prefix}_rpe_mean'] for r in nonempty])
-            std = np.asarray([r[f'{prefix}_rpe_std'] for r in nonempty])
-            ax.bar(x - 0.18, med, width=0.32, color='#94a3b8', edgecolor='white', linewidth=0.6, label='median')
-            ax.bar(x + 0.18, mean, width=0.32, color=color, edgecolor='white', linewidth=0.6, label='mean', yerr=std, error_kw={'ecolor': color_zero, 'elinewidth': 1.1, 'capsize': 3.0, 'capthick': 1.0, 'alpha': 0.85})
-            ax.set_ylabel(ylabel)
-            ax.set_title(title)
-            _apply_axes_style(ax)
-            ax.legend(frameon=False, fontsize=8, loc='upper right')
-            _annotate_stats_box(ax, ['error bars: $\\pm 1\\sigma$ of RPE', f'bands $n={n_bands}$'], loc='upper left')
-        axes[1].set_xticks(x)
-        axes[1].set_xticklabels(labels, rotation=40, ha='right')
-        axes[1].set_xlabel('$|P_{\\mathrm{total}}|$ band')
-        fig.tight_layout()
-        path = plots_dir / 'rpe_by_polarization_range.png'
-        fig.savefig(path, dpi=160, facecolor='white')
-        plt.close(fig)
-        saved.append(path)
         (fig, axes) = plt.subplots(2, 1, figsize=(11.5, 7.4), sharex=True)
         for (ax, prefix, ylabel, title, color) in ((axes[0], 'P', 'Mean residual $P$', '$P$ residuals by $|P_{\\mathrm{total}}|$ band', color_p), (axes[1], 'Q', 'Mean residual $Q$', '$Q$ residuals by $|P_{\\mathrm{total}}|$ band', color_q)):
             mean = np.asarray([r[f'{prefix}_residual_mean'] for r in nonempty])
