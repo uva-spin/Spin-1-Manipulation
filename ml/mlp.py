@@ -70,7 +70,7 @@ class MlpPQModel(nn.Module):
     along frequency first, so a checkpoint still runs.
     """
 
-    def __init__(self, input_size=3, hidden_dims=HIDDEN_DIMS, dropout=DROPOUT, num_bins=NUM_BINS):
+    def __init__(self, input_size=4, hidden_dims=HIDDEN_DIMS, dropout=DROPOUT, num_bins=NUM_BINS):
         super().__init__()
         hidden_dims = tuple(int(h) for h in hidden_dims)
         if not hidden_dims or any(h < 1 for h in hidden_dims):

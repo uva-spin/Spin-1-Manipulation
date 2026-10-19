@@ -67,11 +67,13 @@ def load_npz(path):
         p_total = np.asarray(raw['P_total']).reshape(-1)
         q_total = np.asarray(raw['Q_total']).reshape(-1)
         optional = {}
-        for key in ('p0', 'center_bin', 'source'):
+        for key in ('p0', 'center_bin', 'source', 'run_id', 'burn_steps', 'relax_steps'):
             if key in raw.files:
                 optional[key] = np.asarray(raw[key]).reshape(-1)
         if 'power_profile' in raw.files:
             optional['power_profile'] = np.asarray(raw['power_profile'])
+        if 'rf_dose' in raw.files:
+            optional['rf_dose'] = np.asarray(raw['rf_dose'])
     applied_power = sanitize_applied_power(applied_power, optional.get('source'))
     if spectra.ndim != 3 or spectra.shape[1] != 2:
         raise ValueError(f'{path}: expected spectra shape (N, 2, num_bins), got {spectra.shape}')
@@ -90,6 +92,8 @@ def load_npz(path):
     }
     out.update(optional)
     out['power_profile'] = resolve_power_profile(out)
+    if 'rf_dose' not in out or out['rf_dose'] is None:
+        out['rf_dose'] = np.zeros((n, num_bins), dtype=np.float32)
     return out
 
 
@@ -110,25 +114,51 @@ def prepare_datasets(arrays, *, val_frac=VAL_FRAC, test_frac=TEST_FRAC, seed=SEE
         )
     else:
         power_profile = resolve_power_profile(arrays)
+    
+    rf_dose = arrays.get('rf_dose')
+    if rf_dose is None:
+        rf_dose = np.zeros((n, n_bins), dtype=np.float32)
+    else:
+        rf_dose = np.asarray(rf_dose, dtype=np.float32)
+    
     n_steps = np.asarray(arrays['n_steps']).reshape(-1)
+    
     y_p = np.asarray(arrays['P_total'], dtype=np.float32).reshape(-1)
     y_q = np.asarray(arrays['Q_total'], dtype=np.float32).reshape(-1)
     p0 = arrays.get('p0')
     if p0 is not None:
         p0 = np.asarray(p0).reshape(-1)
+    
+    run_id = arrays.get('run_id')
+    if run_id is None:
+        run_id = np.arange(n, dtype=np.int64)
+    else:
+        run_id = np.asarray(run_id, dtype=np.int64).reshape(-1)
+    
     rng = np.random.default_rng(seed)
     if max_samples is not None and max_samples < n:
         keep = np.sort(rng.choice(n, size=int(max_samples), replace=False))
     else:
         keep = np.arange(n, dtype=np.int64)
 
-    n_keep = int(keep.size)
-    perm = rng.permutation(n_keep)
-    n_test = max(1, round(n_keep * test_frac))
-    n_val = max(1, round(n_keep * val_frac))
-    local_test = perm[:n_test]
-    local_val = perm[n_test:n_test + n_val]
-    local_train = perm[n_test + n_val:]
+    unique_runs = np.unique(run_id[keep])
+    n_runs = len(unique_runs)
+    perm_runs = rng.permutation(n_runs)
+    n_test_runs = max(1, round(n_runs * test_frac))
+    n_val_runs = max(1, round(n_runs * val_frac))
+    
+    test_runs = unique_runs[perm_runs[:n_test_runs]]
+    val_runs = unique_runs[perm_runs[n_test_runs:n_test_runs + n_val_runs]]
+    train_runs = unique_runs[perm_runs[n_test_runs + n_val_runs:]]
+    
+    train_mask = np.isin(run_id[keep], train_runs)
+    val_mask = np.isin(run_id[keep], val_runs)
+    test_mask = np.isin(run_id[keep], test_runs)
+    
+    local_train = np.flatnonzero(train_mask)
+    local_val = np.flatnonzero(val_mask)
+    local_test = np.flatnonzero(test_mask)
+    
     train_global = keep[local_train]
     val_global = keep[local_val]
     test_global = keep[local_test]
@@ -139,19 +169,24 @@ def prepare_datasets(arrays, *, val_frac=VAL_FRAC, test_frac=TEST_FRAC, seed=SEE
         snr_all = spectrum_snr(clean, noise)
         ps = clean + noise
     else:
-        snr_all = np.full(n_keep, np.nan, dtype=np.float64)
+        snr_all = np.full(keep.size, np.nan, dtype=np.float64)
         ps = clean
-    # pwr = np.asarray(power_profile[keep], dtype=np.float32)
-    pwr = np.log1p(np.maximum(np.asarray(power_profile[keep], dtype=np.float32), 0.0))
+    
+    max_gamma = 10.0
+    pwr = np.asarray(power_profile[keep], dtype=np.float32) / max_gamma
+    dose = np.asarray(rf_dose[keep], dtype=np.float32)
+    
     n_steps_k = n_steps[keep]
     y_p_k = y_p[keep]
     y_q_k = y_q[keep]
     ps_mean = float(ps[local_train].mean())
     ps_std = float(ps[local_train].std())
     ps_std = ps_std if ps_std > 1e-08 else 1.0
-    pwr_mean = float(pwr[local_train].mean())
-    pwr_std = float(pwr[local_train].std())
-    pwr_std = pwr_std if pwr_std > 1e-08 else 1.0
+    
+    dose_mean = float(dose[local_train].mean())
+    dose_std = float(dose[local_train].std())
+    dose_std = dose_std if dose_std > 1e-08 else 1.0
+    
     snr_test = snr_all[local_test]
 
     steps_mean = float(n_steps[train_global].mean())
@@ -167,10 +202,11 @@ def prepare_datasets(arrays, *, val_frac=VAL_FRAC, test_frac=TEST_FRAC, seed=SEE
     def _pack(indices):
         t = ps.shape[1]
         ps_n = (ps[indices] - ps_mean) / ps_std
-        pwr_n = (pwr[indices] - pwr_mean) / pwr_std
+        pwr_n = pwr[indices]
+        dose_n = (dose[indices] - dose_mean) / dose_std
         steps_n = (n_steps_k[indices] - steps_mean) / steps_std
         steps_seq = np.broadcast_to(steps_n.reshape(-1, 1), (indices.size, t))
-        x = np.stack([ps_n, pwr_n, steps_seq], axis=-1).astype(np.float32)
+        x = np.stack([ps_n, pwr_n, dose_n, steps_seq], axis=-1).astype(np.float32)
         yp = ((y_p_k[indices] - p_mean) / p_std).astype(np.float32)
         yq = ((y_q_k[indices] - q_mean) / q_std).astype(np.float32)
         return data.TensorDataset(torch.from_numpy(x), torch.from_numpy(yp), torch.from_numpy(yq))
@@ -180,9 +216,9 @@ def prepare_datasets(arrays, *, val_frac=VAL_FRAC, test_frac=TEST_FRAC, seed=SEE
 
     p0_test = (p0[test_global] if p0 is not None else y_p[test_global])
     stats = {
-        'ps_mean': ps_mean, 'ps_std': ps_std, 'pwr_mean': pwr_mean, 'pwr_std': pwr_std,
+        'ps_mean': ps_mean, 'ps_std': ps_std, 'dose_mean': dose_mean, 'dose_std': dose_std,
         'steps_mean': steps_mean, 'steps_std': steps_std, 'P_mean': p_mean, 'P_std': p_std,
-        'Q_mean': q_mean, 'Q_std': q_std, 'input_size': 3, 'num_bins': n_bins,
+        'Q_mean': q_mean, 'Q_std': q_std, 'input_size': 4, 'num_bins': n_bins,
         'n_train': int(train_global.size), 'n_val': int(val_global.size), 'n_test': int(test_global.size),
         'train_idx': train_global, 'val_idx': val_global, 'test_idx': test_global,
         'p0_test': p0_test, 'noise_std': noise_std, 'snr_test': snr_test,

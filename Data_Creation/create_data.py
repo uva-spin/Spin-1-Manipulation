@@ -132,7 +132,7 @@ def parse_args():
     parser.add_argument('--unmanipulated', action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument('--ssrf-afp-combined', action='store_true')
     parser.add_argument('--combined-max-centers', type=int, default=None)
-    parser.add_argument('--combined-max-relax-steps', type=int, default=4000)
+    parser.add_argument('--combined-max-relax-steps', type=int, default=500)
     parser.add_argument('--output', type=Path, default=DEFAULT_OUTPUT)
     parser.add_argument('--plot-dir', type=Path, default=None)
     parser.add_argument('--no-plots', action='store_true')

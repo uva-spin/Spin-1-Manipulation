@@ -10,7 +10,7 @@ Default spectra path: `ml/data/spectra_combined.npz` (override with `--spectra` 
 ## Full-spectrum P/Q models
 
 Each script predicts integrated **P_total** / **Q_total** from the manipulated spectrum
-(plus power profile / step context where applicable):
+(plus power profile / RF dose / step context):
 
 | Script | Architecture |
 |--------|----------------|
@@ -24,11 +24,22 @@ Each script predicts integrated **P_total** / **Q_total** from the manipulated s
 | `dae.py` | Denoising autoencoder on Ps |
 | `eval_model.py` | Load a checkpoint and evaluate on spectra |
 
+**Input channels** (per frequency bin, for LSTM/GRU/CNN/Transformer):
+- `Ps`: manipulated spectrum (I+ + I−), z-score normalized
+- `power_profile`: per-bin RF envelope, physically scaled (÷ 10.0 for max gamma)
+- `rf_dose`: cumulative per-bin RF dose (∫ gamma dt per bin), z-score normalized
+- `burn_steps`: burn-phase step count, normalized by training-set max
+- `relax_steps`: relax-phase step count, normalized by training-set max
+- `peak_gamma`: max applied gamma for this row (broadcast), physically scaled (÷ 10.0)
+
+Older NPZ files without new fields will be loaded with zeros (backward compatible).
+Train/val/test splits are **run-level** (by trajectory) to prevent leakage.
+
 ### Example
 
 ```bash
-# Generate spectra
-python Data_Creation/create_data.py --ssrf --unmanipulated
+# Generate spectra (creates rf_dose, burn_steps, relax_steps, run_id)
+python Data_Creation/create_data.py --ssrf --afp --combined-max-relax-steps 500
 
 # Train (from ml/, or with PYTHONPATH=ml)
 python ml/lstm.py

@@ -2,12 +2,16 @@
 LSTM sequence model: manipulated Ps spectrum → scalar P_total and Q_total.
 
 Input sequence (over frequency bins):
-  [Ps, power_profile, n_steps]  (n_steps is broadcast to every bin)
+  [Ps, power_profile, rf_dose, n_steps]  (n_steps is broadcast to every bin)
 
-``power_profile`` is ``log1p`` of the per-bin RF envelope from the NPZ
-(ssRF Voigt, AFP zeros, optimal U(R)), then z-scored. Scalar
-``applied_power`` is kept for diagnostics and as a fallback if
-``power_profile`` is missing.
+``power_profile`` is the per-bin RF envelope from the NPZ (ssRF Voigt, AFP zeros,
+optimal U(R)), physically scaled by dividing by max_gamma (10.0).
+
+``rf_dose`` is the cumulative per-bin RF dose (integral of gamma*dt per bin,
+excluding AFP envelope), normalized (z-scored) from training data.
+
+``n_steps`` is the number of time steps for this frame, normalized (z-scored)
+from training data.
 
 Targets:
   P_total, Q_total from ``spectra.npz`` (population n+−n− / n+−2n0+n−)
@@ -47,7 +51,7 @@ HIDDEN_SIZE = 32
 
 class LstmModel(nn.Module):
 
-    def __init__(self, input_size=3, hidden_size=HIDDEN_SIZE, num_layers=NUM_LAYERS, dropout=DROPOUT):
+    def __init__(self, input_size=4, hidden_size=HIDDEN_SIZE, num_layers=NUM_LAYERS, dropout=DROPOUT):
         super().__init__()
         self.input_size = input_size
         self.hidden_size = hidden_size
