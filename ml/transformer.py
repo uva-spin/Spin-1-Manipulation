@@ -86,7 +86,7 @@ class TransformerPQModel(nn.Module):
 
     def __init__(
         self,
-        input_size=3,
+        input_size=6,
         d_model=D_MODEL,
         nhead=NHEAD,
         num_layers=NUM_LAYERS,

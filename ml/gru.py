@@ -46,7 +46,7 @@ DEFAULT_OUTPUT_DIR = ML_DIR / 'results' / 'gru' / 'gru_result_ssrf_afp_combined_
 
 class GruModel(nn.Module):
 
-    def __init__(self, input_size=3, hidden_size=HIDDEN_SIZE, num_layers=NUM_LAYERS, dropout=DROPOUT):
+    def __init__(self, input_size=6, hidden_size=HIDDEN_SIZE, num_layers=NUM_LAYERS, dropout=DROPOUT):
         super().__init__()
         self.input_size = input_size
         self.hidden_size = hidden_size
