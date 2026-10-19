@@ -72,7 +72,7 @@ class CnnPQModel(nn.Module):
     Adaptive average and max pools keep where a burn sits along the spectrum.
     """
 
-    def __init__(self, input_size=6, channels=CHANNELS, kernel_sizes=KERNEL_SIZES, dropout=DROPOUT, pool_bins=POOL_BINS):
+    def __init__(self, input_size=4, channels=CHANNELS, kernel_sizes=KERNEL_SIZES, dropout=DROPOUT, pool_bins=POOL_BINS):
         super().__init__()
         channels = tuple(channels)
         kernel_sizes = tuple(kernel_sizes)

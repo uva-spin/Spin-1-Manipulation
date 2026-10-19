@@ -121,19 +121,7 @@ def prepare_datasets(arrays, *, val_frac=VAL_FRAC, test_frac=TEST_FRAC, seed=SEE
     else:
         rf_dose = np.asarray(rf_dose, dtype=np.float32)
     
-    burn_steps = arrays.get('burn_steps')
-    if burn_steps is None:
-        burn_steps = np.zeros(n, dtype=np.int32)
-    else:
-        burn_steps = np.asarray(burn_steps, dtype=np.int32).reshape(-1)
-    
-    relax_steps = arrays.get('relax_steps')
-    if relax_steps is None:
-        relax_steps = np.zeros(n, dtype=np.int32)
-    else:
-        relax_steps = np.asarray(relax_steps, dtype=np.int32).reshape(-1)
-    
-    applied_power = sanitize_applied_power(arrays['applied_power'], arrays.get('source'))
+    n_steps = np.asarray(arrays['n_steps']).reshape(-1)
     
     y_p = np.asarray(arrays['P_total'], dtype=np.float32).reshape(-1)
     y_q = np.asarray(arrays['Q_total'], dtype=np.float32).reshape(-1)
@@ -187,10 +175,8 @@ def prepare_datasets(arrays, *, val_frac=VAL_FRAC, test_frac=TEST_FRAC, seed=SEE
     max_gamma = 10.0
     pwr = np.asarray(power_profile[keep], dtype=np.float32) / max_gamma
     dose = np.asarray(rf_dose[keep], dtype=np.float32)
-    burn_k = burn_steps[keep]
-    relax_k = relax_steps[keep]
-    peak_gamma = np.asarray(applied_power[keep], dtype=np.float32) / max_gamma
     
+    n_steps_k = n_steps[keep]
     y_p_k = y_p[keep]
     y_q_k = y_q[keep]
     ps_mean = float(ps[local_train].mean())
@@ -201,13 +187,11 @@ def prepare_datasets(arrays, *, val_frac=VAL_FRAC, test_frac=TEST_FRAC, seed=SEE
     dose_std = float(dose[local_train].std())
     dose_std = dose_std if dose_std > 1e-08 else 1.0
     
-    burn_max = float(burn_k[local_train].max()) if burn_k[local_train].size > 0 else 1.0
-    burn_max = burn_max if burn_max > 0.0 else 1.0
-    relax_max = float(relax_k[local_train].max()) if relax_k[local_train].size > 0 else 1.0
-    relax_max = relax_max if relax_max > 0.0 else 1.0
-    
     snr_test = snr_all[local_test]
 
+    steps_mean = float(n_steps[train_global].mean())
+    steps_std = float(n_steps[train_global].std())
+    steps_std = steps_std if steps_std > 1e-08 else 1.0
     p_mean = float(y_p[train_global].mean())
     p_std = float(y_p[train_global].std())
     p_std = p_std if p_std > 1e-08 else 1.0
@@ -220,13 +204,9 @@ def prepare_datasets(arrays, *, val_frac=VAL_FRAC, test_frac=TEST_FRAC, seed=SEE
         ps_n = (ps[indices] - ps_mean) / ps_std
         pwr_n = pwr[indices]
         dose_n = (dose[indices] - dose_mean) / dose_std
-        burn_n = burn_k[indices].astype(np.float32) / burn_max
-        relax_n = relax_k[indices].astype(np.float32) / relax_max
-        peak_g = peak_gamma[indices].astype(np.float32)
-        burn_seq = np.broadcast_to(burn_n.reshape(-1, 1), (indices.size, t))
-        relax_seq = np.broadcast_to(relax_n.reshape(-1, 1), (indices.size, t))
-        peak_seq = np.broadcast_to(peak_g.reshape(-1, 1), (indices.size, t))
-        x = np.stack([ps_n, pwr_n, dose_n, burn_seq, relax_seq, peak_seq], axis=-1).astype(np.float32)
+        steps_n = (n_steps_k[indices] - steps_mean) / steps_std
+        steps_seq = np.broadcast_to(steps_n.reshape(-1, 1), (indices.size, t))
+        x = np.stack([ps_n, pwr_n, dose_n, steps_seq], axis=-1).astype(np.float32)
         yp = ((y_p_k[indices] - p_mean) / p_std).astype(np.float32)
         yq = ((y_q_k[indices] - q_mean) / q_std).astype(np.float32)
         return data.TensorDataset(torch.from_numpy(x), torch.from_numpy(yp), torch.from_numpy(yq))
@@ -237,8 +217,8 @@ def prepare_datasets(arrays, *, val_frac=VAL_FRAC, test_frac=TEST_FRAC, seed=SEE
     p0_test = (p0[test_global] if p0 is not None else y_p[test_global])
     stats = {
         'ps_mean': ps_mean, 'ps_std': ps_std, 'dose_mean': dose_mean, 'dose_std': dose_std,
-        'burn_max': burn_max, 'relax_max': relax_max, 'P_mean': p_mean, 'P_std': p_std,
-        'Q_mean': q_mean, 'Q_std': q_std, 'input_size': 6, 'num_bins': n_bins,
+        'steps_mean': steps_mean, 'steps_std': steps_std, 'P_mean': p_mean, 'P_std': p_std,
+        'Q_mean': q_mean, 'Q_std': q_std, 'input_size': 4, 'num_bins': n_bins,
         'n_train': int(train_global.size), 'n_val': int(val_global.size), 'n_test': int(test_global.size),
         'train_idx': train_global, 'val_idx': val_global, 'test_idx': test_global,
         'p0_test': p0_test, 'noise_std': noise_std, 'snr_test': snr_test,

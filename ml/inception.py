@@ -94,7 +94,7 @@ class InceptionPQModel(nn.Module):
 
     def __init__(
         self,
-        input_size=6,
+        input_size=4,
         n_filters=N_FILTERS,
         kernel_sizes=KERNEL_SIZES,
         bottleneck_channels=BOTTLENECK_CHANNELS,
