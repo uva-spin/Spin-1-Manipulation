@@ -6,6 +6,7 @@ import numpy as np
 from physics.rf.model import Spin1Model, Spin1Params
 
 from .constants import F_MAX, F_MIN, NUM_BINS, PAKE_ASYM, PAKE_GAMMA
+from .dulya import active_shape, apply_active_fit
 
 
 def polarization_grid(p_min, p_max, p_step):
@@ -15,6 +16,22 @@ def polarization_grid(p_min, p_max, p_step):
 
 def equilibrium_lineshape(P, f):
     f = np.asarray(f, dtype=float)
+    if active_shape() is not None:
+        fitted = Spin1Model(
+            Spin1Params(
+                n_bins=int(f.size),
+                r_min=float(f[0]),
+                r_max=float(f[-1]),
+                p0=float(P),
+                q0=None,
+                line_gamma=PAKE_GAMMA,
+                line_asym=PAKE_ASYM,
+                rf_enabled=False,
+            )
+        )
+        apply_active_fit(fitted)
+        ip, im, total = fitted.physical_intensities()
+        return np.asarray(total), np.asarray(ip), np.asarray(im)
     model = Spin1Model(
         Spin1Params(
             n_bins=int(f.size),

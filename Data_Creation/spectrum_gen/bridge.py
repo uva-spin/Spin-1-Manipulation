@@ -2,6 +2,7 @@
 import numpy as np
 from .constants import D_SAME_0MINUS, D_SAME_PLUS0, D_SPEC_0MINUS, D_SPEC_PLUS0, DIFFUSION_SCALE, F_MAX, F_MIN, MAX_GDT, MAX_NSUB, MIRROR_AMP_EPS, MIRROR_AMP_RTOL, RF_GAUSSIAN_FWHM_R, RF_LORENTZIAN_FWHM_R, RF_MODE_PHYSICAL_VOIGT, RF_MODE_SINGLE_BIN, ZQ_WIDTH_R
 from physics.rf import Spin1Model, Spin1Params, bin_averaged_voigt, configure_physical_voigt_ssrf, configure_single_bin_ssrf, configure_voigt_burn_spectral_recovery, mirror_bin_idx, ssrf_touched_bins
+from .dulya import apply_active_fit
 afp_touched_bins = ssrf_touched_bins
 PROFILE_REL_THRESHOLD = 0.01
 KERNEL_CUTOFF_WIDTHS = 3.0
@@ -155,11 +156,16 @@ def _spin1_params(*, polarization, num_bins, dt, rf_enabled=False, relax_enabled
     ))
 
 def build_equilibrium_spin1_model(*, polarization, num_bins, dt, rf_enabled=False, relax_enabled=True, diffusion_scale=DIFFUSION_SCALE, rf_gaussian_fwhm_R=RF_GAUSSIAN_FWHM_R, rf_lorentzian_fwhm_R=RF_LORENTZIAN_FWHM_R, r_min=None, r_max=None, legacy_spectral_recovery=True):
-    """Boltzmann Pake equilibrium on the ssRF-beta ODE (no Dulya intensity remap)."""
+    """Equilibrium on the ssRF-beta ODE.
+
+    Analytic Pake unless ``use_fit_params`` installed a Dulya fit, in which
+    case those intensities (rescaled to sum ~ P) replace the Boltzmann state.
+    """
     use_legacy, params = _spin1_params(polarization=polarization, num_bins=num_bins, dt=dt, rf_enabled=rf_enabled, relax_enabled=relax_enabled, diffusion_scale=diffusion_scale, rf_gaussian_fwhm_R=rf_gaussian_fwhm_R, rf_lorentzian_fwhm_R=rf_lorentzian_fwhm_R, r_min=r_min, r_max=r_max, legacy_spectral_recovery=legacy_spectral_recovery)
     model = Spin1Model(params)
     if use_legacy:
         apply_shared_spectral_recovery(model)
+    apply_active_fit(model)
     return model
 
 def build_spin1_model(iplus, iminus, *, polarization, num_bins, dt, rf_enabled=False, relax_enabled=True, diffusion_scale=DIFFUSION_SCALE, rf_gaussian_fwhm_R=RF_GAUSSIAN_FWHM_R, rf_lorentzian_fwhm_R=RF_LORENTZIAN_FWHM_R, r_min=None, r_max=None, legacy_spectral_recovery=True):
@@ -204,7 +210,11 @@ def configure_afp_recovery(model):
     model.install_recovery_to_pre_afp_state()
 
 def level_pq(model):
-    """Return current vector P and tensor Q from stored level populations."""
+    """Vector P and tensor Q from I+ + I- and I+ - I- when a fit is loaded.
+
+    The fitted lineshape is normalized so the unmanipulated sum I+ + I- equals
+    the requested polarization. Level populations then keep P on that sum.
+    """
     lp = model.level_populations()
     return (lp['P'], lp['Q'])
 

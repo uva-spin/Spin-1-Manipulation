@@ -7,6 +7,7 @@ Full-spectrum labeled NMR spectra for DAE / spectrum training.
 ```bash
 python Data_Creation/create_data.py --quick
 python Data_Creation/create_data.py --ssrf --unmanipulated
+python Data_Creation/create_data.py --fit-params Data_Creation/fit_params.json --unmanipulated
 python Data_Creation/create_data.py --ssrf-afp-combined --no-ssrf --no-afp --max-burn-steps 50 --max-relax-steps 50
 ```
 

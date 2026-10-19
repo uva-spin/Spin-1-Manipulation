@@ -6,6 +6,8 @@ import numpy as np
 from physics.rf import bin_averaged_voigt
 from physics.rf.optimal_profile import DATA_GEN_SETTINGS, run_optimal_profile_polarization
 
+from .dulya import apply_active_fit
+
 from .afp_traj import run_one_polarization as run_afp_one
 from .bridge import build_equilibrium_spin1_model, full_spectrum_intensities, level_pq
 from .combined_traj import (
@@ -488,7 +490,16 @@ def generate_profile_events(p_values, steps_grid, *, settings=DATA_GEN_SETTINGS,
         run_counter += 1
         dt_p = resolve_for_polarization(dt, rng)
         print(f'  profile P={p0:.3f} ({ip + 1}/{len(p_values)}): designing synchronized RF program (dt={dt_p:.4g})', flush=True)
-        traj = run_optimal_profile_polarization(p0, n_steps=max_save, n_bins=num_bins, r_min=r_min, r_max=r_max, dt=dt_p, settings=settings)
+        traj = run_optimal_profile_polarization(
+            p0,
+            n_steps=max_save,
+            n_bins=num_bins,
+            r_min=r_min,
+            r_max=r_max,
+            dt=dt_p,
+            settings=settings,
+            equilibrium_loader=apply_active_fit,
+        )
         iplus_full = np.asarray(traj['iplus_full'])
         iminus_full = np.asarray(traj['iminus_full'])
         n_frames = iplus_full.shape[0]

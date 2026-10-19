@@ -497,7 +497,7 @@ def replay_program_spectra(model: IdealBinModel, program: PulseProgram, *, n_rec
 
     def _record(k):
         ip, im, _ = model.physical_intensities()
-        pol = model.polarizations()
+        pol = model.level_populations()
         iplus_full[k] = ip
         iminus_full[k] = im
         p_full[k] = pol["P"]
@@ -525,23 +525,29 @@ def run_optimal_profile_polarization(
     dt=None,
     settings=None,
     bin_allow_mask=None,
+    equilibrium_loader=None,
 ):
     """Design the ssRF-beta profile at ``polarization`` and capture per-step spectra.
 
     ``n_steps`` is the number of Euler frames after equilibrium (same convention
     as ssRF burns). The program endpoint is always included when it falls past
-    ``n_steps``.
+    ``n_steps``. ``equilibrium_loader``, when given, replaces the analytic
+    equilibrium on both the design model and the playback model.
     """
     p0 = float(polarization)
     model = make_ideal_model(p0, n_bins=int(n_bins), r_min=float(r_min), r_max=float(r_max))
     if dt is not None:
         model.params.dt = float(dt)
+    if equilibrium_loader is not None:
+        equilibrium_loader(model)
     design = design_optimal_profile(model, settings=settings, bin_allow_mask=bin_allow_mask)
     dt_used = float(model.params.dt)
     n_euler = 0 if design.duration <= 0.0 else max(1, int(math.ceil(design.duration / dt_used)))
     n_record = max(int(n_steps), n_euler)
     play = make_ideal_model(p0, n_bins=int(n_bins), r_min=float(r_min), r_max=float(r_max))
     play.params.dt = dt_used
+    if equilibrium_loader is not None:
+        equilibrium_loader(play)
     iplus_full, iminus_full, p_full, q_full = replay_program_spectra(
         play, design.program, n_record=n_record
     )
