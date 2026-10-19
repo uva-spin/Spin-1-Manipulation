@@ -15,6 +15,7 @@ Examples (from repo root):
   python Data_Creation/create_data.py --ssrf --afp
   python Data_Creation/create_data.py --unmanipulated
   python Data_Creation/create_data.py --ssrf-afp-combined --no-ssrf --no-afp
+  python Data_Creation/create_data.py --fit-params Data_Creation/fit_params.json --unmanipulated
 """
 from __future__ import annotations
 
@@ -67,6 +68,7 @@ from Data_Creation.spectrum_gen.constants import (  # noqa: E402
     SOURCE_SSRF_AFP,
     SOURCE_UNMANIP,
 )
+from Data_Creation.spectrum_gen.dulya import use_fit_params  # noqa: E402
 from Data_Creation.spectrum_gen.events import _combo_centers_cap  # noqa: E402
 
 # ---------------------------------------------------------------------------
@@ -95,6 +97,10 @@ BURN_STEPS_STEP = 1
 MIN_RELAX_STEPS = 0
 MAX_RELAX_STEPS = 8000
 RELAX_STEPS_STEP = 1
+
+# None: analytic Pake equilibrium. A JSON path uses that frozen Dulya fit
+# (see Data_Creation/fit_params.json) for every equilibrium spectrum.
+FIT_PARAMS = None
 
 DEFAULT_OUTPUT = SCRIPT_DIR / 'spectra_data' / 'spectra.npz'
 DEFAULT_PLOT_DIR = SCRIPT_DIR / 'spectra_data' / 'plots'
@@ -157,6 +163,15 @@ def parse_args():
     parser.add_argument('--dt', type=float, default=None)
     parser.add_argument('--seed', type=int, default=DEFAULT_SEED)
     parser.add_argument('--quick', action='store_true')
+    parser.add_argument(
+        '--fit-params',
+        type=Path,
+        default=None,
+        help=(
+            'JSON of a frozen Dulya lineshape fit. Equilibrium spectra are built '
+            'from those parameters. Omit to keep the analytic Pake lineshape.'
+        ),
+    )
     return parser.parse_args()
 
 
@@ -176,6 +191,8 @@ def main():
     except ValueError as exc:
         raise SystemExit(str(exc)) from exc
 
+    fit_params = args.fit_params if args.fit_params is not None else FIT_PARAMS
+    fit_shape = use_fit_params(fit_params)
     gamma_rf = args.gamma_rf if args.gamma_rf is not None else GAMMA_RF
     afp_window = args.afp_window if args.afp_window is not None else AFP_WINDOW
     gaussian_fwhm_R = GAUSSIAN_FWHM_R
@@ -220,6 +237,10 @@ def main():
         f'dt={describe_param(dt)} n={NUM_BINS} R∈[{F_MIN},{F_MAX}] burn R∈({BURN_R_MIN},{BURN_R_MAX}) | seed={args.seed}',
         flush=True,
     )
+    if fit_shape is None:
+        print('Equilibrium: analytic Pake', flush=True)
+    else:
+        print(f'Equilibrium: Dulya fit {fit_params}', flush=True)
     if do_afp:
         afp_stride = int(args.afp_bin_stride)
         afp_bins = 'every affected bin' if afp_stride <= 0 else f'every {afp_stride}th affected bin'
@@ -314,6 +335,8 @@ def main():
         'lorentzian_fwhm_R': describe_param(lorentzian_fwhm_R),
         'dt': describe_param(dt),
         'seed': int(args.seed),
+        'lineshape': 'pake' if fit_shape is None else 'dulya_fit',
+        'fit_params': None if fit_params is None else str(fit_params),
     }
     data['meta_json'] = np.asarray(json.dumps(metadata))
     np.savez_compressed(output, **data)

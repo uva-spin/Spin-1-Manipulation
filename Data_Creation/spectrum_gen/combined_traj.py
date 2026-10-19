@@ -37,6 +37,7 @@ from .bridge import (
     level_pq,
     mirror_bin_idx,
 )
+from .dulya import apply_active_fit
 from physics.rf import bin_averaged_voigt
 from physics.rf.optimal_profile import replay_program_spectra, run_optimal_profile_polarization, synchronized_program
 from physics.rf.profile_control import make_ideal_model
@@ -290,6 +291,7 @@ def _run_ssrf_profile_phase(
         dt=dt,
         settings=settings,
         bin_allow_mask=allow,
+        equilibrium_loader=apply_active_fit,
     )
     if traj.get("skipped", False):
         return None

@@ -125,9 +125,7 @@ def run_one_polarization(
         iminus_full = np.empty((t_len, num_bins))
 
     def _record(k):
-        pol = model.polarizations()
-        p_full[k] = pol['P']
-        q_full[k] = pol['Q']
+        p_full[k], q_full[k] = level_pq(model)
         if capture_spectrum:
             ip, im, _ = full_spectrum_intensities(model)
             iplus_full[k] = ip
