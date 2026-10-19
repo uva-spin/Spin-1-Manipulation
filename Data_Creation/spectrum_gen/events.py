@@ -171,7 +171,7 @@ def _event_pq(traj, k):
         raise KeyError('trajectory is missing population p_full/q_full')
     return (float(np.asarray(p_full)[k]), float(np.asarray(q_full)[k]))
 
-def _append_event(rows, *, iplus, iminus, p0, p_total, q_total, applied_power, n_steps, center_bin, source, power_profile, combo_scenario=0, combo_layout=0, num_bins=NUM_BINS):
+def _append_event(rows, *, iplus, iminus, p0, p_total, q_total, applied_power, n_steps, center_bin, source, power_profile, combo_scenario=0, combo_layout=0, num_bins=NUM_BINS, rf_dose=None, burn_steps=0, relax_steps=0, run_id=0):
     rows['spectra'].append(np.stack([np.asarray(iplus, dtype=STORE_DTYPE).reshape(-1), np.asarray(iminus, dtype=STORE_DTYPE).reshape(-1)], axis=0))
     rows['p0'].append(p0)
     rows['P_total'].append(p_total)
@@ -183,9 +183,15 @@ def _append_event(rows, *, iplus, iminus, p0, p_total, q_total, applied_power, n
     rows['source'].append(source)
     rows['combo_scenario'].append(int(combo_scenario))
     rows['combo_layout'].append(int(combo_layout))
+    if rf_dose is None:
+        rf_dose = np.zeros(int(num_bins), dtype=STORE_DTYPE)
+    rows['rf_dose'].append(np.asarray(rf_dose, dtype=STORE_DTYPE).reshape(-1))
+    rows['burn_steps'].append(int(burn_steps))
+    rows['relax_steps'].append(int(relax_steps))
+    rows['run_id'].append(int(run_id))
 
 def _empty_rows():
-    return {'spectra': [], 'p0': [], 'P_total': [], 'Q_total': [], 'applied_power': [], 'power_profile': [], 'n_steps': [], 'center_bin': [], 'source': [], 'combo_scenario': [], 'combo_layout': []}
+    return {'spectra': [], 'p0': [], 'P_total': [], 'Q_total': [], 'applied_power': [], 'power_profile': [], 'n_steps': [], 'center_bin': [], 'source': [], 'combo_scenario': [], 'combo_layout': [], 'rf_dose': [], 'burn_steps': [], 'relax_steps': [], 'run_id': []}
 
 def generate_ssrf_events(
     p_values,
@@ -220,6 +226,7 @@ def generate_ssrf_events(
     rng = ensure_rng(rng)
     max_burn = np.max(steps_grid)
     step_set = {s for s in steps_grid}
+    run_counter = 0
     for (ip, p0) in enumerate(np.asarray(p_values)):
         centers = q_negative_bins_for_p0(p0, burn_window, num_bins=num_bins, r_min=r_min, r_max=r_max)
         if max_centers_per_p is not None and centers.size > max_centers_per_p:
@@ -232,6 +239,8 @@ def generate_ssrf_events(
             flush=True,
         )
         for bin_idx in centers:
+            run_id = run_counter
+            run_counter += 1
             gamma = resolve_for_polarization(gamma_rf, rng)
             g_fwhm = resolve_for_polarization(gaussian_fwhm_R, rng)
             l_fwhm = resolve_for_polarization(lorentzian_fwhm_R, rng)
@@ -269,6 +278,7 @@ def generate_ssrf_events(
                 (p_total, q_total) = _event_pq(traj, k)
                 ip_spec += np.random.normal(0, NOISE_LEVEL, ip_spec.shape)
                 im_spec += np.random.normal(0, NOISE_LEVEL, im_spec.shape)
+                dose = profile * burn_steps * dt_p
                 _append_event(
                     rows,
                     iplus=ip_spec,
@@ -282,6 +292,10 @@ def generate_ssrf_events(
                     source=SOURCE_SSRF,
                     power_profile=profile,
                     num_bins=num_bins,
+                    rf_dose=dose,
+                    burn_steps=burn_steps,
+                    relax_steps=0,
+                    run_id=run_id,
                 )
     return rows
 
@@ -322,6 +336,7 @@ def generate_afp_events(
     step_set = {s for s in relax_steps_grid}
     afp_profile = zero_power_profile(num_bins)
     bin_stride = int(bin_stride or 0)
+    run_counter = 0
     for (ip, p0) in enumerate(np.asarray(p_values)):
         centers = q_negative_bins_for_p0(p0, burn_window, num_bins=num_bins, r_min=r_min, r_max=r_max)
         if bin_stride > 0:
@@ -335,6 +350,8 @@ def generate_afp_events(
             flush=True,
         )
         for bin_idx in centers:
+            run_id = run_counter
+            run_counter += 1
             window = resolve_for_polarization(afp_window, rng, as_int=True)
             dt_p = resolve_for_polarization(dt, rng)
             grid_kwargs = _traj_grid_kwargs(num_bins=num_bins, r_min=r_min, r_max=r_max, dt=dt_p)
@@ -371,6 +388,10 @@ def generate_afp_events(
                     source=SOURCE_AFP,
                     power_profile=afp_profile,
                     num_bins=num_bins,
+                    rf_dose=afp_profile,
+                    burn_steps=0,
+                    relax_steps=relax_steps,
+                    run_id=run_id,
                 )
     return rows
 
@@ -388,7 +409,10 @@ def generate_afp_qneg_events(p_values, burn_window, relax_steps_grid, *, num_bin
     rng = ensure_rng(rng)
     max_relax = int(np.max(relax_steps_grid))
     step_set = {int(s) for s in relax_steps_grid}
+    run_counter = 0
     for (ip, p0) in enumerate(np.asarray(p_values)):
+        run_id = run_counter
+        run_counter += 1
         dt_p = resolve_for_polarization(dt, rng)
         grid_kwargs = _traj_grid_kwargs(num_bins=num_bins, r_min=r_min, r_max=r_max, dt=dt_p)
         print(f'  AFP Profile P={p0:.3f} ({ip + 1}/{len(p_values)}): sweep + {relax_steps_grid.size} relax spectra (n_relax={max_relax}, dt={dt_p:.4g})', flush=True)
@@ -412,7 +436,7 @@ def generate_afp_qneg_events(p_values, burn_window, relax_steps_grid, *, num_bin
             (p_total, q_total) = _event_pq(traj, k)
             ip_spec += np.random.normal(0, NOISE_LEVEL, ip_spec.shape)
             im_spec += np.random.normal(0, NOISE_LEVEL, im_spec.shape)
-            _append_event(rows, iplus=ip_spec, iminus=im_spec, p0=p0, p_total=p_total, q_total=q_total, applied_power=0.0, n_steps=k, center_bin=AFP_QNEG_CENTER, source=SOURCE_AFP_PROFILE, power_profile=profile, num_bins=num_bins)
+            _append_event(rows, iplus=ip_spec, iminus=im_spec, p0=p0, p_total=p_total, q_total=q_total, applied_power=0.0, n_steps=k, center_bin=AFP_QNEG_CENTER, source=SOURCE_AFP_PROFILE, power_profile=profile, num_bins=num_bins, rf_dose=profile, burn_steps=0, relax_steps=k, run_id=run_id)
     return rows
 
 def generate_unmanipulated_events(p_values, *, num_bins=NUM_BINS, r_min=F_MIN, r_max=F_MAX, dt=DT, rng=None):
@@ -425,7 +449,10 @@ def generate_unmanipulated_events(p_values, *, num_bins=NUM_BINS, r_min=F_MIN, r
     rows = _empty_rows()
     rng = ensure_rng(rng)
     profile = zero_power_profile(num_bins)
+    run_counter = 0
     for (ip, p0) in enumerate(np.asarray(p_values)):
+        run_id = run_counter
+        run_counter += 1
         dt_p = resolve_for_polarization(dt, rng)
         print(f'  unmanipulated P={p0:.3f} ({ip + 1}/{len(p_values)}) dt={dt_p:.4g}', flush=True)
         model = build_equilibrium_spin1_model(polarization=float(p0), num_bins=num_bins, dt=dt_p, rf_enabled=False, relax_enabled=True, r_min=r_min, r_max=r_max, legacy_spectral_recovery=False)
@@ -435,7 +462,7 @@ def generate_unmanipulated_events(p_values, *, num_bins=NUM_BINS, r_min=F_MIN, r
         im_spec = np.asarray(im_spec, dtype=np.float64).copy()
         ip_spec += np.random.normal(0, NOISE_LEVEL, ip_spec.shape)
         im_spec += np.random.normal(0, NOISE_LEVEL, im_spec.shape)
-        _append_event(rows, iplus=ip_spec, iminus=im_spec, p0=p0, p_total=float(p_total), q_total=float(q_total), applied_power=0.0, n_steps=0, center_bin=UNMANIP_CENTER_BIN, source=SOURCE_UNMANIP, power_profile=profile, num_bins=num_bins)
+        _append_event(rows, iplus=ip_spec, iminus=im_spec, p0=p0, p_total=float(p_total), q_total=float(q_total), applied_power=0.0, n_steps=0, center_bin=UNMANIP_CENTER_BIN, source=SOURCE_UNMANIP, power_profile=profile, num_bins=num_bins, rf_dose=profile, burn_steps=0, relax_steps=0, run_id=run_id)
     return rows
 
 def generate_profile_events(p_values, steps_grid, *, settings=DATA_GEN_SETTINGS, num_bins=NUM_BINS, r_min=F_MIN, r_max=F_MAX, dt=DT, rng=None):
@@ -455,7 +482,10 @@ def generate_profile_events(p_values, steps_grid, *, settings=DATA_GEN_SETTINGS,
         return (rows, profile_rates)
     rng = ensure_rng(rng)
     max_save = int(np.max(steps_grid))
+    run_counter = 0
     for (ip, p0) in enumerate(np.asarray(p_values)):
+        run_id = run_counter
+        run_counter += 1
         dt_p = resolve_for_polarization(dt, rng)
         print(f'  profile P={p0:.3f} ({ip + 1}/{len(p_values)}): designing synchronized RF program (dt={dt_p:.4g})', flush=True)
         traj = run_optimal_profile_polarization(p0, n_steps=max_save, n_bins=num_bins, r_min=r_min, r_max=r_max, dt=dt_p, settings=settings)
@@ -479,7 +509,8 @@ def generate_profile_events(p_values, steps_grid, *, settings=DATA_GEN_SETTINGS,
             (p_total, q_total) = _event_pq(traj, k)
             ip_spec += np.random.normal(0, NOISE_LEVEL, ip_spec.shape)
             im_spec += np.random.normal(0, NOISE_LEVEL, im_spec.shape)
-            _append_event(rows, iplus=ip_spec, iminus=im_spec, p0=p0, p_total=p_total, q_total=q_total, applied_power=peak_u, n_steps=burn_steps, center_bin=PROFILE_CENTER_BIN, source=SOURCE_PROFILE, power_profile=profile, num_bins=num_bins)
+            dose = profile * burn_steps * dt_p
+            _append_event(rows, iplus=ip_spec, iminus=im_spec, p0=p0, p_total=p_total, q_total=q_total, applied_power=peak_u, n_steps=burn_steps, center_bin=PROFILE_CENTER_BIN, source=SOURCE_PROFILE, power_profile=profile, num_bins=num_bins, rf_dose=dose, burn_steps=burn_steps, relax_steps=0, run_id=run_id)
     return (rows, profile_rates)
 
 _COMBO_LAYOUTS_REGION_SPLIT = (
@@ -595,6 +626,7 @@ def generate_combined_ssrf_afp_events(
     frequency = np.linspace(r_min, r_max, num_bins)
     profile_cache = {}
     n_p = len(np.asarray(p_values))
+    run_counter = 0
     for (ip, p0) in enumerate(np.asarray(p_values)):
         centers = q_negative_bins_for_p0(p0, burn_window, num_bins=num_bins, r_min=r_min, r_max=r_max)
         regions = split_q_negative_regions(centers, frequency)
@@ -639,6 +671,8 @@ def generate_combined_ssrf_afp_events(
                     flush=True,
                 )
                 for (pair_i, (ssrf_center, afp_center)) in enumerate(center_pairs):
+                    run_id = run_counter
+                    run_counter += 1
                     # Profile ssRF uses design_optimal_profile rates, not this draw.
                     gamma = (
                         resolve_for_polarization(gamma_rf, rng)
@@ -742,6 +776,9 @@ def generate_combined_ssrf_afp_events(
                         ip_spec += np.random.normal(0, NOISE_LEVEL, ip_spec.shape)
                         im_spec += np.random.normal(0, NOISE_LEVEL, im_spec.shape)
                         n_steps, applied_power = combined_row_clock(frame, ssrf_start, applied, relax_start=relax_start)
+                        burn_steps_count = max(0, min(frame - ssrf_start, n_ssrf))
+                        relax_steps_count = max(0, frame - relax_start) if relax_start is not None and frame >= relax_start else 0
+                        dose = profiles[frame] * burn_steps_count * dt_p
                         _append_event(
                             rows,
                             iplus=ip_spec,
@@ -757,6 +794,10 @@ def generate_combined_ssrf_afp_events(
                             combo_scenario=int(scenario),
                             combo_layout=int(layout),
                             num_bins=num_bins,
+                            rf_dose=dose,
+                            burn_steps=burn_steps_count,
+                            relax_steps=relax_steps_count,
+                            run_id=run_id,
                         )
         print(
             f'    P={p0:.3f} done: traj_ok={traj_ok} traj_skip={traj_skip} '
@@ -772,8 +813,8 @@ def _merge_rows(*row_groups):
             merged[key].extend(rows[key])
     n = len(merged['spectra'])
     if n == 0:
-        return {'spectra': np.empty((0, 2, NUM_BINS), dtype=STORE_DTYPE), 'p0': np.empty(0, dtype=STORE_DTYPE), 'P_total': np.empty(0, dtype=STORE_DTYPE), 'Q_total': np.empty(0, dtype=STORE_DTYPE), 'applied_power': np.empty(0, dtype=STORE_DTYPE), 'power_profile': np.empty((0, NUM_BINS), dtype=STORE_DTYPE), 'n_steps': np.empty(0, dtype=np.int32), 'center_bin': np.empty(0, dtype=np.int32), 'source': np.empty(0, dtype=np.uint8), 'combo_scenario': np.empty(0, dtype=np.uint8), 'combo_layout': np.empty(0, dtype=np.uint8)}
-    return {'spectra': np.stack(merged['spectra'], axis=0).astype(STORE_DTYPE, copy=False), 'p0': np.asarray(merged['p0'], dtype=STORE_DTYPE), 'P_total': np.asarray(merged['P_total'], dtype=STORE_DTYPE), 'Q_total': np.asarray(merged['Q_total'], dtype=STORE_DTYPE), 'applied_power': np.asarray(merged['applied_power'], dtype=STORE_DTYPE), 'power_profile': np.stack(merged['power_profile'], axis=0).astype(STORE_DTYPE, copy=False), 'n_steps': np.asarray(merged['n_steps'], dtype=np.int32), 'center_bin': np.asarray(merged['center_bin'], dtype=np.int32), 'source': np.asarray(merged['source'], dtype=np.uint8), 'combo_scenario': np.asarray(merged['combo_scenario'], dtype=np.uint8), 'combo_layout': np.asarray(merged['combo_layout'], dtype=np.uint8)}
+        return {'spectra': np.empty((0, 2, NUM_BINS), dtype=STORE_DTYPE), 'p0': np.empty(0, dtype=STORE_DTYPE), 'P_total': np.empty(0, dtype=STORE_DTYPE), 'Q_total': np.empty(0, dtype=STORE_DTYPE), 'applied_power': np.empty(0, dtype=STORE_DTYPE), 'power_profile': np.empty((0, NUM_BINS), dtype=STORE_DTYPE), 'n_steps': np.empty(0, dtype=np.int32), 'center_bin': np.empty(0, dtype=np.int32), 'source': np.empty(0, dtype=np.uint8), 'combo_scenario': np.empty(0, dtype=np.uint8), 'combo_layout': np.empty(0, dtype=np.uint8), 'rf_dose': np.empty((0, NUM_BINS), dtype=STORE_DTYPE), 'burn_steps': np.empty(0, dtype=np.int32), 'relax_steps': np.empty(0, dtype=np.int32), 'run_id': np.empty(0, dtype=np.int64)}
+    return {'spectra': np.stack(merged['spectra'], axis=0).astype(STORE_DTYPE, copy=False), 'p0': np.asarray(merged['p0'], dtype=STORE_DTYPE), 'P_total': np.asarray(merged['P_total'], dtype=STORE_DTYPE), 'Q_total': np.asarray(merged['Q_total'], dtype=STORE_DTYPE), 'applied_power': np.asarray(merged['applied_power'], dtype=STORE_DTYPE), 'power_profile': np.stack(merged['power_profile'], axis=0).astype(STORE_DTYPE, copy=False), 'n_steps': np.asarray(merged['n_steps'], dtype=np.int32), 'center_bin': np.asarray(merged['center_bin'], dtype=np.int32), 'source': np.asarray(merged['source'], dtype=np.uint8), 'combo_scenario': np.asarray(merged['combo_scenario'], dtype=np.uint8), 'combo_layout': np.asarray(merged['combo_layout'], dtype=np.uint8), 'rf_dose': np.stack(merged['rf_dose'], axis=0).astype(STORE_DTYPE, copy=False), 'burn_steps': np.asarray(merged['burn_steps'], dtype=np.int32), 'relax_steps': np.asarray(merged['relax_steps'], dtype=np.int32), 'run_id': np.asarray(merged['run_id'], dtype=np.int64)}
 
 def generate_spectra(
     *,
