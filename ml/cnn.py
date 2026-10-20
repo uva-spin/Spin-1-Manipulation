@@ -5,7 +5,7 @@ Same task and data as ``ml/lstm.py``. A stack of residual conv blocks reads
 frequency bins as a 1D axis, then adaptive average and max pools keep a
 coarse frequency grid for the P and Q heads. Per-bin channels:
 
-  [Ps, power_profile, rf_dose, n_steps]  (n_steps is broadcast to every bin)
+  [Ps, power_profile, n_steps]  (n_steps is broadcast to every bin)
 
 Targets:
   P_total, Q_total from ``spectra.npz`` (population n+−n− / n+−2n0+n−)
@@ -72,7 +72,7 @@ class CnnPQModel(nn.Module):
     Adaptive average and max pools keep where a burn sits along the spectrum.
     """
 
-    def __init__(self, input_size=4, channels=CHANNELS, kernel_sizes=KERNEL_SIZES, dropout=DROPOUT, pool_bins=POOL_BINS):
+    def __init__(self, input_size=3, channels=CHANNELS, kernel_sizes=KERNEL_SIZES, dropout=DROPOUT, pool_bins=POOL_BINS):
         super().__init__()
         channels = tuple(channels)
         kernel_sizes = tuple(kernel_sizes)

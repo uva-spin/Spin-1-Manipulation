@@ -162,11 +162,7 @@ def main():
     stats['noise_std'] = noise_std
     stats['noise_seed'] = args.noise_seed
     stats['split_seed'] = args.split_seed
-    stats['p0_test'] = (
-        np.asarray(arrays['p0']).reshape(-1)[test_idx]
-        if 'p0' in arrays
-        else np.asarray(arrays['P_total']).reshape(-1)[test_idx]
-    )
+    stats['p0_test'] = np.asarray(arrays['p0']).reshape(-1)[test_idx]
 
     dataset_stats = {k: stats[k] for k in DATASET_STAT_KEYS if k in stats}
 
@@ -203,8 +199,8 @@ def main():
         metrics,
         pred_csv,
         test_idx=test_idx,
-        p0=np.asarray(arrays['p0']).reshape(-1)[test_idx] if 'p0' in arrays else None,
-        source=np.asarray(arrays['source']).reshape(-1)[test_idx] if 'source' in arrays else None,
+        p0=np.asarray(arrays['p0']).reshape(-1)[test_idx],
+        source=np.asarray(arrays['source']).reshape(-1)[test_idx],
         n_steps=np.asarray(arrays['n_steps']).reshape(-1)[test_idx],
         applied_power=np.asarray(arrays['applied_power']).reshape(-1)[test_idx],
     )

@@ -7,7 +7,7 @@ widths are sized to about the same trainable-parameter count as
 ``CnnPQModel`` on the 500-bin spectra.
 
 Per-bin channels:
-  [Ps, power_profile, rf_dose, n_steps]  (n_steps is broadcast to every bin)
+  [Ps, power_profile, n_steps]  (n_steps is broadcast to every bin)
 
 Targets:
   P_total, Q_total from ``spectra.npz`` (population n+−n− / n+−2n0+n−)
@@ -70,7 +70,7 @@ class MlpPQModel(nn.Module):
     along frequency first, so a checkpoint still runs.
     """
 
-    def __init__(self, input_size=4, hidden_dims=HIDDEN_DIMS, dropout=DROPOUT, num_bins=NUM_BINS):
+    def __init__(self, input_size=3, hidden_dims=HIDDEN_DIMS, dropout=DROPOUT, num_bins=NUM_BINS):
         super().__init__()
         hidden_dims = tuple(int(h) for h in hidden_dims)
         if not hidden_dims or any(h < 1 for h in hidden_dims):

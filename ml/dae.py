@@ -126,33 +126,17 @@ def load_voigt_burn_ps(spectra=None, num_points=500):
     """Load Voigt-burn NPZ spectra and return (Ps, P_proxy).
 
     NPZ key 'spectra' has shape (N, 2, num_points): channel0=Iplus, channel1=Iminus.
-    Ps is Iplus+Iminus. Prefers NPZ ``P_total`` when present; otherwise computes
-    integrated (Iplus-Iminus)/(Iplus+Iminus).
+    Ps is Iplus+Iminus. P proxy is NPZ ``P_total``.
     """
     path = resolve_spectra_path(spectra)
-    loaded = np.load(path, allow_pickle=False)
-    try:
-        if 'spectra' not in loaded.files:
-            raise KeyError(f"{path}: missing 'spectra' array; found {loaded.files}")
+    with np.load(path, allow_pickle=False) as loaded:
         spectra_arr = np.asarray(loaded['spectra'])
-        p_total = np.asarray(loaded['P_total']).reshape(-1) if 'P_total' in loaded.files else None
-    finally:
-        loaded.close()
-    if spectra_arr.ndim != 3 or spectra_arr.shape[1] != 2 or spectra_arr.shape[2] != num_points:
-        raise ValueError(f'{path}: expected spectra shape (N, 2, {num_points}), got {spectra_arr.shape}')
+        p_total = np.asarray(loaded['P_total']).reshape(-1)
     iplus = spectra_arr[:, 0, :]
     iminus = spectra_arr[:, 1, :]
     ps = (iplus + iminus).astype(np.float32, copy=False)
-    if p_total is not None and p_total.shape[0] == ps.shape[0]:
-        p_proxy = p_total
-        p_src = 'P_total'
-    else:
-        total = np.sum(ps, axis=1)
-        diff = np.sum(iplus - iminus, axis=1)
-        p_proxy = np.divide(diff, total, out=np.zeros_like(diff), where=np.abs(total) > 1e-12)
-        p_src = 'I+/I- proxy'
-    print(f'Loaded Voigt-burn spectra: {path}  N={ps.shape[0]}  Ps shape={ps.shape} (from Iplus/Iminus; P from {p_src})', flush=True)
-    return (ps, p_proxy.astype(np.float32, copy=False))
+    print(f'Loaded Voigt-burn spectra: {path}  N={ps.shape[0]}  Ps shape={ps.shape} (from Iplus/Iminus; P from P_total)', flush=True)
+    return (ps, p_total.astype(np.float32, copy=False))
 
 def load_and_prepare_data(spectra=None, num_points=500, noise_std=0.1, val_frac=0.2, test_frac=0.2, seed=42, scale_01=True, override_stats=None):
     """

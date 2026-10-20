@@ -540,8 +540,6 @@ def test_input_ps(test_dataset, stats):
 
 def _equilibrium_q0_by_p0(arrays):
     """Map rounded p0 → equilibrium tensor polarization from n_steps==0 rows."""
-    if 'p0' not in arrays or 'Q_total' not in arrays or 'n_steps' not in arrays:
-        return {}
     p0 = np.asarray(arrays['p0'], dtype=np.float64).reshape(-1)
     q = np.asarray(arrays['Q_total'], dtype=np.float64).reshape(-1)
     n_steps = np.asarray(arrays['n_steps']).reshape(-1)
@@ -587,12 +585,9 @@ def save_example_signal_plots(arrays, stats, metrics, plots_dir, *, test_dataset
     noisy_ps = test_input_ps(test_dataset, denorm_stats)
     noise_std = float(denorm_stats.get('noise_std', stats.get('noise_std', 0.0)))
     snr_test = np.asarray(stats['snr_test'], dtype=np.float64).reshape(-1) if 'snr_test' in stats else None
-    source = np.asarray(arrays['source'], dtype=np.int64).reshape(-1) if 'source' in arrays else None
+    source = np.asarray(arrays['source'], dtype=np.int64).reshape(-1)
     candidate_idx = None
     if source_filter is not None:
-        if source is None:
-            print(f'No source labels; skipping examples under {examples_subdir}/', flush=True)
-            return []
         candidate_idx = np.flatnonzero(source[test_idx] == int(source_filter))
         if candidate_idx.size == 0:
             print(f'No test events with source={source_filter}; skipping {examples_subdir}/', flush=True)
@@ -602,7 +597,7 @@ def save_example_signal_plots(arrays, stats, metrics, plots_dir, *, test_dataset
         return []
     applied = np.asarray(arrays['applied_power']).reshape(-1)
     n_steps_arr = np.asarray(arrays['n_steps']).reshape(-1)
-    p0_arr = np.asarray(arrays['p0']).reshape(-1) if 'p0' in arrays else None
+    p0_arr = np.asarray(arrays['p0']).reshape(-1)
     q0_by_p0 = _equilibrium_q0_by_p0(arrays)
     saved = []
     info_rows = []
@@ -623,13 +618,13 @@ def save_example_signal_plots(arrays, stats, metrics, plots_dir, *, test_dataset
         pq = float(pred_q[local_i])
         rpe_p = float(compute_rpe(np.array([pp]), np.array([tp]))[0])
         rpe_q = float(compute_rpe(np.array([pq]), np.array([tq]))[0])
-        p0_v = float(p0_arr[gi]) if p0_arr is not None else float('nan')
+        p0_v = float(p0_arr[gi])
         q0_v = _lookup_q0(q0_by_p0, p0_v)
         if int(n_steps_arr[gi]) == 0 and np.isfinite(tq):
             q0_v = tq
         power = float(applied[gi])
         steps = int(n_steps_arr[gi])
-        src = SOURCE_NAME.get(int(source[gi]), str(source[gi])) if source is not None else '?'
+        src = SOURCE_NAME.get(int(source[gi]), str(source[gi]))
         (fig_e, ax_s) = plt.subplots(figsize=(8.4, 4.6), constrained_layout=True)
         _plot_example_lineshape(ax_s, freq, ps)
         path_e = examples_dir / f'test_example_{gi:05d}_nsteps{steps:04d}.png'
@@ -672,8 +667,8 @@ def write_pq_report(model, test_ds, stats, dataset_stats, arrays, history, best_
     pred_csv = out_dir / 'test_predictions.csv'
     save_predictions_csv(
         metrics, pred_csv, test_idx=test_idx,
-        p0=np.asarray(arrays['p0']).reshape(-1)[test_idx] if 'p0' in arrays else None,
-        source=np.asarray(arrays['source']).reshape(-1)[test_idx] if 'source' in arrays else None,
+        p0=np.asarray(arrays['p0']).reshape(-1)[test_idx],
+        source=np.asarray(arrays['source']).reshape(-1)[test_idx],
         n_steps=np.asarray(arrays['n_steps']).reshape(-1)[test_idx],
         applied_power=np.asarray(arrays['applied_power']).reshape(-1)[test_idx],
     )
