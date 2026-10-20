@@ -81,3 +81,6 @@ def test_run_optimal_profile_polarization_saves_each_step():
     np.testing.assert_allclose(traj["p_full"][0], 0.45, atol=1e-5)
     assert np.all(np.isfinite(traj["q_full"]))
     assert traj["n_steps"] >= 5
+    moved = not np.allclose(traj["iplus_full"][-1] + traj["iminus_full"][-1], traj["iplus_full"][0] + traj["iminus_full"][0])
+    if moved:
+        assert traj["p_full"].ptp() > 1e-6 or traj["q_full"].ptp() > 1e-6
