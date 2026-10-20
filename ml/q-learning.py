@@ -205,7 +205,7 @@ def _read_lookup_pickle(path):
 def load_mapper(config):
     lookup_path = Path(config.lookup_path)
     if not lookup_path.is_file():
-        raise FileNotFoundError(f'Lookup table not found at {lookup_path}. Run Data_Creation/lookup_table.py first.')
+        raise FileNotFoundError(f'Lookup table not found at {lookup_path}.')
     mapping_data = _read_lookup_pickle(lookup_path)
     mapper = ssRFMapper(config.f, config.sigma, config.gamma, x0=0.0, amp=0.001)
     mapper.compute_lookup_tables(mapping_data)

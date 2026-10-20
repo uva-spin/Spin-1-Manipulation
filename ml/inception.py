@@ -7,7 +7,7 @@ those branches, and a residual shortcut is added every three modules.
 Adaptive average and max pools then keep a coarse frequency grid for the
 P and Q heads. Per-bin channels:
 
-  [Ps, power_profile, n_steps]  (n_steps is broadcast to every bin)
+  [Ps, power_profile, rf_dose, n_steps]  (n_steps is broadcast to every bin)
 
 Targets:
   P_total, Q_total from ``spectra.npz`` (population n+−n− / n+−2n0+n−)

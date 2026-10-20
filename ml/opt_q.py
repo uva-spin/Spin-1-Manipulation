@@ -54,14 +54,7 @@ def initially_negative_q_bins(iplus, iminus):
 
 
 def equilibrium_spin1_intensities(polarization, f):
-    """ssRF-beta analytic Pake (Boltzmann) lineshape in Spin1 intensity units.
-
-    Dulya fit (commented):
-        from bin_setup import equilibrium_lineshape, get_shape_params, spin1_scale_factors
-        _, ip_fit, im_fit = equilibrium_lineshape(polarization, f, get_shape_params())
-        to_spin1, _ = spin1_scale_factors(polarization, ip_fit, im_fit)
-        return ip_fit * to_spin1, im_fit * to_spin1
-    """
+    """Analytic Pake (Boltzmann) lineshape in Spin1 intensity units."""
     f = np.asarray(f, dtype=float)
     params = Spin1Params(
         n_bins=int(f.size),

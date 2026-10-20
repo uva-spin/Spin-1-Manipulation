@@ -531,7 +531,7 @@ def plot_q_table(q_table, output_path):
 def main():
     config = BurnConfig(max_burns=MAX_BURNS, enforce_full_spectrum=FREE_BIN_SELECTION)
     polarizations = np.linspace(0.4, 0.5, 20)
-    print(f'Training SARSA agent with rivanna physics.rf ({config.rf_mode}, only_Q<0 bins={config.only_negative_initial_q}, theta_Q_filter={config.q_filter_use_theta})...')
+    print(f'Training SARSA agent with physics.rf ({config.rf_mode}, only_Q<0 bins={config.only_negative_initial_q}, theta_Q_filter={config.q_filter_use_theta})...')
     (agent, env, stats) = train(config, episodes=EPISODES, polarizations=polarizations, seed=SEED)
     np.save(OUTPUT_DIR / 'sarsa_table.npy', agent.q_table)
     plot_training_returns(stats['episode_returns'], OUTPUT_DIR / 'training_returns.png')

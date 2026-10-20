@@ -8,7 +8,6 @@ from physics.rf.lineshape import boltzmann_Q
 from physics.rf.model import Spin1Model, Spin1Params
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
-RIVANNA = REPO_ROOT / "Data_Creation" / "rivanna"
 
 
 def test_spin1_params_match_ssrf_beta_lineshape_defaults():
@@ -68,21 +67,3 @@ def test_opt_q_equilibrium_does_not_load_fit_params():
     assert opt_q.NUM_BINS == 701
     assert opt_q.F_MIN == -3.0
     assert opt_q.F_MAX == 3.0
-
-
-def test_bin_setup_equilibrium_is_pake_default(monkeypatch):
-    sys.path.insert(0, str(RIVANNA))
-    import bin_setup
-
-    assert bin_setup.LINESHape_MODEL == "pake_default"
-    assert bin_setup.PAKE_GAMMA == 0.05
-    assert bin_setup.PAKE_ASYM == 0.04
-
-    def boom():
-        raise AssertionError("get_shape_params / fit_params.json must not be used")
-
-    monkeypatch.setattr(bin_setup, "get_shape_params", boom)
-    f = np.linspace(-3.0, 3.0, 51)
-    ps, ip, im = bin_setup.equilibrium_lineshape(0.45, f)
-    assert ip.shape == f.shape
-    assert np.all(np.isfinite(ps))
