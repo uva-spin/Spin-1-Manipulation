@@ -249,3 +249,4 @@ class IdealBinModel(Spin1Model):
                         raise RuntimeError("Too many integration substeps; lower rates or steps/tick")
                 finally:
                     self._command_override = None
+            self._sync_level_populations(capture_initial=False)
