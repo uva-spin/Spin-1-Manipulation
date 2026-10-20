@@ -5,9 +5,8 @@ Input sequence (over frequency bins):
   [Ps, power_profile, n_steps]  (n_steps is broadcast to every bin)
 
 ``power_profile`` is the per-bin RF envelope from the NPZ (ssRF Voigt,
-AFP zeros, optimal U(R)), divided by 10. ``n_steps`` is z-scored on the
-training split. Scalar ``applied_power`` is a fallback when
-``power_profile`` is missing.
+AFP zeros, optimal U(R)), z-scored on the training split. ``n_steps`` is
+z-scored the same way.
 
 Targets:
   P_total, Q_total from ``spectra.npz`` (population n+−n− / n+−2n0+n−)
@@ -25,25 +24,24 @@ import torch.nn as nn
 import torch.optim as optim
 
 from utils.constants import (
-    BATCH_SIZE, ML_DIR, DEFAULT_SPECTRA_PATH, DEVICE, DROPOUT,
+    BATCH_SIZE, ML_DIR, DEVICE, DROPOUT,
     HIDDEN_SIZE, LEARNING_RATE, LR_MIN, MAX_GRAD_NORM, MIN_DELTA, NOISE_STD,
     NUM_EPOCHS, NUM_LAYERS, N_EXAMPLE_PLOTS, REL_LOSS_EPS, RESTART_LR_DECAY,
-    RESTART_WARMUP_EPOCHS, SEED, SOURCE_PROFILE, SPECTRUM_R_MAX,
-    SPECTRUM_R_MIN, SOURCE_NAME, STATS_KEYS, TEST_FRAC, T_0, T_MULT, VAL_FRAC,
-    WEIGHT_DECAY,
+    RESTART_WARMUP_EPOCHS, SEED, STATS_KEYS, T_0, T_MULT, WEIGHT_DECAY,
 )
 from utils.helpers import (
     _stats_for_checkpoint, clone_state_dict, json_ready, load_history_json,
     load_npz, make_pq_loaders, parse_int_tuple, prepare_datasets,
-    reload_checkpoint, resolve_power_profile, save_history_json,
+    save_history_json,
 )
 from analysis.pq_report import (
-    compute_rpe, evaluate_model, print_range_stats_table, print_snr_stats,
+    evaluate_model, print_range_stats_table, print_snr_stats,
     save_example_signal_plots, save_plots, save_predictions_csv,
-    save_range_stats_csv, test_input_ps, write_pq_report,
+    save_range_stats_csv, write_pq_report,
 )
 
-DEFAULT_OUTPUT_DIR = ML_DIR / 'results' / 'gru' / 'gru_result_ssrf_afp_combined_v4'
+DEFAULT_SPECTRA_PATH = ML_DIR / 'data' / 'spectra_9.npz'
+DEFAULT_OUTPUT_DIR = ML_DIR / 'results' / 'gru' / 'gru_v13'
 
 class GruModel(nn.Module):
 
