@@ -1,59 +1,33 @@
 # Physics
 
-NMR lineshape calculations and the realtime spin-1 rate-equation model used throughout the repo.
-
-## What's here
+Lineshape helpers and the spin-1 rate-equation model. Training spectra are produced by [`Data_Creation/`](../Data_Creation/README.md), which calls into `physics.rf`. The reinforcement-learning scripts `ml/dqn.py`, `ml/sarsa.py`, and `ml/opt_q.py` call it directly.
 
 ```
 physics/
-├── lineshape/           Analytic Pake powder lineshape, legacy mappers, R&D scripts
-│   ├── Lineshape.py     Core equilibrium lineshape: GenerateVectorLineshape(P, f)
-│   ├── ssRFMapper.py    Legacy lookup-table ssRF mapper
-│   └── rate_eqs_test/   Research scripts (gamma optimization, fitting, SLURM arrays)
-└── rf/                  Primary realtime physics package (see its README)
+├── lineshape/     Analytic Pake powder lineshape
+└── rf/            Realtime rate-equation package (see rf/README.md)
 ```
 
-## Core concepts
+## Spectrum quantities
 
-A deuteron (spin-1) spectrum is stored as **500 frequency bins**. At each bin the signal splits into two branch intensities:
+A deuteron spectrum is a set of frequency bins. Each bin has two branch intensities:
 
-- **I+** — contribution from the +1 ↔ 0 transition
-- **I−** — contribution from the 0 ↔ −1 transition
-
-From these:
+- **I+** from the +1 ↔ 0 transition
+- **I−** from the 0 ↔ −1 transition
 
 ```
-Ps = I+ + I−        (scalar signal)
-Q  = I+ − I−        (local tensor polarization at this bin)
-P  = integrated Ps  (vector polarization over the spectrum)
+Ps = I+ + I−
+Q  = I+ − I−     at one bin
+P  = integrated signal over the spectrum
 ```
 
-Manipulations (ssRF burns, AFP flips) change I+ and I− over time. The realtime model integrates spin-population rate equations under RF, recovery, and optional diffusion.
+ssRF burns and AFP sweeps change I+ and I−. The realtime model steps spin populations under RF, recovery, and optional diffusion.
 
-## `rf/` — main simulation package
+`Data_Creation` saves **500 bins** on R ∈ [−6, 6]. `Spin1Params` in `physics/rf` defaults to **701 bins** on R ∈ [−3, 3]. Those are different grids. The spectrum→P/Q trainers use the 500-bin NPZ.
 
-This is the physics engine used by `Data_Creation/rivanna/` and several ML scripts (`dqn.py`, `sarsa.py`, `opt_q.py`).
+## `lineshape/Lineshape.py`
 
-Key entry points:
-
-| Module | Purpose |
-|--------|---------|
-| `model.py` | `Spin1Model`, `Spin1Params` — integrate burns step-by-step |
-| `rate_equations_realtime.py` | Build models from intensities, configure single-bin ssRF |
-| `voigt_burn_physics.py` | Voigt RF profile in physical R-space |
-
-See [`rf/README.md`](rf/README.md) for parameters and usage.
-
-### Run tests
-
-```bash
-cd physics/rf
-pytest -q
-```
-
-## `lineshape/Lineshape.py` — equilibrium spectrum
-
-Generate an unburned powder lineshape at polarization `P` over frequency grid `f`:
+Unburned powder lineshape at polarization `P`:
 
 ```python
 from physics.lineshape.Lineshape import GenerateVectorLineshape
@@ -61,16 +35,13 @@ from physics.lineshape.Lineshape import GenerateVectorLineshape
 Ps, Iplus, Iminus = GenerateVectorLineshape(0.45, frequency_grid)
 ```
 
-Used by `ml/opt_q.py` and several data-generation scripts.
+## `rf/`
 
-## `lineshape/rate_eqs_test/` — research scripts
+See [`rf/README.md`](rf/README.md) for `Spin1Model`, `Spin1Params`, and the burn helpers.
 
-Older R&D code for per-bin trajectory generation, gamma optimization, and fitting experimental Dulya lineshapes. Much of this functionality has been superseded by `Data_Creation/rivanna/`, but these scripts remain useful for physics experiments.
+```bash
+cd physics/rf
+pytest -q
+```
 
-Contains its own SLURM arrays (`ssrf_traj_array.slurm`, `gamma_opt_array.slurm`, etc.). Run from that directory on the cluster.
-
-**Note:** Some scripts here import modules that may not exist in the current tree (for example `physics/afp.py`). Check imports before running.
-
-## Relationship to data generation
-
-`Data_Creation/rivanna/` imports the model from `physics.rf`. Changes to the physics model belong in `physics/rf/`.
+`pytest.ini` sets `pythonpath = ../..` so imports resolve from the repo root.
