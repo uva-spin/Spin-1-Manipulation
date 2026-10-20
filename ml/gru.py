@@ -2,11 +2,12 @@
 GRU sequence model: manipulated Ps spectrum → scalar P_total and Q_total.
 
 Input sequence (over frequency bins):
-  [Ps, power_profile, n_steps]  (n_steps is broadcast to every bin)
+  [Ps, power_profile, rf_dose, n_steps]  (n_steps is broadcast to every bin)
 
 ``power_profile`` is the per-bin RF envelope from the NPZ (ssRF Voigt,
-AFP zeros, optimal U(R)). Scalar ``applied_power`` is kept for diagnostics
-and as a fallback if ``power_profile`` is missing.
+AFP zeros, optimal U(R)), divided by 10. ``rf_dose`` and ``n_steps`` are
+z-scored on the training split. Scalar ``applied_power`` is a fallback when
+``power_profile`` is missing.
 
 Targets:
   P_total, Q_total from ``spectra.npz`` (population n+−n− / n+−2n0+n−)

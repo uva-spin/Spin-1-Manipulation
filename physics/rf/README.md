@@ -1,32 +1,28 @@
 # physics.rf
 
-Realtime spin-1 rate-equation model for ssRF burns, AFP, recovery, and diffusion on a 500-bin Pake powder lineshape.
+Realtime spin-1 rate equations for ssRF burns, AFP, recovery, and diffusion on a Pake powder lineshape.
 
-## What it simulates
+`Data_Creation/spectrum_gen/` uses this package to write training spectra. `ml/dqn.py`, `ml/sarsa.py`, and `ml/opt_q.py` step the same model while they search for a burn policy.
 
-Given initial branch intensities **I+** and **I−** across 500 frequency bins, the model steps forward in time while RF is applied at a chosen burn center. Each step updates internal spin populations, then converts back to physical intensities.
+## What a step does
 
-With DNP disabled (the usual case in this repo), RF is the main mechanism that changes vector and tensor polarization.
+You start from branch intensities I+ and I−. Each call to `step_once` updates internal spin populations while RF is on or off, then you read intensities back with `physical_intensities()`. With `dnp_enabled=False` (the default), RF is what changes vector and tensor polarization during a burn.
 
-## Key types
+## `Spin1Params` (`model.py`)
 
-### `Spin1Params` (`model.py`)
-
-Configuration dataclass. Important fields:
-
-| Field | Typical value | Meaning |
-|-------|---------------|---------|
-| `n_bins` | 500 | Number of frequency bins |
-| `r_min`, `r_max` | −3, 3 | Burn window in normalized frequency |
+| Field | Default | Meaning |
+|-------|---------|---------|
+| `n_bins` | 701 | Frequency bins |
+| `r_min`, `r_max` | −3, 3 | Frequency window |
 | `p0` | 0.45 | Initial vector polarization |
-| `dt` | 0.015 | Integration timestep |
-| `steps` | 20 | Steps per burn macro-step |
-| `gamma_rf` | varies | RF burn strength |
+| `dt` | 0.0015 | Integration timestep |
+| `steps` | 50 | Steps per burn macro-step |
+| `gamma_rf` | 2.0 | RF burn strength |
 | `dnp_enabled` | False | Dynamic nuclear polarization reservoir |
 
-### `Spin1Model` (`model.py`)
+Training NPZ files from `Data_Creation` use 500 bins on R ∈ [−6, 6]. Pass `n_bins`, `r_min`, and `r_max` when you want that grid. The snippet below does.
 
-The simulation object. Typical usage:
+## Typical call
 
 ```python
 from physics.rf import (
@@ -36,7 +32,7 @@ from physics.rf import (
     configure_single_bin_ssrf,
 )
 
-params = Spin1Params(n_bins=500, p0=0.45, gamma_rf=10.0, steps=20)
+params = Spin1Params(n_bins=500, r_min=-6.0, r_max=6.0, p0=0.45, gamma_rf=10.0, steps=20)
 model = build_model_for_intensities(iplus, iminus, params=params, p0=0.45)
 configure_single_bin_ssrf(model, bin_idx=172, gamma_rf=10.0)
 
@@ -46,17 +42,17 @@ for _ in range(params.steps):
 iplus_new, iminus_new, _ = model.physical_intensities()
 ```
 
-## Helper module: `rate_equations_realtime.py`
+## `rate_equations_realtime.py`
 
 | Function | Purpose |
 |----------|---------|
-| `build_model_for_intensities` | Create a `Spin1Model` from I+/I− arrays |
-| `configure_single_bin_ssrf` | Point RF at one bin with a given `gamma_rf` |
+| `build_model_for_intensities` | Build a `Spin1Model` from I+ and I− arrays |
+| `configure_single_bin_ssrf` | Aim RF at one bin |
 | `configure_physical_voigt_ssrf` | Install a physical-R Voigt RF profile |
-| `burn_preserves_ps_sign` | Check that a burn step did not flip Ps sign |
-| `burn_preserves_branch_order` | Check that I+ ≥ I− ordering is preserved |
+| `burn_preserves_ps_sign` | True when a burn step did not flip the sign of Ps |
+| `burn_preserves_branch_order` | True when I+ stays at or above I− |
 
-These guards are used by `ml/opt_q.py` when searching for valid burn parameters.
+`ml/opt_q.py` uses the two checks while it searches burn parameters.
 
 ## Tests
 
@@ -64,11 +60,3 @@ These guards are used by `ml/opt_q.py` when searching for valid burn parameters.
 cd physics/rf
 pytest -q
 ```
-
-`pytest.ini` sets `pythonpath = ../..` so imports resolve from the repo root.
-
-## Used by
-
-- `Data_Creation/rivanna/` — training data generation (`from physics.rf import …`)
-- `ml/dqn.py`, `ml/sarsa.py` — reinforcement-learning burn policies
-- `ml/opt_q.py` — greedy incremental Q optimization

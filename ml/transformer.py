@@ -3,7 +3,7 @@ Transformer encoder: manipulated Ps spectrum → scalar P_total and Q_total.
 
 Same task and data as ``ml/lstm.py``. Frequency bins are a sequence of
 
-  [Ps, power_profile, n_steps]  (n_steps is broadcast to every bin)
+  [Ps, power_profile, rf_dose, n_steps]  (n_steps is broadcast to every bin)
 
 A local convolutional token embedding, sinusoidal positional encoding, and
 a pre-norm encoder stack read the spectrum. Adaptive average and max pools

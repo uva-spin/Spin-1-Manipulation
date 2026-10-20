@@ -7,7 +7,7 @@ widths are sized to about the same trainable-parameter count as
 ``CnnPQModel`` on the 500-bin spectra.
 
 Per-bin channels:
-  [Ps, power_profile, n_steps]  (n_steps is broadcast to every bin)
+  [Ps, power_profile, rf_dose, n_steps]  (n_steps is broadcast to every bin)
 
 Targets:
   P_total, Q_total from ``spectra.npz`` (population n+−n− / n+−2n0+n−)

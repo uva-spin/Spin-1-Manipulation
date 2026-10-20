@@ -1,20 +1,18 @@
 """
-Denoising Autoencoder (DAE) for 500-point NMR signals.
+Denoising autoencoder for 500-bin NMR signals.
 
-Uses Ps (Iplus + Iminus) at each bin as the training target. Loads the same
-Voigt-burn ``spectra.npz`` as ``spectrum_pq.py`` (shape N×2×500: I+, I-),
-forms Ps, applies noise BEFORE normalizing, then trains a simple DAE to denoise.
+The target is Ps = I+ + I− from a spectra.npz of shape (N, 2, 500).
+Noise is added before normalization. Pass --spectra to a file from
+Data_Creation/create_data.py. If --spectra is omitted, the script looks for:
 
-Default NPZ search order matches spectrum_pq:
   Data_Creation/dae_voigt_burn_spectra/spectra.npz
   ml/dae_voigt_burn_spectra/spectra.npz
 
-For use with the DAE+combined pipeline (dae_combined_pipeline.py), train with
---no-scale-01 so the DAE output is in raw Ps scale compatible with the combined model.
+--no-scale-01 leaves the output in raw Ps units instead of scaling each
+spectrum to [0, 1].
 
 Usage:
-  python ml/dae.py
-  python ml/dae.py --spectra Data_Creation/dae_voigt_burn_spectra/spectra.npz --noise-std 0.1
+  python ml/dae.py --spectra Data_Creation/spectra_data/spectra.npz --noise-std 0.1
   python ml/dae.py --test-only --checkpoint ml/results/dae/dae_denoise_results/dae_denoise_500.pth
 """
 import argparse
@@ -112,7 +110,7 @@ def _minmax_scale_01(x):
     return (x - x_min) / span
 
 def resolve_spectra_path(spectra=None):
-    """Resolve spectra.npz path (same search order as spectrum_pq.py)."""
+    """Resolve spectra.npz path from --spectra or the default candidate list."""
     if spectra is not None:
         path = Path(spectra)
         if path.is_file():
@@ -472,7 +470,7 @@ def run_test(model, test_dataset, stats, device, output_dir, noise_std, P_test, 
 
 def parse_args():
     parser = argparse.ArgumentParser(description='Train DAE to denoise 500-point NMR signals.')
-    parser.add_argument('--spectra', type=str, default=None, help='Path to spectra.npz (same file as spectrum_pq.py). Default: search Data_Creation/ then ml/ dae_voigt_burn_spectra/')
+    parser.add_argument('--spectra', type=str, default=None, help='Path to spectra.npz. Default: search Data_Creation/ then ml/ dae_voigt_burn_spectra/')
     parser.add_argument('--test-frac', type=float, default=0.2, help='Fraction of spectra held out as test (default: 0.2)')
     parser.add_argument('--output-dir', type=str, default=str(DEFAULT_OUTPUT_DIR), help=f'Directory for model and plots (default: {DEFAULT_OUTPUT_DIR})')
     parser.add_argument('--noise-std', type=float, default=0.3, help='Noise level (fraction of signal std). Applied before scaling.')
