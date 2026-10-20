@@ -48,27 +48,15 @@ python Data_Creation/create_data.py --ssrf --afp --unmanipulated \
   --no-plots
 ```
 
-### 2. Put the file where the trainers look
+### 2. Train
 
-`ml/lstm.py` and `ml/gru.py` always load `ml/data/spectra.npz`. They have no `--spectra` argument.
-
-```bash
-mkdir -p ml/data
-cp Data_Creation/spectra_data/spectra.npz ml/data/spectra.npz
-```
-
-`cnn.py`, `mlp.py`, `transformer.py`, `inception.py`, `old_model.py`, and `eval_model.py` take `--spectra`, so they can read the Data_Creation path directly.
-
-### 3. Train
-
-`lstm.py` and `gru.py` import `utils` as a top-level package. Run them from `ml/`:
+All spectrum models take `--spectra`. If you omit it, they load `ml/data/spectra.npz`.
 
 ```bash
-cd ml
-python lstm.py
+python ml/lstm.py --spectra Data_Creation/spectra_data/spectra.npz
 ```
 
-The default run is 500 epochs (`NUM_EPOCHS` in `ml/utils/constants.py`). The checkpoint and plots go to `ml/results/lstm/lstm_result_ssrf_afp_combined_v6/`.
+The default run is 500 epochs (`NUM_EPOCHS` in `ml/utils/constants.py`). The checkpoint and plots go to `ml/results/lstm/lstm_result_ssrf_afp_combined_v7/`.
 
 A short run of another model, from the repo root:
 
@@ -79,12 +67,11 @@ python ml/cnn.py \
   --max-samples 2000
 ```
 
-Each of these models reads four values per frequency bin:
+Each of these models reads three values per frequency bin:
 
 1. Ps, z-scored on the training split
 2. per-bin RF power profile, divided by 10
-3. cumulative RF dose (`rf_dose`), z-scored on the training split
-4. `n_steps`, z-scored and repeated on every bin
+3. `n_steps`, z-scored and repeated on every bin
 
 Train, validation, and test splits follow `run_id`, so frames from one trajectory stay in one split. Dataset prep adds Gaussian noise to Ps (`NOISE_STD = 0.01` in `ml/utils/constants.py`).
 
