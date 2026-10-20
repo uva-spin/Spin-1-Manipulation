@@ -31,12 +31,13 @@ def resolve_power_profile(arrays):
 def load_npz(path):
     """Load spectra from a ``.npz`` file, fully into RAM."""
     flat = ('spectra', 'power_profile')
+    columns = (
+        'p0', 'center_bin', 'source', 'burn_steps', 'relax_steps',
+        'applied_power', 'n_steps', 'P_total', 'Q_total',
+    )
     with np.load(path, allow_pickle=False) as raw:
         out = {k: np.asarray(raw[k]) for k in flat}
-        out.update({k: np.asarray(raw[k]).reshape(-1) for k in (
-            'p0', 'center_bin', 'source', 'run_id', 'burn_steps', 'relax_steps',
-            'applied_power', 'n_steps', 'P_total', 'Q_total',
-        )})
+        out.update({k: np.asarray(raw[k]).reshape(-1) for k in columns if k in raw.files})
     out['spectra'] = out['spectra'].astype(np.float32, copy=False)
     out['applied_power'] = sanitize_applied_power(out['applied_power'], out['source'])
     out['power_profile'] = resolve_power_profile(out)
@@ -59,31 +60,20 @@ def prepare_datasets(arrays, *, val_frac=VAL_FRAC, test_frac=TEST_FRAC, seed=SEE
     y_p = np.asarray(arrays['P_total'], dtype=np.float32).reshape(-1)
     y_q = np.asarray(arrays['Q_total'], dtype=np.float32).reshape(-1)
     p0 = np.asarray(arrays['p0']).reshape(-1)
-    run_id = np.asarray(arrays['run_id'], dtype=np.int64).reshape(-1)
-    
+
     rng = np.random.default_rng(seed)
     if max_samples is not None and max_samples < n:
         keep = np.sort(rng.choice(n, size=int(max_samples), replace=False))
     else:
         keep = np.arange(n, dtype=np.int64)
 
-    unique_runs = np.unique(run_id[keep])
-    n_runs = len(unique_runs)
-    perm_runs = rng.permutation(n_runs)
-    n_test_runs = max(1, round(n_runs * test_frac))
-    n_val_runs = max(1, round(n_runs * val_frac))
-    
-    test_runs = unique_runs[perm_runs[:n_test_runs]]
-    val_runs = unique_runs[perm_runs[n_test_runs:n_test_runs + n_val_runs]]
-    train_runs = unique_runs[perm_runs[n_test_runs + n_val_runs:]]
-    
-    train_mask = np.isin(run_id[keep], train_runs)
-    val_mask = np.isin(run_id[keep], val_runs)
-    test_mask = np.isin(run_id[keep], test_runs)
-    
-    local_train = np.flatnonzero(train_mask)
-    local_val = np.flatnonzero(val_mask)
-    local_test = np.flatnonzero(test_mask)
+    n_keep = int(keep.size)
+    perm = rng.permutation(n_keep)
+    n_test = max(1, round(n_keep * test_frac))
+    n_val = max(1, round(n_keep * val_frac))
+    local_test = np.sort(perm[:n_test])
+    local_val = np.sort(perm[n_test:n_test + n_val])
+    local_train = np.sort(perm[n_test + n_val:])
     
     train_global = keep[local_train]
     val_global = keep[local_val]
@@ -98,8 +88,10 @@ def prepare_datasets(arrays, *, val_frac=VAL_FRAC, test_frac=TEST_FRAC, seed=SEE
         snr_all = np.full(keep.size, np.nan, dtype=np.float64)
         ps = clean
     
-    max_gamma = 10.0
-    pwr = np.asarray(power_profile[keep], dtype=np.float32) / max_gamma
+    pwr = np.asarray(power_profile[keep], dtype=np.float32)
+    pwr_mean = float(pwr[local_train].mean())
+    pwr_std = float(pwr[local_train].std())
+    pwr_std = pwr_std if pwr_std > 1e-08 else 1.0
 
     n_steps_k = n_steps[keep]
     y_p_k = y_p[keep]
@@ -123,7 +115,7 @@ def prepare_datasets(arrays, *, val_frac=VAL_FRAC, test_frac=TEST_FRAC, seed=SEE
     def _pack(indices):
         t = ps.shape[1]
         ps_n = (ps[indices] - ps_mean) / ps_std
-        pwr_n = pwr[indices]
+        pwr_n = (pwr[indices] - pwr_mean) / pwr_std
         steps_n = (n_steps_k[indices] - steps_mean) / steps_std
         steps_seq = np.broadcast_to(steps_n.reshape(-1, 1), (indices.size, t))
         x = np.stack([ps_n, pwr_n, steps_seq], axis=-1).astype(np.float32)
@@ -136,7 +128,7 @@ def prepare_datasets(arrays, *, val_frac=VAL_FRAC, test_frac=TEST_FRAC, seed=SEE
 
     p0_test = p0[test_global]
     stats = {
-        'ps_mean': ps_mean, 'ps_std': ps_std,
+        'ps_mean': ps_mean, 'ps_std': ps_std, 'pwr_mean': pwr_mean, 'pwr_std': pwr_std,
         'steps_mean': steps_mean, 'steps_std': steps_std, 'P_mean': p_mean, 'P_std': p_std,
         'Q_mean': q_mean, 'Q_std': q_std, 'input_size': 3, 'num_bins': n_bins,
         'n_train': int(train_global.size), 'n_val': int(val_global.size), 'n_test': int(test_global.size),

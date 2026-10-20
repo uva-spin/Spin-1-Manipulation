@@ -5,17 +5,15 @@ Input sequence (over frequency bins, bin order kept):
   [Ps, power_profile, n_steps]  (n_steps is broadcast to every bin)
 
 ``power_profile`` is the per-bin RF envelope from the NPZ (ssRF Voigt, AFP zeros,
-optimal U(R)), physically scaled by dividing by max_gamma (10.0).
-
-``n_steps`` is the number of time steps for this frame, normalized (z-scored)
-from training data. The loader shuffles which spectra share a batch. It does
-not reorder frequency bins inside a spectrum.
+optimal U(R)), z-scored on the training split. ``n_steps`` is the number of
+time steps for this frame, z-scored the same way. The loader shuffles which
+spectra share a batch. It does not reorder frequency bins inside a spectrum.
 
 Targets:
   P_total, Q_total from ``spectra.npz`` (population n+−n− / n+−2n0+n−)
 
 Usage:
-  python ml/lstm.py --spectra ml/data/spectra.npz
+  python ml/lstm.py --spectra ml/data/spectra_v6.npz
   python ml/lstm.py --test-only
 """
 import argparse
@@ -27,7 +25,7 @@ import torch.nn as nn
 import torch.optim as optim
 
 from utils.constants import (
-    BATCH_SIZE, DEFAULT_OUTPUT_DIR, DEFAULT_SPECTRA_PATH, DEVICE, DROPOUT,
+    BATCH_SIZE, DEVICE, DROPOUT,
     LEARNING_RATE, LR_MIN, MAX_GRAD_NORM, MIN_DELTA, NOISE_STD,
     NUM_EPOCHS, NUM_LAYERS, N_EXAMPLE_PLOTS, REL_LOSS_EPS, RESTART_LR_DECAY,
     RESTART_WARMUP_EPOCHS, SEED, SOURCE_PROFILE, SPECTRUM_R_MAX,
@@ -45,7 +43,9 @@ from analysis.pq_report import (
     save_range_stats_csv, test_input_ps, write_pq_report,
 )
 
-HIDDEN_SIZE = 32
+HIDDEN_SIZE = 128
+DEFAULT_SPECTRA_PATH = Path(__file__).parent / 'data' / 'spectra_9.npz'
+DEFAULT_OUTPUT_DIR = Path(__file__).parent / 'results' / 'lstm' / 'lstm_v12'
 
 class LstmModel(nn.Module):
 
@@ -56,7 +56,7 @@ class LstmModel(nn.Module):
         self.num_layers = num_layers
         enc_dropout = dropout if num_layers > 1 else 0.0
         self.encoder = nn.LSTM(input_size=self.input_size, hidden_size=self.hidden_size, num_layers=self.num_layers, batch_first=True, bidirectional=True, dropout=enc_dropout, device=DEVICE)
-        trunk_dim = 4 * self.hidden_size
+        trunk_dim = 2 * self.hidden_size
         self.head_p = nn.Linear(trunk_dim, 1)
         self.head_q = nn.Linear(trunk_dim, 1)
         self._initialize_weights()
@@ -70,7 +70,7 @@ class LstmModel(nn.Module):
 
     def forward(self, x):
         (enc_out, _) = self.encoder(x)
-        ctx = torch.cat((enc_out.mean(dim=1), enc_out.amax(dim=1)), dim=1)
+        ctx = enc_out.mean(dim=1)
         return (self.head_p(ctx).squeeze(-1), self.head_q(ctx).squeeze(-1))
 
 def relative_weighted_loss(pred_z, true_z, *, mean, std, eps=REL_LOSS_EPS):
@@ -336,8 +336,8 @@ def main():
         (model, best_val, history) = train_model(
             train_ds, val_ds, stats, hidden_size=HIDDEN_SIZE, num_layers=NUM_LAYERS,
             dropout=DROPOUT, num_epochs=NUM_EPOCHS, batch_size=BATCH_SIZE,
-            learning_rate=LEARNING_RATE, checkpoint_path=checkpoint_path,
-            restart_decay=RESTART_LR_DECAY, warmup_epochs=RESTART_WARMUP_EPOCHS,
+            learning_rate=0.001, checkpoint_path=checkpoint_path,
+            restart_decay=1.0, warmup_epochs=0,
         )
         save_history_json(history, history_path)
     write_pq_report(

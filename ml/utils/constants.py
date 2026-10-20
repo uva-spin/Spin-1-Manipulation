@@ -3,8 +3,8 @@ from pathlib import Path
 import torch
 
 ML_DIR = Path(__file__).resolve().parent.parent
-DEFAULT_SPECTRA_PATH = ML_DIR / 'data' / 'spectra.npz'
-DEFAULT_OUTPUT_DIR = ML_DIR / 'results' / 'lstm' / 'lstm_result_ssrf_afp_combined_v7'
+DEFAULT_SPECTRA_PATH = ML_DIR / 'data' / 'spectra_9.npz'
+DEFAULT_OUTPUT_DIR = ML_DIR / 'results' / 'lstm' / 'lstm_v11'
 SEED = 42
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 NUM_EPOCHS = 500
