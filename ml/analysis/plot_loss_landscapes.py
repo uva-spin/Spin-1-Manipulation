@@ -180,10 +180,7 @@ def build_eval_batch(
     spectra = arrays["spectra"]
     n = int(spectra.shape[0])
     n_bins = int(spectra.shape[2])
-    if "power_profile" in arrays and arrays["power_profile"] is not None:
-        power_profile = arrays["power_profile"]
-    else:
-        power_profile = lstm_pq.resolve_power_profile(arrays)
+    power_profile = arrays["power_profile"]
     n_steps = np.asarray(arrays["n_steps"]).reshape(-1)
     y_p = np.asarray(arrays["P_total"], dtype=np.float32).reshape(-1)
     y_q = np.asarray(arrays["Q_total"], dtype=np.float32).reshape(-1)

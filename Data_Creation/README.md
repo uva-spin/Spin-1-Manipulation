@@ -14,12 +14,10 @@ Output: `Data_Creation/spectra_data/spectra.npz`, shape `(N, 2, 500)` for I+ and
 
 `--quick` fixes the grid: P ∈ {0.30, 0.50}, three centers per P, burn and relax steps `0, 5, …, 100`. Modes are ssRF, per-bin AFP, and the optimal profile.
 
-Copy that file before training `lstm.py` or `gru.py`. Those two scripts only read `ml/data/spectra.npz`:
+Train on that file:
 
 ```bash
-mkdir -p ml/data
-cp Data_Creation/spectra_data/spectra.npz ml/data/spectra.npz
-cd ml && python lstm.py
+python ml/lstm.py --spectra Data_Creation/spectra_data/spectra.npz
 ```
 
 ## Modes
@@ -82,7 +80,6 @@ python Data_Creation/create_data.py \
 | `spectra` | `(N, 2, 500)` I+ / I− |
 | `P_total`, `Q_total` | Target polarizations |
 | `power_profile` | `(N, 500)` per-bin RF envelope |
-| `rf_dose` | `(N, 500)` cumulative per-bin RF dose (∫ γ dt, excluding the AFP envelope) |
 | `applied_power` | Peak γ for the event |
 | `n_steps` | Step count saved for this frame |
 | `burn_steps`, `relax_steps` | Burn-phase and relax-phase counts |

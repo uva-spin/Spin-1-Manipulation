@@ -117,28 +117,14 @@ def _coerce_power_profile(power_profile, *, source, num_bins=NUM_BINS):
         prof = np.zeros(n, dtype=np.float64)
     return prof.astype(STORE_DTYPE, copy=False)
 
-def _sanitize_saved_arrays(data, *, num_bins=NUM_BINS):
+def _sanitize_saved_arrays(data):
     """Ensure NPZ arrays are finite; unmanipulated power_profile is all zeros."""
-    if 'power_profile' not in data or data['power_profile'] is None:
-        n = int(data['spectra'].shape[0]) if data['spectra'].size else 0
-        data['power_profile'] = np.zeros((n, int(num_bins)), dtype=STORE_DTYPE)
-        return data
-    pp = np.asarray(data['power_profile'], dtype=np.float64)
-    if pp.ndim == 1 and data['spectra'].shape[0] == 1:
-        pp = pp.reshape(1, -1)
-    pp = np.nan_to_num(pp, nan=0.0, posinf=0.0, neginf=0.0)
-    if 'source' in data and pp.ndim == 2:
-        src = np.asarray(data['source']).reshape(-1)
-        if src.shape[0] == pp.shape[0]:
-            unmanip = src == SOURCE_UNMANIP
-            if np.any(unmanip):
-                pp[unmanip] = 0.0
+    src = np.asarray(data['source']).reshape(-1)
+    pp = np.nan_to_num(np.asarray(data['power_profile'], dtype=np.float64), nan=0.0, posinf=0.0, neginf=0.0)
+    pp[src == SOURCE_UNMANIP] = 0.0
     data['power_profile'] = pp.astype(STORE_DTYPE, copy=False)
-    ap = np.asarray(data['applied_power'], dtype=np.float64).reshape(-1)
-    ap = np.nan_to_num(ap, nan=0.0, posinf=0.0, neginf=0.0)
-    if 'source' in data and ap.shape[0] == data['source'].shape[0]:
-        src = np.asarray(data['source']).reshape(-1)
-        ap[(src == SOURCE_UNMANIP) | (src == SOURCE_AFP)] = 0.0
+    ap = np.nan_to_num(np.asarray(data['applied_power'], dtype=np.float64).reshape(-1), nan=0.0, posinf=0.0, neginf=0.0)
+    ap[(src == SOURCE_UNMANIP) | (src == SOURCE_AFP)] = 0.0
     data['applied_power'] = ap.astype(STORE_DTYPE, copy=False)
     return data
 

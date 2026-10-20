@@ -308,7 +308,7 @@ def save_example_plots(
             rates = np.asarray(rates_info['rates'], dtype=float).reshape(-1)
             f_u = np.asarray(rates_info.get('frequency', f), dtype=float).reshape(-1)
             peak = float(rates_info.get('peak_u', power))
-        elif 'power_profile' in data:
+        else:
             rates = np.asarray(data['power_profile'][idx[0]], dtype=float).reshape(-1)
         if rates is not None and rates.size and f_u.size == rates.size:
             fig, ax = plt.subplots(figsize=(8.5, 5.2))

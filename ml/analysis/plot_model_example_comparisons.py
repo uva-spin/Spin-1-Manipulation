@@ -313,19 +313,17 @@ def save_summary_csv(wide_sel: pd.DataFrame, model_labels: list[str], path: Path
 
 def load_event_meta(spectra_path: Path, event_indices: np.ndarray) -> dict[int, dict]:
     with np.load(spectra_path, allow_pickle=False) as raw:
-        source = np.asarray(raw["source"]).reshape(-1) if "source" in raw.files else None
+        source = np.asarray(raw["source"]).reshape(-1)
         n_steps = np.asarray(raw["n_steps"]).reshape(-1)
-        p0 = np.asarray(raw["p0"]).reshape(-1) if "p0" in raw.files else None
-    meta = {}
-    for e in event_indices:
-        gi = int(e)
-        entry = {"n_steps": int(n_steps[gi])}
-        if source is not None:
-            entry["source"] = SOURCE_NAME.get(int(source[gi]), str(int(source[gi])))
-        if p0 is not None:
-            entry["p0"] = float(p0[gi])
-        meta[gi] = entry
-    return meta
+        p0 = np.asarray(raw["p0"]).reshape(-1)
+    return {
+        int(e): {
+            "n_steps": int(n_steps[int(e)]),
+            "source": SOURCE_NAME.get(int(source[int(e)]), str(int(source[int(e)]))),
+            "p0": float(p0[int(e)]),
+        }
+        for e in event_indices
+    }
 
 
 def main() -> None:

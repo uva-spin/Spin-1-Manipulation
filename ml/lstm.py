@@ -1,23 +1,21 @@
 """
 LSTM sequence model: manipulated Ps spectrum → scalar P_total and Q_total.
 
-Input sequence (over frequency bins):
-  [Ps, power_profile, rf_dose, n_steps]  (n_steps is broadcast to every bin)
+Input sequence (over frequency bins, bin order kept):
+  [Ps, power_profile, n_steps]  (n_steps is broadcast to every bin)
 
 ``power_profile`` is the per-bin RF envelope from the NPZ (ssRF Voigt, AFP zeros,
 optimal U(R)), physically scaled by dividing by max_gamma (10.0).
 
-``rf_dose`` is the cumulative per-bin RF dose (integral of gamma*dt per bin,
-excluding AFP envelope), normalized (z-scored) from training data.
-
 ``n_steps`` is the number of time steps for this frame, normalized (z-scored)
-from training data.
+from training data. The loader shuffles which spectra share a batch. It does
+not reorder frequency bins inside a spectrum.
 
 Targets:
   P_total, Q_total from ``spectra.npz`` (population n+−n− / n+−2n0+n−)
 
 Usage:
-  python ml/lstm.py
+  python ml/lstm.py --spectra ml/data/spectra.npz
   python ml/lstm.py --test-only
 """
 import argparse
@@ -51,7 +49,7 @@ HIDDEN_SIZE = 32
 
 class LstmModel(nn.Module):
 
-    def __init__(self, input_size=4, hidden_size=HIDDEN_SIZE, num_layers=NUM_LAYERS, dropout=DROPOUT):
+    def __init__(self, input_size=3, hidden_size=HIDDEN_SIZE, num_layers=NUM_LAYERS, dropout=DROPOUT):
         super().__init__()
         self.input_size = input_size
         self.hidden_size = hidden_size
@@ -301,6 +299,7 @@ def train_model(train_dataset, val_dataset, stats, *, hidden_size, num_layers, d
 
 def main():
     parser = argparse.ArgumentParser(description='Train/evaluate LSTM seq model: Ps spectrum + per-bin power profile → P_total, Q_total.')
+    parser.add_argument('--spectra', type=Path, default=DEFAULT_SPECTRA_PATH, help='Path to spectra.npz')
     parser.add_argument('--test-only', action='store_true', help='Skip training; load checkpoint and evaluate on a fresh split')
     args = parser.parse_args()
     torch.manual_seed(SEED)
@@ -308,7 +307,7 @@ def main():
     out_dir = DEFAULT_OUTPUT_DIR
     out_dir.mkdir(parents=True, exist_ok=True)
     checkpoint_path = out_dir / 'lstm_best.pth'
-    spectra_path = DEFAULT_SPECTRA_PATH
+    spectra_path = args.spectra or DEFAULT_SPECTRA_PATH
     print(f'Loading spectra from {spectra_path} ...', flush=True)
     arrays = load_npz(spectra_path)
     print('Preparing datasets...', flush=True)
