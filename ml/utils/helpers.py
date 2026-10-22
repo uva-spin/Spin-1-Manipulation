@@ -138,6 +138,15 @@ def prepare_datasets(arrays, *, val_frac=VAL_FRAC, test_frac=TEST_FRAC, seed=SEE
     return (train_ds, val_ds, test_ds, stats)
 
 
+def keep_ps_channel(train_ds, val_ds, test_ds, stats):
+    """Drop power_profile and n_steps; keep only the Ps channel (index 0)."""
+    def _one(ds):
+        (x, yp, yq) = ds.tensors
+        return data.TensorDataset(x[..., :1].contiguous(), yp, yq)
+
+    return (_one(train_ds), _one(val_ds), _one(test_ds), {**stats, 'input_size': 1})
+
+
 def clone_state_dict(model):
     return {k: v.detach().cpu().clone() for (k, v) in model.state_dict().items()}
 
