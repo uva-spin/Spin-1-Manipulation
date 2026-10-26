@@ -6,11 +6,11 @@ Python API for a LabVIEW Python Node that simulates a Dulya lineshape and applie
 
 1. Point the LabVIEW Python Node (or session) at this folder, or ensure the repo root `Spin-1-Manipulation` is on `sys.path`.
 2. Use a Python environment that can import `numpy`, `scipy`, and this repo’s `physics` / `Data_Creation` packages (e.g. the project conda env).
-3. Have a Dulya fit JSON available (repo default: `Data_Creation/fit_params.json`).
+3. Optionally supply a Dulya fit JSON (`Data_Creation/fit_params.json`). Leave the path empty (default) to use the analytic Pake lineshape, same as `create_data.py` without `--fit-params`.
 
 ## Call order
 
-1. **Once per session:** `InitSim(fit_params_path, P0, Q0=-1, n_bins=500)`
+1. **Once per session:** `InitSim(fit_params_path='', P0, Q0=-1, n_bins=500)`
 2. **Loop / events:** `main(cmd, dt, burn_R, gamma_rf, n_steps, afp_mode, efficiency, rf_mode)`
 
 `InitSim` and every `main` call return the same tuple for stable wiring:
@@ -33,7 +33,14 @@ Python API for a LabVIEW Python Node that simulates a Dulya lineshape and applie
 | 3 | afp | Instantaneous AFP (`afp_mode`: 0 = all Q&lt;0, 1 = selective window around `burn_R`) |
 | 4 | ssrf_profile | Design + apply optimal ssRF profile on current state (can take seconds) |
 | 5 | afp_profile | AFP over the full Q&lt;0 profile |
-| 6 | reset | Rebuild Dulya equilibrium from the last `InitSim` parameters |
+| 6 | reset | Rebuild equilibrium from the last `InitSim` parameters |
+
+### `InitSim` fit path
+
+| `fit_params_path` | Equilibrium |
+|-------------------|-------------|
+| `''` / empty (default) | Analytic Pake (`create_data.py` default) |
+| path to fit JSON | Frozen Dulya fit seated via `use_fit_params` |
 
 ### Useful arguments
 
@@ -51,7 +58,7 @@ Unused args for a given `cmd` may be left at defaults.
 
 ## Suggested LabVIEW wiring
 
-1. **Init** frame: call `InitSim` with path to `fit_params.json` and desired `P0`.
+1. **Init** frame: call `InitSim` with desired `P0`; leave `fit_params_path` empty unless you want a Dulya fit.
 2. **Timed loop:** call `main(1, dt, …)` each tick for continuous recovery; wire `freq`/`intensity` to an XY Graph.
 3. **Buttons / events:** call `main(2|3|4|5, …)` with burn/AFP parameters when the operator applies a manipulation.
 4. Display `P`, `Q`, `t`, and `status` on indicators.
@@ -62,10 +69,12 @@ Persistence is in Python module globals (`model`, spectrum cache). You do **not*
 
 ```python
 from ml.labview_sim.labview_sim import InitSim, main
-from pathlib import Path
 
-fit = str(Path("Data_Creation/fit_params.json").resolve())
-InitSim(fit, 0.45)
+# Default: analytic Pake (same as create_data without --fit-params)
+InitSim('', 0.45)
+# Optional Dulya fit:
+# InitSim("Data_Creation/fit_params.json", 0.45)
+
 freq, intensity, P, Q, t, status = main(2, burn_R=0.4, gamma_rf=2.0, n_steps=20)
 freq, intensity, P, Q, t, status = main(1, dt=0.0015, n_steps=10)
 ```

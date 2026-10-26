@@ -1,7 +1,9 @@
-"""LabVIEW Python Node API for Dulya + ssRF / AFP dynamics.
+"""LabVIEW Python Node API for analytic Pake / optional Dulya + ssRF / AFP dynamics.
 
 Call ``InitSim`` once per LabVIEW Python session, then ``main(cmd, ...)`` in a
 loop. Simulation state lives in module globals for the lifetime of the process.
+Empty ``fit_params_path`` (default) uses the analytic Pake equilibrium, matching
+``create_data.py`` without ``--fit-params``.
 """
 from __future__ import annotations
 
@@ -126,12 +128,16 @@ def _burn_bin_from_R(burn_R):
     return int(np.argmin(np.abs(r - float(burn_R))))
 
 
+def _normalize_fit_path(fit_params_path):
+    """Return a fit JSON path, or None for analytic Pake (create_data default)."""
+    if fit_params_path is None:
+        return None
+    path = str(fit_params_path).strip()
+    return path or None
+
+
 def _build_model(*, fit_params_path, P0, Q0, n_bins, dt):
-    path = fit_params_path
-    if path is not None and str(path).strip():
-        use_fit_params(str(path))
-    else:
-        use_fit_params(None)
+    use_fit_params(_normalize_fit_path(fit_params_path))
     q0 = None if float(Q0) < 0.0 else float(Q0)
     m = build_equilibrium_spin1_model(
         polarization=float(P0),
@@ -148,16 +154,19 @@ def _build_model(*, fit_params_path, P0, Q0, n_bins, dt):
     return m
 
 
-def InitSim(fit_params_path, P0, Q0=-1.0, n_bins=500, dt=None):
-    """Load Dulya fit and build equilibrium model into module globals.
+def InitSim(fit_params_path='', P0=0.45, Q0=-1.0, n_bins=500, dt=None):
+    """Build equilibrium model into module globals (call once per LabVIEW session).
 
-    Call once per LabVIEW Python session. ``Q0 < 0`` keeps Boltzmann tensor Q.
+    ``fit_params_path`` is optional. Leave empty (default) to use the analytic
+    Pake lineshape, same as ``create_data.py`` without ``--fit-params``. Pass a
+    Dulya fit JSON path to seat that fitted equilibrium instead. ``Q0 < 0``
+    keeps Boltzmann tensor Q.
     """
     global model, sim_time, _init_kwargs, _last_freq, _last_intensity, _last_p, _last_q
     dt_used = float(DT if dt is None else dt)
     n = int(n_bins) if n_bins else NUM_BINS
     _init_kwargs = {
-        'fit_params_path': fit_params_path,
+        'fit_params_path': _normalize_fit_path(fit_params_path),
         'P0': float(P0),
         'Q0': float(Q0),
         'n_bins': n,

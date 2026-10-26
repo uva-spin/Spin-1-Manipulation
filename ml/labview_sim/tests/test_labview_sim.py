@@ -36,9 +36,9 @@ def _reset_session():
     lv._optimizer_settings = None
 
 
-def _init(p0=0.45, n_bins=N_BINS):
-    assert FIT.is_file(), f'missing fit params: {FIT}'
-    return lv.InitSim(str(FIT), p0, Q0=-1.0, n_bins=n_bins)
+def _init(p0=0.45, n_bins=N_BINS, fit_params_path=''):
+    """Default: analytic Pake (create_data without --fit-params)."""
+    return lv.InitSim(fit_params_path, p0, Q0=-1.0, n_bins=n_bins)
 
 
 def test_main_without_init_returns_error_status():
@@ -57,6 +57,17 @@ def test_init_sim_returns_finite_spectrum():
     assert np.all(np.isfinite(intensity))
     assert abs(p - 0.45) < 0.08
     assert np.isfinite(q)
+    assert lv._init_kwargs['fit_params_path'] is None
+
+
+def test_init_sim_optional_dulya_fit():
+    assert FIT.is_file(), f'missing fit params: {FIT}'
+    freq, intensity, p, q, t, status = _init(fit_params_path=str(FIT))
+    assert status == 'ok'
+    assert freq.size == N_BINS
+    assert np.all(np.isfinite(intensity))
+    assert abs(p - 0.45) < 0.08
+    assert lv._init_kwargs['fit_params_path'] == str(FIT)
 
 
 def test_ssrf_changes_spectrum():
