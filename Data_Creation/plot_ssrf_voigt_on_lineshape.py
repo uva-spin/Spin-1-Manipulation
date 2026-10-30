@@ -24,10 +24,10 @@ REPO_ROOT = SCRIPT_DIR.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from Data_Creation.spectrum_gen.events import ssrf_voigt_power_profile  # noqa: E402
-from Data_Creation.spectrum_gen.ssrf_traj import run_one_polarization  # noqa: E402
-from physics import rf  # noqa: E402
-from physics.rf.voigt_physical import approximate_voigt_fwhm  # noqa: E402
+from Data_Creation.spectrum_gen.events import ssrf_voigt_power_profile
+from Data_Creation.spectrum_gen.ssrf_traj import run_one_polarization
+from physics import rf
+from physics.rf.voigt_physical import approximate_voigt_fwhm
 
 P0 = 0.45
 N_BINS = 500
