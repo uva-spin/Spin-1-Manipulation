@@ -95,11 +95,7 @@ These scripts roll out `physics.rf` themselves. They do not read `spectra.npz`.
 | Script | Method | How to run |
 |--------|--------|------------|
 | `dqn.py` | Double DQN on a 701-bin ideal-bin profile | `python ml/dqn.py --episodes 100 --polarization 0.45` |
-| `sarsa.py` | Tabular SARSA | `python ml/sarsa.py` (fixed episode count and polarization grid in the file) |
-| `opt_q.py` | Greedy search over burn bins | `python ml/opt_q.py` |
 | `rf_profile_rl.py` | RF-profile policy | `python ml/rf_profile_rl.py` |
-
-`q-learning.py` imports `physics.lineshape.ssRFMapper` and expects `Data_Creation/lookup_table.pkl`. Neither is in this tree, so that script does not run here.
 
 DQN writes under `results/current/dqn/` at the repo root, not under `ml/results/`.
 

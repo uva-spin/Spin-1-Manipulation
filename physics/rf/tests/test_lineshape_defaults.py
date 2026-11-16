@@ -55,16 +55,3 @@ def test_no_ssrf_beta_imports():
                 for name in names:
                     assert "ssRF-beta" not in name
                     assert "ssrf-beta" not in name.lower().replace("_", "-")
-
-
-def test_opt_q_equilibrium_does_not_load_fit_params():
-    sys.path.insert(0, str(REPO_ROOT))
-    import ml.opt_q as opt_q
-    f = np.linspace(opt_q.F_MIN, opt_q.F_MAX, opt_q.NUM_BINS)
-    ip, im = opt_q.equilibrium_spin1_intensities(0.45, f)
-    assert ip.shape == (701,)
-    assert im.shape == (701,)
-    assert np.all(np.isfinite(ip))
-    assert opt_q.NUM_BINS == 701
-    assert opt_q.F_MIN == -3.0
-    assert opt_q.F_MAX == 3.0

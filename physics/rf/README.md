@@ -2,7 +2,7 @@
 
 Realtime spin-1 rate equations for ssRF burns, AFP, recovery, and diffusion on a Pake powder lineshape.
 
-`Data_Creation/spectrum_gen/` uses this package to write training spectra. `ml/dqn.py`, `ml/sarsa.py`, and `ml/opt_q.py` step the same model while they search for a burn policy.
+`Data_Creation/spectrum_gen/` uses this package to write training spectra. `ml/dqn.py` and `ml/rf_profile_rl.py` step the same model while they search for a burn policy.
 
 ## What a step does
 
@@ -52,7 +52,7 @@ iplus_new, iminus_new, _ = model.physical_intensities()
 | `burn_preserves_ps_sign` | True when a burn step did not flip the sign of Ps |
 | `burn_preserves_branch_order` | True when I+ stays at or above I− |
 
-`ml/opt_q.py` uses the two checks while it searches burn parameters.
+`solve_rate_equations` uses the two checks and rejects a step that would flip the sign of Ps or the branch order.
 
 ## Tests
 

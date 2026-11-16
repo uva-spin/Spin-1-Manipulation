@@ -1,6 +1,6 @@
 # Physics
 
-Lineshape helpers and the spin-1 rate-equation model. Training spectra are produced by [`Data_Creation/`](../Data_Creation/README.md), which calls into `physics.rf`. The reinforcement-learning scripts `ml/dqn.py`, `ml/sarsa.py`, and `ml/opt_q.py` call it directly.
+Lineshape helpers and the spin-1 rate-equation model. Training spectra are produced by [`Data_Creation/`](../Data_Creation/README.md), which calls into `physics.rf`. The reinforcement-learning scripts `ml/dqn.py` and `ml/rf_profile_rl.py` call it directly.
 
 ```
 physics/
