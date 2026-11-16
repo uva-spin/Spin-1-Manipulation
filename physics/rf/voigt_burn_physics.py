@@ -449,20 +449,19 @@ class VoigtBurnPhysicsMixin:
         conn = self.diffusion_connectivity(dnp_on=dnp_on)
         terms = self._spin_diffusion_terms(dnp_on)
         net = terms['diff_plus0'] + terms['diff_0minus'] + terms['diff_cross'] + terms.get('diff_double_quantum', 0)
-        scale_obs = self.display_cal / self.dR
 
         def val(arr, idx):
             return np.nan if idx is None else arr[idx]
         dq = conn.get('double_quantum', 0)
         out = {'R': R, 'conn_Iplus': val(conn['same_plus0'] + conn['cross_plus'] + dq, kp), 'conn_Iminus': val(conn['same_0minus'] + conn['cross_minus'] + dq, km), 'dIplus_diff_dt': np.nan, 'dIminus_diff_dt': np.nan, 'lambda_Iplus': np.nan, 'lambda_Iminus': np.nan}
         if kp is not None:
-            slope = scale_obs * (net[kp, PLUS] - net[kp, ZERO])
+            slope = net[kp, PLUS] - net[kp, ZERO]
             out['dIplus_diff_dt'] = slope
             Ip = self.local_intensities(R)['Iplus']
             if np.isfinite(Ip) and abs(Ip) > 1e-15:
                 out['lambda_Iplus'] = slope / Ip
         if km is not None:
-            slope = scale_obs * (net[km, ZERO] - net[km, MINUS])
+            slope = net[km, ZERO] - net[km, MINUS]
             out['dIminus_diff_dt'] = slope
             Im = self.local_intensities(R)['Iminus']
             if np.isfinite(Im) and abs(Im) > 1e-15:

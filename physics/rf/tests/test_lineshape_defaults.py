@@ -17,8 +17,7 @@ def test_spin1_params_match_ssrf_beta_lineshape_defaults():
     assert p.r_max == 3.0
     assert p.line_gamma == 0.05
     assert p.line_asym == 0.04
-    assert p.plot_divisor == 10.0
-    assert p.calibration_p == 0.50
+    assert not hasattr(p, "display_cal")
     assert p.diffusion_enabled is True
     assert p.diffusion_scale == 5.0
     assert p.diffusion_overlap == "lorentzian"
@@ -31,8 +30,10 @@ def test_population_pq_matches_ssrf_beta():
     pol = m.polarizations()
     assert pol["P"] == pytest.approx(0.45, rel=1e-8, abs=1e-8)
     assert pol["Q"] == pytest.approx(boltzmann_Q(0.45), rel=1e-8, abs=1e-8)
-    assert m.display_cal == pytest.approx(m._plot_signal_reference_calibration())
-    assert m.display_cal > 0.0
+    assert not hasattr(m, "display_cal")
+    ip, im, total = m.physical_intensities()
+    assert float(np.sum(total)) == pytest.approx(0.45, rel=1e-8, abs=1e-8)
+    assert float(np.sum(ip - im)) == pytest.approx(boltzmann_Q(0.45), rel=1e-8, abs=1e-8)
 
 
 def test_no_ssrf_beta_imports():

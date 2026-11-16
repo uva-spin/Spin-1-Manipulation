@@ -15,7 +15,7 @@ from typing import Optional
 import numpy as np
 from .conversions import physical_intensities_to_packet_n, packet_n_to_physical_intensities
 from .voigt_burn_physics import VoigtBurnPhysicsMixin
-from .lineshape import boltzmann_P_from_Q, boltzmann_Q, boltzmann_branch_ratio, level_populations_from_PQ, normalized_component, pake_component_raw, trapezoid_integral
+from .lineshape import boltzmann_P_from_Q, boltzmann_Q, boltzmann_branch_ratio, level_populations_from_PQ, normalized_component
 (PLUS, ZERO, MINUS) = (0, 1, 2)
 
 def _clamp_p(P):
@@ -31,10 +31,6 @@ class Spin1Params:
     r_max: float = 3.0
     line_gamma: float = 0.05
     line_asym: float = 0.04
-    plot_signal_units: bool = True
-    plot_divisor: float = 10.0
-    display_scale: float = 1.0
-    calibration_p: float = 0.50
     p0: float = 0.45
     q0: Optional[float] = None
     rf_burn_R: float = 0.40
@@ -108,7 +104,6 @@ class Spin1Model(VoigtBurnPhysicsMixin):
         self.n = self.n_ref.copy()
         self.n_initial = self.n.copy()
         self.t = 0.0
-        self.display_cal = self._compute_display_calibration()
         self._populations_from_intensities = False
         self.n_plus = self.n_zero = self.n_minus = 0.0
         self.n_plus_initial = self.n_zero_initial = self.n_minus_initial = 0.0
@@ -173,27 +168,6 @@ class Spin1Model(VoigtBurnPhysicsMixin):
         if self.params.rf_profile is None:
             self.params.rf_profile = np.zeros(int(self.params.n_bins), dtype=float)
 
-    def _compute_display_calibration(self):
-        """Plot_Signal-style display scale (ssRF-beta). State/rates stay population-based."""
-        p = self.params
-        if not p.plot_signal_units:
-            return float(p.display_scale)
-        Pcal = _clamp_p(p.calibration_p)
-        pref_cal = level_populations_from_PQ(Pcal, None)
-        minor_diff = abs(float(pref_cal[ZERO] - pref_cal[MINUS]))
-        if minor_diff < 1e-15:
-            pref_cal = level_populations_from_PQ(0.5, None)
-            minor_diff = abs(float(pref_cal[ZERO] - pref_cal[MINUS]))
-        raw = pake_component_raw(self.Rplus, +1, gamma=p.line_gamma, asym=p.line_asym)
-        raw_area = trapezoid_integral(raw, self.Rplus)
-        if raw_area <= 0 or not np.isfinite(raw_area):
-            return float(p.display_scale)
-        return float(p.display_scale * raw_area / (max(p.plot_divisor, 1e-15) * minor_diff))
-
-    def _plot_signal_reference_calibration(self):
-        """Same display scale as ``_compute_display_calibration`` (ssRF-beta Plot_Signal)."""
-        return self._compute_display_calibration()
-
     def set_params(self, **kwargs):
         rf_profile_changed = False
         diffusion_changed = False
@@ -224,7 +198,7 @@ class Spin1Model(VoigtBurnPhysicsMixin):
 
     def load_from_physical_intensities(self, Iplus, Iminus):
         """Set ``self.n`` from physical R-grid intensities using model conversions."""
-        self.n = physical_intensities_to_packet_n(Iplus, Iminus, self.mu, display_cal=self.display_cal, dR=self.dR)
+        self.n = physical_intensities_to_packet_n(Iplus, Iminus, self.mu)
         self.n_initial = self.n.copy()
         self.n_ref = self.n.copy()
         self._populations_from_intensities = True
@@ -384,12 +358,11 @@ class Spin1Model(VoigtBurnPhysicsMixin):
             for k in touched_list:
                 ip_new[k] += 0.5 * add
                 im_new[k] += 0.5 * add
-        inv_scale = self.dR / self.display_cal
         n_bins = len(self.n)
         for k in touched_set:
             mirror = n_bins - 1 - k
-            a = ip_new[k] * inv_scale
-            b = im_new[mirror] * inv_scale
+            a = ip_new[k]
+            b = im_new[mirror]
             n_zero = (self.mu[k] - a + b) / 3.0
             self.n[k, PLUS] = n_zero + a
             self.n[k, ZERO] = n_zero
@@ -439,13 +412,8 @@ class Spin1Model(VoigtBurnPhysicsMixin):
         """Refresh stored global level fractions ``n_plus``, ``n_zero``, ``n_minus``."""
         if self._populations_from_intensities:
             (ip, im, _) = self.physical_intensities()
-            p_raw = np.sum(ip + im)
-            q_raw = np.sum(ip - im)
-            if abs(p_raw) <= 1.0 + 1e-09:
-                (p_vec, q_ten) = (p_raw, q_raw)
-            else:
-                scale = self.dR / max(abs(self.display_cal), 1e-30)
-                (p_vec, q_ten) = (p_raw * scale, q_raw * scale)
+            # Intensities are per-bin population differences: their sums are P and Q.
+            (p_vec, q_ten) = (np.sum(ip + im), np.sum(ip - im))
             try:
                 pref = level_populations_from_PQ(p_vec, q_ten)
             except ValueError:
@@ -649,17 +617,17 @@ class Spin1Model(VoigtBurnPhysicsMixin):
         return {**cap, 'gamma_rf_Iplus_R': p.gamma_rf * wp if np.isfinite(wp) else np.nan, 'gamma_rf_Iminus_R': p.gamma_rf * wm if np.isfinite(wm) else np.nan, 'dnp_Iplus_R': p.dnp_rate * wp if np.isfinite(wp) else np.nan, 'dnp_Iminus_R': p.dnp_rate * wm if np.isfinite(wm) else np.nan, 'same_plus0_Iplus_R': p.d_same_plus0 * wp if np.isfinite(wp) else np.nan, 'same_0minus_Iminus_R': p.d_same_0minus * wm if np.isfinite(wm) else np.nan}
 
     def branch_areas(self, n=None):
-        """Return display-calibrated integrated branch areas and total area (v15)."""
+        """Return integrated branch areas and total area (``A_total`` is P)."""
         if n is None:
             n = self.n
-        a_plus = self.display_cal * np.sum(n[:, PLUS] - n[:, ZERO])
-        a_minus = self.display_cal * np.sum(n[:, ZERO] - n[:, MINUS])
+        a_plus = np.sum(n[:, PLUS] - n[:, ZERO])
+        a_minus = np.sum(n[:, ZERO] - n[:, MINUS])
         return {'A_plus': a_plus, 'A_minus': a_minus, 'A_total': a_plus + a_minus, 'A_diff': a_plus - a_minus}
 
     def static_plot_signal_reference(self):
         """Return the Plot_Signal-style static reference for comparison (v15)."""
         from .lineshape import plot_signal_reference
-        return plot_signal_reference(self.Rplus, P=self.params.p0, gamma=self.params.line_gamma, asym=self.params.line_asym, divisor=self.params.plot_divisor)
+        return plot_signal_reference(self.Rplus, P=self.params.p0, gamma=self.params.line_gamma, asym=self.params.line_asym, divisor=10.0)
 
     def polarizations(self, n=None):
         """Return current dimensionless level populations, vector P, and tensor Q."""
@@ -691,17 +659,14 @@ class Spin1Model(VoigtBurnPhysicsMixin):
         return (n[:, PLUS] - n[:, ZERO], n[:, ZERO] - n[:, MINUS])
 
     def packet_intensities(self, use_reference=False):
-        """Return display-calibrated I_plus(x) and I_minus(x-packet) arrays."""
+        """Return per-bin population-difference I_plus(x) and I_minus(x-packet) arrays."""
         n = self.n_ref if use_reference else self.n
-        (Iplus, Iminus) = self._transition_differences(n)
-        Iplus = self.display_cal * Iplus / self.dR
-        Iminus = self.display_cal * Iminus / self.dR
-        return (Iplus, Iminus)
+        return self._transition_differences(n)
 
     def physical_intensities(self, n=None):
         """Return I+(R), I-(R), and total on the model's physical R grid."""
         state = self.n if n is None else n
-        return packet_n_to_physical_intensities(state, self.Rplus, display_cal=self.display_cal, dR=self.dR)
+        return packet_n_to_physical_intensities(state, self.Rplus)
 
     def local_intensities(self, R=None, use_reference=False):
         (kp, km) = self.branch_indices(R)
@@ -733,8 +698,6 @@ class Spin1Model(VoigtBurnPhysicsMixin):
 
     def spectrum_from_state(self, n):
         (Iplus_packet, Iminus_packet) = self._transition_differences(n)
-        Iplus_packet = self.display_cal * Iplus_packet / self.dR
-        Iminus_packet = self.display_cal * Iminus_packet / self.dR
         R_axis = self.Rplus.copy()
         Iplus = Iplus_packet.copy()
         Rminus_phys = -self.Rplus
@@ -955,16 +918,15 @@ class Spin1Model(VoigtBurnPhysicsMixin):
         if not breakdown:
             return dn
         (kp, km) = self.cached_branch_indices(self.params.rf_burn_R)
-        scale = self.display_cal / self.dR
 
         def obs_for_term(term):
             d = {'dIplus_R_dt': np.nan, 'dIminus_R_dt': np.nan, 'dIplus_minusR_dt': np.nan, 'dIminus_minusR_dt': np.nan, 'dP_dt': np.sum(term[:, PLUS] - term[:, MINUS])}
             if kp is not None:
-                d['dIplus_R_dt'] = scale * (term[kp, PLUS] - term[kp, ZERO])
-                d['dIminus_minusR_dt'] = scale * (term[kp, ZERO] - term[kp, MINUS])
+                d['dIplus_R_dt'] = term[kp, PLUS] - term[kp, ZERO]
+                d['dIminus_minusR_dt'] = term[kp, ZERO] - term[kp, MINUS]
             if km is not None:
-                d['dIminus_R_dt'] = scale * (term[km, ZERO] - term[km, MINUS])
-                d['dIplus_minusR_dt'] = scale * (term[km, PLUS] - term[km, ZERO])
+                d['dIminus_R_dt'] = term[km, ZERO] - term[km, MINUS]
+                d['dIplus_minusR_dt'] = term[km, PLUS] - term[km, ZERO]
             return d
         obs_terms = {name: obs_for_term(term) for (name, term) in dn_terms.items()}
         obs_terms['net'] = obs_for_term(dn)
@@ -982,9 +944,8 @@ class Spin1Model(VoigtBurnPhysicsMixin):
             if self._uses_physical_voigt_rf():
                 unit_term = self._rf_population_term(True, self.params.rf_burn_R, gamma_rf=1.0)
                 (kp, km) = self.branch_indices(self.params.rf_burn_R)
-                scale = self.display_cal / self.dR
-                u_plus = np.nan if kp is None else scale * (unit_term[kp, PLUS] - unit_term[kp, ZERO])
-                u_minus = np.nan if km is None else scale * (unit_term[km, ZERO] - unit_term[km, MINUS])
+                u_plus = np.nan if kp is None else unit_term[kp, PLUS] - unit_term[kp, ZERO]
+                u_minus = np.nan if km is None else unit_term[km, ZERO] - unit_term[km, MINUS]
                 refill_plus = parts['net']['dIplus_R_dt']
                 refill_minus = parts['net']['dIminus_R_dt']
 

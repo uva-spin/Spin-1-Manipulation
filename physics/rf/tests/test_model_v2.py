@@ -84,8 +84,9 @@ def test_afp_one_shot_in_step():
 
 def test_load_from_physical_intensities_roundtrip():
     m = Spin1Model(Spin1Params(p0=0.45, n_bins=101))
-    assert m.display_cal == pytest.approx(m._plot_signal_reference_calibration())
+    assert not hasattr(m, "display_cal")
     (Iplus, Iminus, _) = m.physical_intensities()
+    assert float(np.sum(Iplus + Iminus)) == pytest.approx(0.45, rel=1e-8, abs=1e-8)
     m.load_from_physical_intensities(Iplus, Iminus)
     (Iplus2, Iminus2, _) = m.physical_intensities()
     assert np.allclose(Iplus, Iplus2, rtol=1e-10)

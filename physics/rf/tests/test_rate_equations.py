@@ -27,7 +27,7 @@ def test_build_model_for_intensities_matches_grid_length():
     (f, Iplus, Iminus) = _lineshape(n_bins=200)
     model = build_model_for_intensities(Iplus, Iminus, p0=0.45)
     assert len(model.Rplus) == 200
-    assert model.display_cal == pytest.approx(model._plot_signal_reference_calibration())
+    assert not hasattr(model, "display_cal")
     (Iplus_out, Iminus_out, _) = model.physical_intensities()
     assert np.allclose(Iplus, Iplus_out, rtol=1e-10)
     assert np.allclose(Iminus, Iminus_out, rtol=1e-10)

@@ -11,7 +11,7 @@ from .voigt_physical import discrete_bins_to_physical_fwhm
 
 def voigt_burn_params(**overrides):
     """Return :class:`Spin1Params` aligned with ``spin1_ssrf_realtime_voigt_burn`` defaults."""
-    base = Spin1Params(n_bins=701, r_min=-3.0, r_max=3.0, line_gamma=0.05, line_asym=0.04, plot_signal_units=True, plot_divisor=10.0, display_scale=1.0, calibration_p=0.5, p0=0.45, q0=None, rf_burn_R=-0.94, rf_enabled=True, gamma_rf=2.0, use_physical_voigt_rf=True, rf_gaussian_fwhm_R=0.03, rf_lorentzian_fwhm_R=0.015, rf_profile_normalization='center_bin', rf_profile_quadrature_order=0, diffusion_scale=5.0, zq_width_R=0.05, cross_branch_ratio=0.0, orientation_corr_fraction=0.0, orientation_corr_width_deg=20.0, kernel_cutoff_widths=4.0, microwave_diffusion_factor=1.0, capacity_rate_power=1.0, capacity_rate_clip=12.0, dnp_enabled=False, p_dnp_sat=0.58, dnp_rate=0.05, t1_rate=0.0, t1_p_eq=0.0, dt=0.0015, noise_sigma=0.0, relax_enabled=False, d_same_plus0=0.0, d_same_0minus=0.0, d_spec_plus0=0.0, d_spec_0minus=0.0)
+    base = Spin1Params(n_bins=701, r_min=-3.0, r_max=3.0, line_gamma=0.05, line_asym=0.04, p0=0.45, q0=None, rf_burn_R=-0.94, rf_enabled=True, gamma_rf=2.0, use_physical_voigt_rf=True, rf_gaussian_fwhm_R=0.03, rf_lorentzian_fwhm_R=0.015, rf_profile_normalization='center_bin', rf_profile_quadrature_order=0, diffusion_scale=5.0, zq_width_R=0.05, cross_branch_ratio=0.0, orientation_corr_fraction=0.0, orientation_corr_width_deg=20.0, kernel_cutoff_widths=4.0, microwave_diffusion_factor=1.0, capacity_rate_power=1.0, capacity_rate_clip=12.0, dnp_enabled=False, p_dnp_sat=0.58, dnp_rate=0.05, t1_rate=0.0, t1_p_eq=0.0, dt=0.0015, noise_sigma=0.0, relax_enabled=False, d_same_plus0=0.0, d_same_0minus=0.0, d_spec_plus0=0.0, d_spec_0minus=0.0)
     if overrides:
         base = base.replace(**overrides)
     return base
@@ -183,8 +183,8 @@ def build_model_for_intensities(Iplus, Iminus, *, params=None, rf_burn_R=None, p
     Build a :class:`Spin1Model` whose grid matches ``Iplus`` / ``Iminus`` length.
 
     The model state is loaded from the supplied intensities.  Set ``p0`` to the
-    vector polarization used to generate the lineshape (e.g. ``GenerateVectorLineshape``);
-    it sets ``display_cal`` via :attr:`Spin1Params.p0`.
+    vector polarization used to generate the lineshape (e.g. ``GenerateVectorLineshape``),
+    whose intensities sum to that polarization.
     """
     Iplus = np.asarray(Iplus)
     Iminus = np.asarray(Iminus)
