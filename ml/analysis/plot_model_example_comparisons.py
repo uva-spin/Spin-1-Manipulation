@@ -21,7 +21,11 @@ RESULTS_DIR = ML_DIR / "results"
 if str(ML_DIR) not in sys.path:
     sys.path.insert(0, str(ML_DIR))
 
-import lstm as lstm_pq
+from utils.constants import (
+    SOURCE_NAME, SPECTRUM_R_MIN, SPECTRUM_R_MAX, SEED, NOISE_STD, DEFAULT_SPECTRA_PATH,
+)
+from utils.helpers import load_npz, prepare_datasets
+from analysis.pq_report import test_input_ps
 
 # Latest result run per architecture (matches weight_histo / bias-vs-SNR).
 # Paths are relative to RESULTS_DIR.
@@ -33,11 +37,6 @@ MODELS = [
     ("old_model/old_model_pq_results_v1", "Old Polarization Model"),
 ]
 
-SOURCE_NAME = lstm_pq.SOURCE_NAME
-SPECTRUM_R_MIN = lstm_pq.SPECTRUM_R_MIN
-SPECTRUM_R_MAX = lstm_pq.SPECTRUM_R_MAX
-SEED = lstm_pq.SEED
-NOISE_STD = lstm_pq.NOISE_STD
 N_EXAMPLES_DEFAULT = 10
 
 
@@ -162,13 +161,13 @@ def select_example_events(wide: pd.DataFrame, n_examples: int, *, seed: int = SE
 def load_noisy_test_spectra(spectra_path: Path, event_indices: np.ndarray) -> dict[int, np.ndarray]:
     """Rebuild the same noisy test inputs used during evaluation."""
     print(f"Loading spectra from {spectra_path} ...", flush=True)
-    arrays = lstm_pq.load_npz(spectra_path)
+    arrays = load_npz(spectra_path)
     print("Rebuilding noisy test split (same seed/noise as training) ...", flush=True)
-    _train_ds, _val_ds, test_ds, stats = lstm_pq.prepare_datasets(
+    _train_ds, _val_ds, test_ds, stats = prepare_datasets(
         arrays, noise_std=NOISE_STD, seed=SEED,
     )
     del _train_ds, _val_ds, arrays
-    noisy_ps = lstm_pq.test_input_ps(test_ds, stats)
+    noisy_ps = test_input_ps(test_ds, stats)
     test_idx = np.asarray(stats["test_idx"], dtype=int)
     local_by_event = {int(e): i for i, e in enumerate(test_idx)}
     missing = [int(e) for e in event_indices if int(e) not in local_by_event]
@@ -318,7 +317,7 @@ def load_event_meta(spectra_path: Path, event_indices: np.ndarray) -> dict[int, 
         p0 = np.asarray(raw["p0"]).reshape(-1)
     return {
         int(e): {
-            "n_steps": int(n_steps[int(e)]),
+            "n_steps": 0 if not np.isfinite(n_steps[int(e)]) else int(n_steps[int(e)]),
             "source": SOURCE_NAME.get(int(source[int(e)]), str(int(source[int(e)]))),
             "p0": float(p0[int(e)]),
         }
@@ -333,7 +332,7 @@ def main() -> None:
     parser.add_argument(
         "--spectra",
         type=Path,
-        default=lstm_pq.DEFAULT_SPECTRA_PATH,
+        default=DEFAULT_SPECTRA_PATH,
         help="Path to spectra.npz used for training/evaluation",
     )
     parser.add_argument(

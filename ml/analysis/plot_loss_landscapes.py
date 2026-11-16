@@ -32,6 +32,8 @@ if str(ML_DIR) not in sys.path:
     sys.path.insert(0, str(ML_DIR))
 
 import cnn as cnn_pq
+from utils.constants import NOISE_STD
+from utils.helpers import load_npz, relative_weighted_loss
 import lstm as lstm_pq
 import mlp as mlp_pq
 import old_model as old_pq
@@ -176,7 +178,7 @@ def build_eval_batch(
     device: torch.device,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Fixed (x, y_p_z, y_q_z) batch using checkpoint normalization stats."""
-    arrays = lstm_pq.load_npz(spectra_path)
+    arrays = load_npz(spectra_path)
     spectra = arrays["spectra"]
     n = int(spectra.shape[0])
     n_bins = int(spectra.shape[2])
@@ -190,7 +192,7 @@ def build_eval_batch(
     idx = np.sort(rng.choice(n, size=take, replace=False))
 
     ps = np.asarray(spectra[idx, 0, :] + spectra[idx, 1, :], dtype=np.float32)
-    noise_std = float(ckpt_stats.get("noise_std", lstm_pq.NOISE_STD))
+    noise_std = float(ckpt_stats.get("noise_std", NOISE_STD))
     if noise_std > 0.0:
         ps = ps + rng.normal(0.0, noise_std, size=ps.shape).astype(np.float32)
     pwr = np.asarray(power_profile[idx], dtype=np.float32)
@@ -233,8 +235,8 @@ def eval_pq_loss(
     for start in range(0, n, batch_size):
         sl = slice(start, start + batch_size)
         pred_p, pred_q = model(x[sl])
-        loss_p = lstm_pq.relative_weighted_loss(pred_p, y_p[sl], mean=p_mean, std=p_std)
-        loss_q = lstm_pq.relative_weighted_loss(pred_q, y_q[sl], mean=q_mean, std=q_std)
+        loss_p = relative_weighted_loss(pred_p, y_p[sl], mean=p_mean, std=p_std)
+        loss_q = relative_weighted_loss(pred_q, y_q[sl], mean=q_mean, std=q_std)
         total += float((loss_p + loss_q).item())
         n_batches += 1
     return total / max(n_batches, 1)

@@ -22,14 +22,13 @@ RESULTS_DIR = ML_DIR / "results"
 if str(ML_DIR) not in sys.path:
     sys.path.insert(0, str(ML_DIR))
 
-import lstm as lstm_pq
+from utils.constants import (
+    SOURCE_NAME, SPECTRUM_R_MIN, SPECTRUM_R_MAX, DEFAULT_SPECTRA_PATH,
+)
 from plot_bias_variance_vs_snr import MODELS, SNR_BIN_WIDTH
 from plot_model_example_comparisons import load_noisy_test_spectra
 from plot_pred_vs_true_by_snr import MIN_BIN_COUNT, _bin_label, snr_intervals
 
-SOURCE_NAME = lstm_pq.SOURCE_NAME
-SPECTRUM_R_MIN = lstm_pq.SPECTRUM_R_MIN
-SPECTRUM_R_MAX = lstm_pq.SPECTRUM_R_MAX
 QUANTITIES = ("P", "Q")
 DEFAULT_TOP_N = 1
 
@@ -217,7 +216,7 @@ def main() -> None:
     parser.add_argument(
         "--spectra",
         type=Path,
-        default=lstm_pq.DEFAULT_SPECTRA_PATH,
+        default=DEFAULT_SPECTRA_PATH,
         help="Path to spectra.npz used for training/evaluation",
     )
     parser.add_argument(

@@ -19,6 +19,8 @@ if str(ML_DIR) not in sys.path:
     sys.path.insert(0, str(ML_DIR))
 
 import cnn as cnn_pq
+from utils.constants import NOISE_STD
+from utils.helpers import load_npz, resolve_power_profile
 import lstm as lstm_pq
 import mlp as mlp_pq
 import old_model as old_pq
@@ -613,14 +615,14 @@ def build_activation_batch(
     seed: int = 42,
 ) -> torch.Tensor:
     """Pack a small (N, bins, 3) batch normalized with checkpoint stats."""
-    arrays = lstm_pq.load_npz(spectra_path)
+    arrays = load_npz(spectra_path)
     spectra = np.asarray(arrays["spectra"])
     ps = np.asarray(spectra[:, 0, :] + spectra[:, 1, :], dtype=np.float32, copy=True)
-    power_profile = lstm_pq.resolve_power_profile(arrays)
+    power_profile = resolve_power_profile(arrays)
     n_steps = np.asarray(arrays["n_steps"]).reshape(-1)
     n = ps.shape[0]
     rng = np.random.default_rng(seed)
-    noise_std = float(ckpt_stats.get("noise_std", lstm_pq.NOISE_STD))
+    noise_std = float(ckpt_stats.get("noise_std", NOISE_STD))
     if noise_std > 0.0:
         ps = ps + rng.normal(0.0, noise_std, size=ps.shape).astype(np.float32)
 

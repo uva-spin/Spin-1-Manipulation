@@ -542,8 +542,8 @@ def _equilibrium_q0_by_p0(arrays):
     """Map rounded p0 → equilibrium tensor polarization from n_steps==0 rows."""
     p0 = np.asarray(arrays['p0'], dtype=np.float64).reshape(-1)
     q = np.asarray(arrays['Q_total'], dtype=np.float64).reshape(-1)
-    n_steps = np.asarray(arrays['n_steps']).reshape(-1)
-    mask = n_steps == 0
+    n_steps = np.asarray(arrays['n_steps'], dtype=np.float64).reshape(-1)
+    mask = ~np.isfinite(n_steps) | (n_steps == 0)
     out = {}
     for (pv, qv) in zip(p0[mask], q[mask]):
         out[round(float(pv), 6)] = float(qv)
@@ -620,10 +620,11 @@ def save_example_signal_plots(arrays, stats, metrics, plots_dir, *, test_dataset
         rpe_q = float(compute_rpe(np.array([pq]), np.array([tq]))[0])
         p0_v = float(p0_arr[gi])
         q0_v = _lookup_q0(q0_by_p0, p0_v)
-        if int(n_steps_arr[gi]) == 0 and np.isfinite(tq):
+        step_v = float(n_steps_arr[gi])
+        steps = 0 if not np.isfinite(step_v) else int(step_v)
+        if steps == 0 and np.isfinite(tq):
             q0_v = tq
         power = float(applied[gi])
-        steps = int(n_steps_arr[gi])
         src = SOURCE_NAME.get(int(source[gi]), str(source[gi]))
         (fig_e, ax_s) = plt.subplots(figsize=(8.4, 4.6), constrained_layout=True)
         _plot_example_lineshape(ax_s, freq, ps)
