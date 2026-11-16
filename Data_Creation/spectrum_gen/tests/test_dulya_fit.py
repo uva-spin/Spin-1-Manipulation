@@ -48,7 +48,7 @@ def test_default_lineshape_ignores_fit_until_installed():
         assert float(np.sum(ip_m + im_m)) == pytest.approx(0.4, abs=1e-6)
         p_eq, _q_eq = level_pq(model)
         assert p_eq == pytest.approx(0.4, abs=1e-6)
-        assert model.display_cal == pytest.approx(model.dR)
+        assert not hasattr(model, "display_cal")
     finally:
         use_fit_params(None)
     _, iplus_again, _ = equilibrium_lineshape(0.4, freq)

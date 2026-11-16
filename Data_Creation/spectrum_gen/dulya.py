@@ -175,7 +175,7 @@ def active_shape():
 
 
 def _minimum_packet_weight(iplus, iminus):
-    """Smallest ``mu`` that keeps every level non-negative at ``display_cal = dR``."""
+    """Smallest ``mu`` that keeps every level non-negative for these intensities."""
     iplus = np.asarray(iplus, dtype=float)
     iminus = np.asarray(iminus, dtype=float)
     n = iplus.size
@@ -210,13 +210,11 @@ def _seat_packet_weight(mu, iplus, iminus):
 def apply_active_fit(model):
     """Load the fitted Dulya lineshape at its own amplitude with full spin physics.
 
-    Intensities are normalized so ``sum(I+ + I-) = p0``. Population differences
-    are ``I * dR / display_cal``, so the default calibration would shrink that
-    into a nearly unpolarized packet and an ssRF burn could not raise Q.
-    Setting ``display_cal = dR`` makes those fitted intensities a real ``p0``
-    polarization; the saved lineshape stays on the fitted scale. Packet weight
-    is then seated so the smooth fitted curve is stored whole, instead of
-    chopping bins whose Pake weight is too small.
+    Intensities are normalized so ``sum(I+ + I-) = p0``. Intensities are the
+    per-bin population differences themselves, so those fitted intensities are
+    a real ``p0`` polarization; the saved lineshape stays on the fitted scale.
+    Packet weight is then seated so the smooth fitted curve is stored whole,
+    instead of chopping bins whose Pake weight is too small.
     """
     shape = _ACTIVE
     if shape is None:
@@ -229,7 +227,6 @@ def apply_active_fit(model):
         scale = p0 / area
         iplus = iplus * scale
         iminus = iminus * scale
-    model.display_cal = float(model.dR)
     model.mu = _seat_packet_weight(model.mu, iplus, iminus)
     model.base_density = model.mu / model.dR
     model._diffusion_kernel_key = None
