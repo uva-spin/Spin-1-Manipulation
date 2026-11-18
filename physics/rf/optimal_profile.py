@@ -23,6 +23,7 @@ from .profile_control import (
     candidate_mask,
     make_ideal_model,
 )
+from .kinetic_defaults import SSRF_BETA_DEFAULT_DT
 from .pulse_program import BinPulse, PulseProgram, RFProfile
 
 
@@ -535,17 +536,26 @@ def run_optimal_profile_polarization(
     equilibrium on both the design model and the playback model.
     """
     p0 = float(polarization)
-    model = make_ideal_model(p0, n_bins=int(n_bins), r_min=float(r_min), r_max=float(r_max))
-    if dt is not None:
-        model.params.dt = float(dt)
+    dt_used = float(dt) if dt is not None else SSRF_BETA_DEFAULT_DT
+    model = make_ideal_model(
+        p0,
+        n_bins=int(n_bins),
+        r_min=float(r_min),
+        r_max=float(r_max),
+        dt=dt_used,
+    )
     if equilibrium_loader is not None:
         equilibrium_loader(model)
     design = design_optimal_profile(model, settings=settings, bin_allow_mask=bin_allow_mask)
-    dt_used = float(model.params.dt)
     n_euler = 0 if design.duration <= 0.0 else max(1, int(math.ceil(design.duration / dt_used)))
     n_record = max(int(n_steps), n_euler)
-    play = make_ideal_model(p0, n_bins=int(n_bins), r_min=float(r_min), r_max=float(r_max))
-    play.params.dt = dt_used
+    play = make_ideal_model(
+        p0,
+        n_bins=int(n_bins),
+        r_min=float(r_min),
+        r_max=float(r_max),
+        dt=dt_used,
+    )
     if equilibrium_loader is not None:
         equilibrium_loader(play)
     iplus_full, iminus_full, p_full, q_full = replay_program_spectra(

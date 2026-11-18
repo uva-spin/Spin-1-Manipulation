@@ -1,7 +1,8 @@
 """Bridge Dulya equilibrium lineshapes to physics.rf."""
 import numpy as np
 from .constants import D_SAME_0MINUS, D_SAME_PLUS0, D_SPEC_0MINUS, D_SPEC_PLUS0, DIFFUSION_SCALE, F_MAX, F_MIN, MAX_GDT, MAX_NSUB, MIRROR_AMP_EPS, MIRROR_AMP_RTOL, RF_GAUSSIAN_FWHM_R, RF_LORENTZIAN_FWHM_R, RF_MODE_PHYSICAL_VOIGT, RF_MODE_SINGLE_BIN, ZQ_WIDTH_R
-from physics.rf import Spin1Model, Spin1Params, bin_averaged_voigt, configure_physical_voigt_ssrf, configure_single_bin_ssrf, configure_voigt_burn_spectral_recovery, mirror_bin_idx, ssrf_touched_bins
+from physics.rf import Spin1Model, bin_averaged_voigt, configure_physical_voigt_ssrf, configure_single_bin_ssrf, configure_voigt_burn_spectral_recovery, mirror_bin_idx, ssrf_touched_bins
+from physics.rf.kinetic_defaults import ssrf_beta_spin1_params
 from .dulya import apply_active_fit
 afp_touched_bins = ssrf_touched_bins
 PROFILE_REL_THRESHOLD = 0.01
@@ -117,43 +118,21 @@ def afp_window_indices(bin_idx, n_bins, window):
 
 def _spin1_params(*, polarization, num_bins, dt, rf_enabled=False, relax_enabled=True, diffusion_scale=DIFFUSION_SCALE, rf_gaussian_fwhm_R=RF_GAUSSIAN_FWHM_R, rf_lorentzian_fwhm_R=RF_LORENTZIAN_FWHM_R, r_min=None, r_max=None, legacy_spectral_recovery=True):
     """ssRF-beta kinetic defaults for data-generation models."""
-    P = polarization
-    near_zero_p = abs(P) < 1e-12
     use_legacy = legacy_spectral_recovery and relax_enabled
-    return (use_legacy, Spin1Params(
+    params = ssrf_beta_spin1_params(
+        polarization=polarization,
         n_bins=num_bins,
-        r_min=F_MIN if r_min is None else r_min,
-        r_max=F_MAX if r_max is None else r_max,
-        p0=P if not near_zero_p else 0.0,
-        q0=None,
-        p_dnp_sat=P if not near_zero_p else 0.0,
-        dnp_enabled=False,
-        rf_enabled=rf_enabled,
-        relax_enabled=use_legacy,
-        afp_enabled=False,
-        gamma_rf=0.0,
         dt=dt,
-        capacity_rate_power=1.0,
-        plot_signal_units=not near_zero_p,
-        display_scale=1.0,
-        use_physical_voigt_rf=False,
+        rf_enabled=rf_enabled,
+        relax_enabled=relax_enabled,
+        legacy_spectral_recovery=legacy_spectral_recovery,
+        diffusion_scale=diffusion_scale,
+        r_min=r_min if r_min is not None else F_MIN,
+        r_max=r_max if r_max is not None else F_MAX,
         rf_gaussian_fwhm_R=rf_gaussian_fwhm_R,
         rf_lorentzian_fwhm_R=rf_lorentzian_fwhm_R,
-        rf_profile_normalization='center_bin',
-        diffusion_enabled=True,
-        diffusion_scale=diffusion_scale,
-        diffusion_overlap='lorentzian',
-        zq_width_R=ZQ_WIDTH_R,
-        cross_branch_ratio=1.0,
-        double_quantum_ratio=0.10,
-        kernel_cutoff_widths=0.0,
-        line_gamma=0.05,
-        line_asym=0.04,
-        d_same_plus0=D_SAME_PLUS0 if use_legacy else 0.0,
-        d_same_0minus=D_SAME_0MINUS if use_legacy else 0.0,
-        d_spec_plus0=D_SPEC_PLUS0 if use_legacy else 0.0,
-        d_spec_0minus=D_SPEC_0MINUS if use_legacy else 0.0,
-    ))
+    )
+    return use_legacy, params
 
 def build_equilibrium_spin1_model(*, polarization, num_bins, dt, rf_enabled=False, relax_enabled=True, diffusion_scale=DIFFUSION_SCALE, rf_gaussian_fwhm_R=RF_GAUSSIAN_FWHM_R, rf_lorentzian_fwhm_R=RF_LORENTZIAN_FWHM_R, r_min=None, r_max=None, legacy_spectral_recovery=True):
     """Equilibrium on the ssRF-beta ODE.

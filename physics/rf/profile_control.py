@@ -12,6 +12,7 @@ from typing import Optional
 import numpy as np
 
 from .ideal_model import IdealBinModel, IdealBinParams
+from .kinetic_defaults import SSRF_BETA_DEFAULT_DT, ssrf_beta_ideal_bin_params
 from .pulse_program import BinPulse, PulseProgram, RFProfile
 
 DEFAULT_N_BINS = 249
@@ -132,23 +133,23 @@ def play_program(model, program, *, dnp_on=False):
     return q1 - q0, q1, float(pol["P"]), False
 
 
-def make_ideal_model(polarization=DEFAULT_P0, *, n_bins=DEFAULT_N_BINS, r_min=DEFAULT_R_MIN, r_max=DEFAULT_R_MAX):
-    params = IdealBinParams(
+def make_ideal_model(
+    polarization=DEFAULT_P0,
+    *,
+    n_bins=DEFAULT_N_BINS,
+    r_min=DEFAULT_R_MIN,
+    r_max=DEFAULT_R_MAX,
+    dt=None,
+    legacy_spectral_recovery=False,
+):
+    """Boltzmann equilibrium on the ssRF-beta ODE (same defaults as data generation)."""
+    params = ssrf_beta_ideal_bin_params(
+        polarization=float(polarization),
         n_bins=int(n_bins),
         r_min=float(r_min),
         r_max=float(r_max),
-        p0=float(polarization),
-        q0=None,
-        line_gamma=DEFAULT_LINE_GAMMA,
-        line_asym=DEFAULT_LINE_ASYM,
-        rf_enabled=False,
-        dnp_enabled=False,
-        diffusion_enabled=True,
-        relax_enabled=False,
-        d_same_plus0=0.0,
-        d_same_0minus=0.0,
-        d_spec_plus0=0.0,
-        d_spec_0minus=0.0,
+        dt=SSRF_BETA_DEFAULT_DT if dt is None else float(dt),
+        legacy_spectral_recovery=bool(legacy_spectral_recovery),
     )
     return IdealBinModel(params)
 

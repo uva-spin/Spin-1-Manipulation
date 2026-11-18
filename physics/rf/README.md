@@ -54,6 +54,10 @@ iplus_new, iminus_new, _ = model.physical_intensities()
 
 `ml/opt_q.py` uses the two checks while it searches burn parameters.
 
+## Optimal ssRF profile (`optimal_profile.py`)
+
+Synchronized multibin RF programs (L-BFGS-B over duration and per-bin rates) use the same ssRF-beta population ODE and diffusion defaults as `Data_Creation/spectrum_gen/bridge.py`. Shared kinetic defaults live in `kinetic_defaults.py`; `profile_control.make_ideal_model` builds the `IdealBinModel` used for design and replay.
+
 ## Tests
 
 ```bash
