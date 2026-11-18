@@ -23,7 +23,15 @@ from .profile_control import (
     candidate_mask,
     make_ideal_model,
 )
-from .kinetic_defaults import SSRF_BETA_DEFAULT_DT, SSRF_BETA_PROFILE_SMOOTHING_FWHM_R
+from .kinetic_defaults import (
+    SSRF_BETA_DEFAULT_DT,
+    SSRF_BETA_DESIGN_N_BINS,
+    SSRF_BETA_DESIGN_R_MAX,
+    SSRF_BETA_DESIGN_R_MIN,
+    SSRF_BETA_IDEAL_BIN_DT,
+    SSRF_BETA_OPTIMIZER_MAX_DURATION,
+    SSRF_BETA_PROFILE_SMOOTHING_FWHM_R,
+)
 from .pulse_program import BinPulse, PulseProgram, RFProfile
 from scipy.ndimage import gaussian_filter1d
 
@@ -70,10 +78,12 @@ class OptimizerSettings:
 # demo_single_pake optimizer block (ssRF-beta materials/demo_single_pake.json).
 SSRF_BETA_OPTIMIZER_SETTINGS = OptimizerSettings(
     max_power=U_MAX,
+    max_duration=SSRF_BETA_OPTIMIZER_MAX_DURATION,
     duration_samples=9,
     duration_refinements=3,
     max_iterations=100,
     starts=2,
+    max_steps=20000,
     max_wall_seconds=300.0,
     profile_smoothing_fwhm_R=SSRF_BETA_PROFILE_SMOOTHING_FWHM_R,
 )
@@ -601,9 +611,9 @@ def run_optimal_profile_polarization(
     polarization,
     *,
     n_steps,
-    n_bins=701,
-    r_min=-3.0,
-    r_max=3.0,
+    n_bins=SSRF_BETA_DESIGN_N_BINS,
+    r_min=SSRF_BETA_DESIGN_R_MIN,
+    r_max=SSRF_BETA_DESIGN_R_MAX,
     dt=None,
     settings=None,
     bin_allow_mask=None,
@@ -617,7 +627,7 @@ def run_optimal_profile_polarization(
     equilibrium on both the design model and the playback model.
     """
     p0 = float(polarization)
-    dt_used = float(dt) if dt is not None else SSRF_BETA_DEFAULT_DT
+    dt_used = float(dt) if dt is not None else SSRF_BETA_IDEAL_BIN_DT
     model = make_ideal_model(
         p0,
         n_bins=int(n_bins),
