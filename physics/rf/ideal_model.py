@@ -143,12 +143,13 @@ class IdealBinModel(Spin1Model):
         return u, u[::-1].copy()
 
     def rf_rate_fields(self, center_R=None, gamma_rf=None) -> Tuple[np.ndarray, np.ndarray]:
-        u, um = self.rf_profile_arrays()
+        u = self.commanded_rf_field()
+        if self.params.rf_response_mode == "spectral":
+            if not np.allclose(self.Rplus, -self.Rplus[::-1], rtol=0, atol=1e-12):
+                raise ValueError("Spectral RF requires a symmetric frequency grid")
+            return self.rf_rate_operator().rates(u)
         w = self.capacity_rate_weights()
-        # gamma_rf in the baseline derivative is intentionally unused: rates
-        # are supplied by the per-bin program, with program.gain as the sole
-        # additional global multiplier. No automatic profile normalization.
-        return w*u, w*um
+        return w * u, w * u[::-1]
 
     def rf_profile_summary(self, center_R=None):
         u = self.commanded_rf_field()

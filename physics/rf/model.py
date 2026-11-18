@@ -56,6 +56,16 @@ class Spin1Params:
     microwave_diffusion_factor: float = 1.0
     capacity_rate_power: float = 1.0
     capacity_rate_clip: float = 12.0
+    rf_response_mode: str = "legacy"
+    rf_density_power: float = 0.0
+    rf_density_clip: float = 12.0
+    rf_pedestal_gain: float = 1.0
+    rf_peak_center_R: float = 0.96
+    rf_peak_half_width_R: float = 0.16
+    rf_transition_width_R: float = 0.25
+    rf_spectral_strength: float = 0.04
+    rf_homogeneous_hwhm_R: float = 0.015
+    rf_peak_selectivity: float = 0.0
     dnp_enabled: bool = False
     p_dnp_sat: float = 0.58
     dnp_rate: float = 0.05
@@ -201,8 +211,25 @@ class Spin1Model(VoigtBurnPhysicsMixin):
             if not hasattr(self.params, key):
                 raise AttributeError(f'Unknown parameter: {key}')
             setattr(self.params, key, value)
-            if key in {'rf_burn_R', 'rf_gaussian_fwhm_R', 'rf_lorentzian_fwhm_R', 'rf_profile_normalization', 'rf_profile_quadrature_order', 'use_physical_voigt_rf'}:
+            if key in {
+                'rf_burn_R',
+                'rf_gaussian_fwhm_R',
+                'rf_lorentzian_fwhm_R',
+                'rf_profile_normalization',
+                'rf_profile_quadrature_order',
+                'use_physical_voigt_rf',
+                'rf_response_mode',
+                'rf_spectral_strength',
+                'rf_homogeneous_hwhm_R',
+                'rf_peak_selectivity',
+                'rf_peak_center_R',
+                'rf_peak_half_width_R',
+                'rf_transition_width_R',
+                'capacity_rate_power',
+                'capacity_rate_clip',
+            }:
                 rf_profile_changed = True
+                self._rf_operator_key = None
             if key in {'diffusion_scale', 'diffusion_enabled', 'diffusion_overlap', 'zq_width_R', 'cross_branch_ratio', 'double_quantum_ratio', 'orientation_corr_fraction', 'orientation_corr_width_deg', 'kernel_cutoff_widths', 'microwave_diffusion_factor', 'line_asym', 'n_bins', 'r_min', 'r_max'}:
                 diffusion_changed = True
         if rf_profile_changed:
@@ -592,6 +619,98 @@ class Spin1Model(VoigtBurnPhysicsMixin):
         if self._populations_from_intensities:
             return self.n_ref
         return self.equilibrium_reference(self.n_plus - self.n_minus)
+
+    def rf_pedestal_profile(self) -> np.ndarray:
+        """Dimensionless RF gain at physical R (unity in legacy/spectral modes)."""
+        p = self.params
+        if p.rf_response_mode in ("legacy", "spectral"):
+            return np.ones_like(self.Rplus)
+        if p.rf_response_mode != "independent":
+            raise ValueError(f"Unknown rf_response_mode {p.rf_response_mode!r}")
+        distance = np.abs(np.abs(self.Rplus) - p.rf_peak_center_R)
+        x = np.clip((distance - p.rf_peak_half_width_R) / p.rf_transition_width_R, 0.0, 1.0)
+        return 1.0 + (p.rf_pedestal_gain - 1.0) * x * x * (3.0 - 2.0 * x)
+
+    def rf_rate_weights(self) -> np.ndarray:
+        """Per-spin RF response weights for the active coupling mode."""
+        p = self.params
+        if p.rf_response_mode == "legacy":
+            return self.capacity_rate_weights()
+        if p.rf_response_mode == "spectral":
+            return self.rf_packet_response() * (
+                p.rf_spectral_strength / self.rf_hwhm_profile()
+            )
+        base = self._density_rate_weights(p.rf_density_power, p.rf_density_clip)
+        return base * self.rf_pedestal_profile()
+
+    def rf_packet_response(self) -> np.ndarray:
+        """State-independent empirical RF coupling (spectral mode selectivity)."""
+        p = self.params
+        if p.rf_response_mode != "spectral":
+            return np.ones_like(self.mu)
+        out = np.ones_like(self.mu)
+        distance = np.abs(np.abs(self.Rplus) - p.rf_peak_center_R)
+        x = np.clip((distance - p.rf_peak_half_width_R) / p.rf_transition_width_R, 0.0, 1.0)
+        step = x * x * (3.0 - 2.0 * x)
+        if p.rf_peak_selectivity != 0:
+            density = self._density_rate_weights(1.0, 12.0)
+            relative = density / np.max(density)
+            out = 1.0 + (1.0 - step) * (relative ** p.rf_peak_selectivity - 1.0)
+        return out
+
+    def rf_hwhm_profile(self) -> np.ndarray:
+        """Homogeneous RF HWHM of each receiving packet (spectral mode)."""
+        return float(self.params.rf_homogeneous_hwhm_R) * np.ones_like(self.mu)
+
+    def rf_rate_operator(self):
+        from .spectral_rf import RFRateOperator
+
+        p = self.params
+        weights = self.rf_rate_weights()
+        hwhm = self.rf_hwhm_profile() if p.rf_response_mode == "spectral" else None
+        uniform = hwhm is None or np.all(hwhm == hwhm[0])
+        key = (
+            p.rf_response_mode,
+            p.rf_spectral_strength,
+            p.rf_homogeneous_hwhm_R,
+            len(self.Rplus),
+            float(self.Rplus[0]),
+            float(self.Rplus[-1]),
+            weights.tobytes(),
+            None if uniform else hwhm.tobytes(),
+        )
+        if getattr(self, "_rf_operator_key", None) != key:
+            kwargs = (
+                dict(
+                    strength=p.rf_spectral_strength,
+                    hwhm=p.rf_homogeneous_hwhm_R if uniform else hwhm,
+                    packet_response=self.rf_packet_response(),
+                )
+                if p.rf_response_mode == "spectral"
+                else {}
+            )
+            self._rf_operator = RFRateOperator(self.Rplus, weights, **kwargs)
+            self._rf_operator_key = key
+        return self._rf_operator
+
+    def _density_rate_weights(self, power, clip):
+        """Pake-density multipliers with optional clipping (independent RF mode)."""
+        power = max(0.0, float(power))
+        clip = max(1.0, float(clip))
+        if power == 0.0:
+            return np.ones_like(self.mu)
+        density = np.maximum(self.base_density, 0.0)
+        avg_density = np.average(density, weights=self.mu)
+        if avg_density <= 0.0 or not np.isfinite(avg_density):
+            return np.ones_like(self.mu)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            w = (density / avg_density) ** power
+        w = np.nan_to_num(w, nan=0.0, posinf=clip, neginf=0.0)
+        w = np.clip(w, 1.0 / clip, clip)
+        norm = np.average(w, weights=self.mu)
+        if norm > 0.0 and np.isfinite(norm):
+            w = w / norm
+        return w
 
     def capacity_rate_weights(self):
         """Return Pake-density rate multipliers with mu-weighted average one."""

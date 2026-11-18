@@ -56,7 +56,7 @@ iplus_new, iminus_new, _ = model.physical_intensities()
 
 ## Optimal ssRF profile (`optimal_profile.py`)
 
-Synchronized multibin RF programs (L-BFGS-B over duration and per-bin rates) use the same ssRF-beta population ODE and diffusion defaults as `Data_Creation/spectrum_gen/bridge.py`. Shared kinetic defaults live in `kinetic_defaults.py`; `profile_control.make_ideal_model` builds the `IdealBinModel` used for design and replay.
+Synchronized multibin RF programs (L-BFGS-B over duration and per-bin rates) use the same ssRF-beta population ODE and diffusion defaults as `Data_Creation/spectrum_gen/bridge.py`. Ideal-bin design additionally uses the ssRF-beta **spectral RF** response (`spectral_rf.py`) and **command smoothing** (`profile_smoothing_fwhm_R`, default 0.03 R) from `materials/demo_single_pake.json`. Shared kinetic defaults live in `kinetic_defaults.py`; `profile_control.make_ideal_model` builds the `IdealBinModel` used for design and replay.
 
 ## Tests
 

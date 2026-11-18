@@ -24,6 +24,15 @@ SSRF_BETA_D_SAME_0MINUS = 0.10
 SSRF_BETA_D_SPEC_PLUS0 = 2.0
 SSRF_BETA_D_SPEC_0MINUS = 1.0
 SSRF_BETA_DEFAULT_DT = 0.0015
+# demo_single_pake / ssRF-beta tensor designer (spectral RF on ideal-bin programs)
+SSRF_BETA_RF_RESPONSE_MODE = "spectral"
+SSRF_BETA_RF_SPECTRAL_STRENGTH = 0.04
+SSRF_BETA_RF_HWHM_R = 0.015
+SSRF_BETA_RF_PEAK_SELECTIVITY = 0.7
+SSRF_BETA_RF_PEAK_CENTER_R = 0.96
+SSRF_BETA_RF_PEAK_HALF_WIDTH_R = 0.16
+SSRF_BETA_RF_TRANSITION_WIDTH_R = 0.25
+SSRF_BETA_PROFILE_SMOOTHING_FWHM_R = 0.03
 
 
 def ssrf_beta_spin1_params(
@@ -107,4 +116,11 @@ def ssrf_beta_ideal_bin_params(
     fields = asdict(base)
     fields["rf_gaussian_fwhm_R"] = 0.0
     fields["rf_lorentzian_fwhm_R"] = 0.0
+    fields["rf_response_mode"] = SSRF_BETA_RF_RESPONSE_MODE
+    fields["rf_spectral_strength"] = SSRF_BETA_RF_SPECTRAL_STRENGTH
+    fields["rf_homogeneous_hwhm_R"] = SSRF_BETA_RF_HWHM_R
+    fields["rf_peak_selectivity"] = SSRF_BETA_RF_PEAK_SELECTIVITY
+    fields["rf_peak_center_R"] = SSRF_BETA_RF_PEAK_CENTER_R
+    fields["rf_peak_half_width_R"] = SSRF_BETA_RF_PEAK_HALF_WIDTH_R
+    fields["rf_transition_width_R"] = SSRF_BETA_RF_TRANSITION_WIDTH_R
     return IdealBinParams(**fields)

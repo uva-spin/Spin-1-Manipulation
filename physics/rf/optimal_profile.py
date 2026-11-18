@@ -23,8 +23,9 @@ from .profile_control import (
     candidate_mask,
     make_ideal_model,
 )
-from .kinetic_defaults import SSRF_BETA_DEFAULT_DT
+from .kinetic_defaults import SSRF_BETA_DEFAULT_DT, SSRF_BETA_PROFILE_SMOOTHING_FWHM_R
 from .pulse_program import BinPulse, PulseProgram, RFProfile
+from scipy.ndimage import gaussian_filter1d
 
 
 @dataclass
@@ -43,6 +44,7 @@ class OptimizerSettings:
     q_relative_tolerance: float = 0.002
     candidate_mode: str = "union"
     candidate_threshold: float = 1e-10
+    profile_smoothing_fwhm_R: float = SSRF_BETA_PROFILE_SMOOTHING_FWHM_R
     seed: int = 42
 
     def validate(self):
@@ -60,16 +62,30 @@ class OptimizerSettings:
             raise ValueError("max_steps must be 2..200000")
         if self.candidate_mode not in ("union", "tensor_deficit", "rf_gain", "all"):
             raise ValueError("Unknown candidate mode")
+        if self.profile_smoothing_fwhm_R < 0:
+            raise ValueError("profile_smoothing_fwhm_R must be nonnegative")
         return self
 
 
-# Shorter search used when generating DAE events (same objective and seed family).
+# demo_single_pake optimizer block (ssRF-beta materials/demo_single_pake.json).
+SSRF_BETA_OPTIMIZER_SETTINGS = OptimizerSettings(
+    max_power=U_MAX,
+    duration_samples=9,
+    duration_refinements=3,
+    max_iterations=100,
+    starts=2,
+    max_wall_seconds=300.0,
+    profile_smoothing_fwhm_R=SSRF_BETA_PROFILE_SMOOTHING_FWHM_R,
+)
+
+# Shorter search for bulk data (ssRF-beta ``fast`` preset, with material smoothing).
 DATA_GEN_SETTINGS = OptimizerSettings(
     duration_samples=5,
     duration_refinements=1,
-    max_iterations=8,
+    max_iterations=40,
     starts=1,
-    max_wall_seconds=60.0,
+    max_wall_seconds=180.0,
+    profile_smoothing_fwhm_R=SSRF_BETA_PROFILE_SMOOTHING_FWHM_R,
 )
 
 QUICK_SETTINGS = OptimizerSettings(
@@ -99,6 +115,7 @@ class FrozenDynamics:
         self.N = len(self.mu)
         self.grid = model.Rplus.copy()
         self.w = model.capacity_rate_weights().copy()
+        self.rf = model.rf_rate_operator()
         self.scale = (
             self.p.diffusion_scale
             * (self.p.microwave_diffusion_factor if self.p.dnp_enabled else 1.0)
@@ -110,7 +127,7 @@ class FrozenDynamics:
         self.decay = np.full(self.N, self.p.t1_rate)
         self.source = self.p.t1_rate * self.model.equilibrium_reference(self.p.t1_p_eq)
         if self.p.dnp_enabled:
-            d = self.p.dnp_rate * self.w
+            d = self.p.dnp_rate * self.model.capacity_rate_weights()
             self.decay = self.decay + d
             self.source = self.source + d[:, None] * self.model.equilibrium_reference(self.p.p_dnp_sat)
         self._fft = None
@@ -154,8 +171,7 @@ class FrozenDynamics:
         return np.sum(y, axis=0)[None, :] if self.C is None else self.C @ y
 
     def rhs(self, n, u):
-        gp = self.w * u
-        gm = self.w * u[::-1]
+        gp, gm = self.rf.rates(u)
         jp = gp * (n[:, 0] - n[:, 1])
         jm = gm * (n[:, 1] - n[:, 2])
         out = -self.decay[:, None] * n + self.source
@@ -188,13 +204,12 @@ class FrozenDynamics:
         vb = adj[:, 1] - adj[:, 2]
         vd = -vb
         vz = adj[:, 0] - adj[:, 2]
-        gp = self.w * u
-        gm = self.w * u[::-1]
+        gp, gm = self.rf.rates(u)
         g = -self.decay[:, None] * adj
         g[:, 0] -= gp * va
         g[:, 1] += gp * va - gm * vb
         g[:, 2] += gm * vb
-        gu = -self.w * (n[:, 0] - n[:, 1]) * va - (self.w * (n[:, 1] - n[:, 2]) * vb)[::-1]
+        gu = self.rf.transpose(-(n[:, 0] - n[:, 1]) * va, -(n[:, 1] - n[:, 2]) * vb)
         if self.scale:
             s = self.scale
             hn = self.h(n)
@@ -228,7 +243,8 @@ class FrozenDynamics:
         return g, gu
 
     def outgoing_bound(self, upper):
-        out = self.w * (upper + upper[::-1]) + self.decay
+        gp, gm = self.rf.rates(upper)
+        out = gp + gm + self.decay
         if self.scale:
             mu = self.mu[:, None]
             out = out + 2 * self.scale * self.h(mu)[:, 0]
@@ -270,11 +286,43 @@ class FrozenDynamics:
         return q, n, gu
 
 
+def smooth_bounded_commands(powers, upper, sigma_bins):
+    """Gaussian-smooth commands, preserve total power, honor per-bin upper bounds."""
+    target = float(np.sum(powers))
+    if target == 0:
+        return np.array(powers, copy=True)
+    sigma_bins = min(float(sigma_bins), 1e100)
+    seed = gaussian_filter1d(
+        np.asarray(powers, dtype=float),
+        sigma_bins,
+        mode="constant",
+        truncate=min(4.0, (len(powers) - 1) / max(sigma_bins, 1e-30)),
+    )
+    seed[upper <= 0] = 0.0
+    lo, hi = 0.0, max(1.0, target / max(float(seed.sum()), 1e-300))
+    while float(np.minimum(upper, hi * seed).sum()) < target * (1.0 - 1e-14):
+        hi *= 2.0
+        if not math.isfinite(hi):
+            raise FloatingPointError("Cannot construct a bounded RF profile")
+    for _ in range(60):
+        mid = (lo + hi) / 2.0
+        if float(np.minimum(upper, mid * seed).sum()) <= target:
+            lo = mid
+        else:
+            hi = mid
+    candidate = np.minimum(upper, lo * seed)
+    scale = min(1.0, target / max(float(candidate.sum()), 1e-300))
+    return candidate * scale
+
+
 def rf_only_seed(dyn, T, upper):
     """Isolated-bin exposure maxima used as the ssRF-beta starting guess."""
     n = dyn.n0
     a = n[:, 0] - n[:, 1]
     b = (n[:, 1] - n[:, 2])[::-1]
+    if dyn.rf.spectral:
+        gain = dyn.rf.transpose(-3 * a, 3 * b[::-1])
+        return upper * (gain > 0)
     cp = dyn.w
     cm = dyn.w[::-1]
     emax = upper * T
@@ -454,6 +502,39 @@ def design_optimal_profile(
             status = "no_RF_benefit"
     if budget_hit and status == "completed":
         status = "budget_reached"
+    if (
+        t > 0.0
+        and np.any(u)
+        and settings.profile_smoothing_fwhm_R > 0.0
+        and status == "completed"
+    ):
+        unrefined = u.copy()
+        q_reference, _ = dyn.evaluate(unrefined, t, dt_fine, settings.max_steps)
+        raw_roughness = float(np.sum(np.diff(unrefined) ** 2))
+        tol = max(
+            settings.q_absolute_tolerance,
+            settings.q_relative_tolerance * max(0.0, q_reference - initial["Q"]),
+        )
+        sigma_scale = math.sqrt(8.0 * math.log(2.0)) * dyn.model.dR
+        for shrink in range(7):
+            width = settings.profile_smoothing_fwhm_R / (2**shrink)
+            if width < 0.25 * dyn.model.dR:
+                break
+            candidate = smooth_bounded_commands(
+                unrefined,
+                upper,
+                width / sigma_scale,
+            )
+            roughness = float(np.sum(np.diff(candidate) ** 2))
+            if roughness >= raw_roughness * (1.0 - 1e-10):
+                continue
+            q_candidate, n_candidate = dyn.evaluate(
+                candidate, t, dt_fine, settings.max_steps
+            )
+            if q_candidate >= q_reference - tol and q_candidate >= initial["Q"]:
+                u = candidate
+                endpoint = n_candidate
+                break
     program = synchronized_program(dyn.grid, u, t)
     # Independent replay through the unchanged scheduler.
     replay_model = IdealBinModel(model.params.replace(), program)
