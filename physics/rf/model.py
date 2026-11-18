@@ -31,6 +31,13 @@ class Spin1Params:
     r_max: float = 3.0
     line_gamma: float = 0.05
     line_asym: float = 0.04
+    line_model: str = "single_pake"
+    line_cd_scale_R: float = 1.0
+    line_od_scale_ratio: float = 1.6
+    line_eta_cd: float = 0.03
+    line_eta_od: float = 0.12
+    line_od_fraction: float = 0.07
+    line_phi_points: int = 64
     plot_signal_units: bool = True
     plot_divisor: float = 10.0
     display_scale: float = 1.0
@@ -109,7 +116,14 @@ class Spin1Model(VoigtBurnPhysicsMixin):
             raise ValueError('r_min must be less than r_max')
         self.Rplus = np.linspace(p.r_min, p.r_max, p.n_bins)
         self.dR = self.Rplus[1] - self.Rplus[0]
-        density = normalized_component(self.Rplus, +1, gamma=p.line_gamma, asym=p.line_asym)
+        if p.line_model == "multisite_butanol":
+            if p.orientation_corr_fraction != 0:
+                raise ValueError("Multisite orientation correlation requires site-resolved geometry")
+            density = self._multisite_density()
+        elif p.line_model == "single_pake":
+            density = normalized_component(self.Rplus, +1, gamma=p.line_gamma, asym=p.line_asym)
+        else:
+            raise ValueError(f"Unknown line_model {p.line_model!r}")
         mu = density * self.dR
         self.mu = mu / max(mu.sum(), 1e-30)
         self.base_density = self.mu / self.dR
@@ -164,6 +178,21 @@ class Spin1Model(VoigtBurnPhysicsMixin):
         if self.params.rf_enabled:
             self.set_rf_profile()
 
+    def _multisite_density(self):
+        from .multisite_lineshape import absorption_density
+
+        p = self.params
+        return absorption_density(
+            self.Rplus,
+            cd_scale=p.line_cd_scale_R,
+            od_ratio=p.line_od_scale_ratio,
+            hwhm=p.line_gamma,
+            eta_cd=p.line_eta_cd,
+            eta_od=p.line_eta_od,
+            od_fraction=p.line_od_fraction,
+            points=p.line_phi_points,
+        )
+
     def set_rf_profile(self):
         """Install a discrete RF-rate vector if one is not already frozen.
 
@@ -194,7 +223,11 @@ class Spin1Model(VoigtBurnPhysicsMixin):
         if minor_diff < 1e-15:
             pref_cal = level_populations_from_PQ(0.5, None)
             minor_diff = abs(float(pref_cal[ZERO] - pref_cal[MINUS]))
-        raw = pake_component_raw(self.Rplus, +1, gamma=p.line_gamma, asym=p.line_asym)
+        raw = (
+            self._multisite_density()
+            if p.line_model == "multisite_butanol"
+            else pake_component_raw(self.Rplus, +1, gamma=p.line_gamma, asym=p.line_asym)
+        )
         raw_area = trapezoid_integral(raw, self.Rplus)
         if raw_area <= 0 or not np.isfinite(raw_area):
             return float(p.display_scale)
@@ -230,7 +263,30 @@ class Spin1Model(VoigtBurnPhysicsMixin):
             }:
                 rf_profile_changed = True
                 self._rf_operator_key = None
-            if key in {'diffusion_scale', 'diffusion_enabled', 'diffusion_overlap', 'zq_width_R', 'cross_branch_ratio', 'double_quantum_ratio', 'orientation_corr_fraction', 'orientation_corr_width_deg', 'kernel_cutoff_widths', 'microwave_diffusion_factor', 'line_asym', 'n_bins', 'r_min', 'r_max'}:
+            if key in {
+                'diffusion_scale',
+                'diffusion_enabled',
+                'diffusion_overlap',
+                'zq_width_R',
+                'cross_branch_ratio',
+                'double_quantum_ratio',
+                'orientation_corr_fraction',
+                'orientation_corr_width_deg',
+                'kernel_cutoff_widths',
+                'microwave_diffusion_factor',
+                'line_asym',
+                'line_gamma',
+                'line_model',
+                'line_cd_scale_R',
+                'line_od_scale_ratio',
+                'line_eta_cd',
+                'line_eta_od',
+                'line_od_fraction',
+                'line_phi_points',
+                'n_bins',
+                'r_min',
+                'r_max',
+            }:
                 diffusion_changed = True
         if rf_profile_changed:
             self.invalidate_rf_profile()
