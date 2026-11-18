@@ -836,6 +836,12 @@ class Spin1Model(VoigtBurnPhysicsMixin):
         from .lineshape import plot_signal_reference
         return plot_signal_reference(self.Rplus, P=self.params.p0, gamma=self.params.line_gamma, asym=self.params.line_asym, divisor=self.params.plot_divisor)
 
+    def intensities_plot_units(self, n=None):
+        """ssRF-beta GUI intensity scale: (I±) / (display_cal × plot_divisor)."""
+        ip, im, _ = self.physical_intensities(n)
+        scale = 1.0 / (max(abs(self.display_cal), 1e-30) * max(self.params.plot_divisor, 1e-30))
+        return ip * scale, im * scale, (ip + im) * scale
+
     def polarizations(self, n=None):
         """Return current dimensionless level populations, vector P, and tensor Q."""
         if n is None:

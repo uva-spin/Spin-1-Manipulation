@@ -33,6 +33,12 @@ SSRF_BETA_D_SAME_0MINUS = 0.10
 SSRF_BETA_D_SPEC_PLUS0 = 2.0
 SSRF_BETA_D_SPEC_0MINUS = 1.0
 SSRF_BETA_DEFAULT_DT = 0.0015
+# Ideal-bin tensor designer / demo_single_pake integration step.
+SSRF_BETA_IDEAL_BIN_DT = 0.03
+SSRF_BETA_DESIGN_N_BINS = 500
+SSRF_BETA_DESIGN_R_MIN = -3.0
+SSRF_BETA_DESIGN_R_MAX = 3.0
+SSRF_BETA_OPTIMIZER_MAX_DURATION = 10.0
 # demo_single_pake / ssRF-beta tensor designer (spectral RF on ideal-bin programs)
 SSRF_BETA_RF_RESPONSE_MODE = "spectral"
 SSRF_BETA_RF_SPECTRAL_STRENGTH = 0.04

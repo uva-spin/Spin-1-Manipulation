@@ -12,18 +12,26 @@ from typing import Optional
 import numpy as np
 
 from .ideal_model import IdealBinModel, IdealBinParams
-from .kinetic_defaults import SSRF_BETA_DEFAULT_DT, ssrf_beta_ideal_bin_params
+from .kinetic_defaults import (
+    SSRF_BETA_DEFAULT_DT,
+    SSRF_BETA_DESIGN_N_BINS,
+    SSRF_BETA_DESIGN_R_MAX,
+    SSRF_BETA_DESIGN_R_MIN,
+    SSRF_BETA_IDEAL_BIN_DT,
+    SSRF_BETA_OPTIMIZER_MAX_DURATION,
+    ssrf_beta_ideal_bin_params,
+)
 from .pulse_program import BinPulse, PulseProgram, RFProfile
 
-DEFAULT_N_BINS = 249
-DEFAULT_R_MIN = -3.0
-DEFAULT_R_MAX = 3.0
+DEFAULT_N_BINS = SSRF_BETA_DESIGN_N_BINS
+DEFAULT_R_MIN = SSRF_BETA_DESIGN_R_MIN
+DEFAULT_R_MAX = SSRF_BETA_DESIGN_R_MAX
 DEFAULT_LINE_GAMMA = 0.05
 DEFAULT_LINE_ASYM = 0.04
 DEFAULT_P0 = 0.45
 U_MAX = 20.0
 T_MIN = 0.01
-T_MAX = 2.0
+T_MAX = SSRF_BETA_OPTIMIZER_MAX_DURATION
 CANDIDATE_THRESHOLD = 1e-10
 
 
@@ -148,7 +156,7 @@ def make_ideal_model(
         n_bins=int(n_bins),
         r_min=float(r_min),
         r_max=float(r_max),
-        dt=SSRF_BETA_DEFAULT_DT if dt is None else float(dt),
+        dt=SSRF_BETA_IDEAL_BIN_DT if dt is None else float(dt),
         legacy_spectral_recovery=bool(legacy_spectral_recovery),
     )
     return IdealBinModel(params)
